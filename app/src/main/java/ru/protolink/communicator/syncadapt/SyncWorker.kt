@@ -25,8 +25,7 @@ class SyncWorker @AssistedInject constructor(
     private val mappingStore: MappingStore,
     private val metadataStore: MetadataStore,
     private val remote: ApiRemoteCloud,
-    private val localFs: SafLocalFileSystem,
-    private val settingsStore: ru.protolink.communicator.data.SettingsStore
+    private val localFs: SafLocalFileSystem
 ) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
         val mappings = mappingStore.load().map {
@@ -42,19 +41,20 @@ class SyncWorker @AssistedInject constructor(
             return Result.success()
         }
         if (!SyncFlight.mutex.tryLock()) {
-            Log.i(TAG, "Skip; another sync is already running")
+            SyncFlight.deferredFull.set(true)
+            Log.i(TAG, "Skip; another sync is already running (deferred full)")
             return Result.success()
         }
         return try {
-            val compare = settingsStore.load().compareSizeAndTimeOnSync
-            Log.i(TAG, "Reconcile ${mappings.size} mapping(s) compareSizeAndTime=$compare")
-            val result = SyncEngine(metadataStore, localFs, remote)
-                .reconcileAll(mappings, compareSizeAndTime = compare)
-            Log.i(TAG, "Done local=${result.localChanges} remote=${result.remoteChanges}")
+            do {
+                SyncFlight.deferredFull.set(false)
+                Log.i(TAG, "Reconcile ${mappings.size} mapping(s)")
+                val result = SyncEngine(metadataStore, localFs, remote).reconcileAll(mappings)
+                Log.i(TAG, "Done local=${result.localChanges} remote=${result.remoteChanges}")
+            } while (SyncFlight.deferredFull.getAndSet(false))
             Result.success()
         } catch (e: Exception) {
             Log.e(TAG, "Sync failed", e)
-            // Permanent-style failures should not spin forever; one backoff retry is enough noise.
             Result.retry()
         } finally {
             SyncFlight.mutex.unlock()
@@ -69,11 +69,16 @@ class SyncWorker @AssistedInject constructor(
         fun enqueue(context: Context) {
             val req = PeriodicWorkRequestBuilder<SyncWorker>(15, TimeUnit.MINUTES).build()
             WorkManager.getInstance(context).enqueueUniquePeriodicWork(
-                UNIQUE_PERIODIC, ExistingPeriodicWorkPolicy.KEEP, req
+                UNIQUE_PERIODIC, ExistingPeriodicWorkPolicy.UPDATE, req
             )
         }
 
-        /** Coalesce manual/background one-shots — never stack concurrent workers. */
+        fun cancelPeriodic(context: Context) {
+            WorkManager.getInstance(context).cancelUniqueWork(UNIQUE_PERIODIC)
+            WorkManager.getInstance(context).cancelUniqueWork(UNIQUE_ONESHOT)
+            Log.i(TAG, "Cancelled periodic/oneshot WorkManager sync")
+        }
+
         fun runNow(context: Context) {
             WorkManager.getInstance(context).enqueueUniqueWork(
                 UNIQUE_ONESHOT,

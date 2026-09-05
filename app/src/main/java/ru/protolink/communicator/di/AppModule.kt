@@ -17,6 +17,7 @@ import ru.protolink.communicator.data.SettingsStore
 import ru.protolink.communicator.data.TokenStore
 import ru.protolink.communicator.data.api.ProtoLinkApi
 import ru.protolink.communicator.data.db.AppDatabase
+import ru.protolink.communicator.data.db.MIGRATION_1_2
 import ru.protolink.communicator.data.db.RoomMetadataStore
 import ru.protolink.communicator.data.db.SyncMetaDao
 import ru.protolink.communicator.sync.ports.MetadataStore
@@ -30,7 +31,10 @@ import javax.inject.Singleton
 object AppModule {
     @Provides @Singleton
     fun db(@ApplicationContext ctx: Context): AppDatabase =
-        Room.databaseBuilder(ctx, AppDatabase::class.java, "protolink.db").build()
+        Room.databaseBuilder(ctx, AppDatabase::class.java, "protolink.db")
+            .addMigrations(MIGRATION_1_2)
+            .fallbackToDestructiveMigration()
+            .build()
 
     @Provides fun dao(db: AppDatabase): SyncMetaDao = db.syncMetaDao()
 

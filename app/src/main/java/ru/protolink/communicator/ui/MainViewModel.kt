@@ -23,6 +23,7 @@ import ru.protolink.communicator.data.api.EntityDto
 import ru.protolink.communicator.data.api.GetEntitiesRequest
 import ru.protolink.communicator.data.api.ProtoLinkApi
 import ru.protolink.communicator.data.api.SendCommandRequest
+import ru.protolink.communicator.sync.engine.ContentHashUtil
 import ru.protolink.communicator.sync.engine.SyncEngine
 import ru.protolink.communicator.sync.model.SyncMapping
 import ru.protolink.communicator.sync.ports.MetadataStore
@@ -36,7 +37,11 @@ import android.net.Uri
 import android.util.Log
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.time.Instant
 import javax.inject.Inject
 
@@ -63,6 +68,11 @@ data class NoteTreeRow(
     val indexUri: String?
 )
 
+data class PendingForce(
+    val cloudFolderId: String,
+    val push: Boolean
+)
+
 data class UiState(
     val authenticated: Boolean = false,
     val login: String = "",
@@ -77,11 +87,18 @@ data class UiState(
     val notesTreeRows: List<NoteTreeRow> = emptyList(),
     val notesExpandedIds: Set<String> = emptySet(),
     val notesContent: String = "",
+    val notesDirty: Boolean = false,
+    val notesReloadPrompt: Boolean = false,
     val selectedNotePath: String? = null,
+    val selectedNoteRelativePath: String? = null,
     val selectedNoteDocumentId: String? = null,
     val selectedNoteIndexUri: String? = null,
     val showSettings: Boolean = false,
     val syncing: Boolean = false,
+    val forceRunning: Boolean = false,
+    val pendingForce: PendingForce? = null,
+    val syncError: String? = null,
+    val syncSuccess: String? = null,
     val appVersion: String = BuildConfig.VERSION_NAME,
     val apiVersionText: String = ""
 )
@@ -100,6 +117,7 @@ class MainViewModel @Inject constructor(
 ) : ViewModel() {
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state
+    private var autoSyncJob: Job? = null
 
     init {
         refreshAuth()
@@ -115,22 +133,56 @@ class MainViewModel @Inject constructor(
             // Contacts first — never wait on cloud root/sync or SignalR.
             loadContacts()
             viewModelScope.launch {
-                signalR.onMessage = {
-                    _state.value.selectedContact?.let { loadMessages(it) }
-                }
+                signalR.onCommand = { handleRealtimeCommand(it) }
                 runCatching { signalR.start() }
             }
             viewModelScope.launch {
                 runCatching { ensureCloudRoot() }
             }
+            startAutoSyncInterval()
+            requestFullSync()
         }
         if (!settingsStore.load().notesRootUri.isNullOrBlank()) {
             refreshNotesTree()
         }
     }
 
+    /** Interval: local-only push (no remote scan). Skips while any sync is active. */
+    private fun startAutoSyncInterval(intervalMs: Long = 15_000L) {
+        autoSyncJob?.cancel()
+        autoSyncJob = viewModelScope.launch {
+            while (isActive) {
+                delay(intervalMs)
+                if (!auth.isAuthenticated) continue
+                if (mappingStore.load().isEmpty()) continue
+                if (_state.value.syncing || SyncFlight.mutex.isLocked) continue
+                requestLocalPush()
+            }
+        }
+    }
+
+    private fun stopAutoSyncInterval() {
+        autoSyncJob?.cancel()
+        autoSyncJob = null
+    }
+
     fun refreshAuth() {
         _state.update { it.copy(authenticated = auth.isAuthenticated, login = auth.current()?.login.orEmpty()) }
+    }
+
+    /** Messenger always; Cloud full sync only on data_changed. */
+    private fun handleRealtimeCommand(commandType: String?) {
+        viewModelScope.launch {
+            loadContacts()
+            _state.value.selectedContact?.let { loadMessages(it) }
+            if (!settingsStore.load().notesRootUri.isNullOrBlank()) {
+                refreshNotesTree()
+            }
+            if (commandType.equals("data_changed", ignoreCase = true)) {
+                requestFullSync()
+            }
+            _state.update { it.copy(status = "Live update${commandType?.let { t -> " ($t)" } ?: ""}") }
+        }
     }
 
     fun toggleSettings(show: Boolean) {
@@ -165,10 +217,12 @@ class MainViewModel @Inject constructor(
                 _state.update { s -> s.copy(authenticated = true, login = it.login, status = "Logged in", showSettings = false) }
                 loadContacts()
                 viewModelScope.launch {
-                    signalR.onMessage = { _state.value.selectedContact?.let { c -> loadMessages(c) } }
+                    signalR.onCommand = { handleRealtimeCommand(it) }
                     runCatching { signalR.start() }
                 }
                 viewModelScope.launch { runCatching { ensureCloudRoot() } }
+                startAutoSyncInterval()
+                requestFullSync()
             }
             .onFailure { e ->
                 _state.update { it.copy(status = "Login failed: ${e.message}") }
@@ -176,6 +230,7 @@ class MainViewModel @Inject constructor(
     }
 
     fun logout() {
+        stopAutoSyncInterval()
         signalR.stop()
         auth.logout()
         _state.update { it.copy(authenticated = false, login = "", contacts = emptyList(), messages = emptyList()) }
@@ -211,6 +266,18 @@ class MainViewModel @Inject constructor(
             }
         }
         _state.update { it.copy(cloudItems = items, status = "Cloud loaded") }
+    }
+
+    /** Jump to a mapped folder (stories strip) with a sensible breadcrumb. */
+    fun openMappedFolder(folderId: String, name: String) {
+        val root = cloudRootId ?: _state.value.breadcrumb.firstOrNull()?.first
+        val crumbs = when {
+            root != null && !root.equals(folderId, true) ->
+                listOf(root to "Cloud", folderId to name.ifBlank { "Folder" })
+            else -> listOf(folderId to name.ifBlank { "Folder" })
+        }
+        _state.update { it.copy(breadcrumb = crumbs) }
+        loadCloudFolder(folderId)
     }
 
     fun openCloudFolder(item: CloudItem) {
@@ -259,9 +326,14 @@ class MainViewModel @Inject constructor(
     }
 
     fun syncNow() {
+        requestFullSync()
+    }
+
+    /** Full reconcile (startup / SignalR / manual). Coalesces if busy. */
+    private fun requestFullSync() {
         viewModelScope.launch {
-            if (_state.value.syncing) {
-                _state.update { it.copy(status = "Sync already in progress…") }
+            if (!auth.isAuthenticated) {
+                _state.update { it.copy(status = "Log in before sync", syncing = false) }
                 return@launch
             }
             val mappings = mappingStore.load()
@@ -274,17 +346,65 @@ class MainViewModel @Inject constructor(
                 }
                 return@launch
             }
-            if (!auth.isAuthenticated) {
-                _state.update { it.copy(status = "Log in before sync", syncing = false) }
-                return@launch
-            }
             if (!SyncFlight.mutex.tryLock()) {
-                _state.update { it.copy(status = "Sync already in progress…") }
+                SyncFlight.deferredFull.set(true)
+                _state.update { it.copy(status = "Full sync queued…") }
                 return@launch
             }
             _state.update { it.copy(status = "Syncing ${mappings.size} folder(s)…", syncing = true) }
             try {
-                val result = withContext(Dispatchers.IO) {
+                var lastLocal = 0
+                var lastRemote = 0
+                do {
+                    SyncFlight.deferredFull.set(false)
+                    val currentMappings = mappingStore.load()
+                    val result = withContext(Dispatchers.IO) {
+                        val engineMappings = currentMappings.map {
+                            SyncMapping(
+                                id = it.cloudFolderId.replace("-", ""),
+                                cloudFolderId = it.cloudFolderId,
+                                localRootPath = it.localPath,
+                                cloudFolderName = it.cloudFolderName
+                            )
+                        }
+                        SyncEngine(metadataStore, localFs, remoteCloud).reconcileAll(engineMappings)
+                    }
+                    lastLocal = result.localChanges
+                    lastRemote = result.remoteChanges
+                    currentFolderId?.let { loadCloudFolder(it) }
+                } while (SyncFlight.deferredFull.getAndSet(false))
+                _state.update {
+                    it.copy(
+                        status = "Sync complete (local $lastLocal, remote $lastRemote)",
+                        syncing = false,
+                        mappings = mappingStore.load()
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e("ProtoLinkSync", "sync failed", e)
+                _state.update {
+                    it.copy(
+                        status = "Sync failed: ${e.message ?: e.javaClass.simpleName}",
+                        syncing = false,
+                        syncError = e.message ?: e.javaClass.simpleName
+                    )
+                }
+            } finally {
+                if (SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
+            }
+        }
+    }
+
+    /** Local-only push (interval / note save). Skips if sync busy. Notifies peers after uploads. */
+    private fun requestLocalPush() {
+        viewModelScope.launch {
+            if (!auth.isAuthenticated) return@launch
+            val mappings = mappingStore.load()
+            if (mappings.isEmpty()) return@launch
+            if (_state.value.syncing || !SyncFlight.mutex.tryLock()) return@launch
+            _state.update { it.copy(status = "Uploading local changes…", syncing = true) }
+            try {
+                val applied = withContext(Dispatchers.IO) {
                     val engineMappings = mappings.map {
                         SyncMapping(
                             id = it.cloudFolderId.replace("-", ""),
@@ -293,26 +413,165 @@ class MainViewModel @Inject constructor(
                             cloudFolderName = it.cloudFolderName
                         )
                     }
-                    SyncEngine(metadataStore, localFs, remoteCloud).reconcileAll(
-                        engineMappings,
-                        compareSizeAndTime = settingsStore.load().compareSizeAndTimeOnSync
-                    )
+                    SyncEngine(metadataStore, localFs, remoteCloud).pushLocalChanges(engineMappings)
+                }
+                if (applied > 0) {
+                    notifyOtherDevices()
+                    currentFolderId?.let { loadCloudFolder(it) }
+                }
+                // Drain deferred full sync requested while we held the lock.
+                while (SyncFlight.deferredFull.getAndSet(false)) {
+                    val currentMappings = mappingStore.load()
+                    withContext(Dispatchers.IO) {
+                        val engineMappings = currentMappings.map {
+                            SyncMapping(
+                                id = it.cloudFolderId.replace("-", ""),
+                                cloudFolderId = it.cloudFolderId,
+                                localRootPath = it.localPath,
+                                cloudFolderName = it.cloudFolderName
+                            )
+                        }
+                        SyncEngine(metadataStore, localFs, remoteCloud).reconcileAll(engineMappings)
+                    }
+                    currentFolderId?.let { loadCloudFolder(it) }
                 }
                 _state.update {
                     it.copy(
-                        status = "Sync complete (local ${result.localChanges}, remote ${result.remoteChanges})",
+                        status = if (applied > 0) "Uploaded local changes ($applied)" else "No local changes",
                         syncing = false,
                         mappings = mappingStore.load()
                     )
                 }
-                currentFolderId?.let { loadCloudFolder(it) }
             } catch (e: Exception) {
-                Log.e("ProtoLinkSync", "sync failed", e)
+                Log.e("ProtoLinkSync", "local push failed", e)
                 _state.update {
-                    it.copy(status = "Sync failed: ${e.message ?: e.javaClass.simpleName}", syncing = false)
+                    it.copy(
+                        status = "Upload failed: ${e.message ?: e.javaClass.simpleName}",
+                        syncing = false,
+                        syncError = e.message ?: e.javaClass.simpleName
+                    )
                 }
             } finally {
-                SyncFlight.mutex.unlock()
+                if (SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
+            }
+        }
+    }
+
+    private suspend fun notifyOtherDevices() {
+        val me = auth.current()?.userId ?: return
+        runCatching {
+            api.sendCommand(
+                SendCommandRequest(
+                    commandType = "data_changed",
+                    targetUserId = me,
+                    parameters = mapOf("source" to "cloud_sync")
+                )
+            )
+        }.onFailure { Log.w("ProtoLinkSync", "notifyOtherDevices failed", it) }
+    }
+
+    fun clearSyncError() {
+        _state.update { it.copy(syncError = null) }
+    }
+
+    fun clearSyncSuccess() {
+        _state.update { it.copy(syncSuccess = null) }
+    }
+
+    fun requestForceUpload(cloudFolderId: String) {
+        _state.update {
+            it.copy(
+                pendingForce = PendingForce(cloudFolderId = cloudFolderId, push = true)
+            )
+        }
+    }
+
+    fun requestForceDownload(cloudFolderId: String) {
+        _state.update {
+            it.copy(
+                pendingForce = PendingForce(cloudFolderId = cloudFolderId, push = false)
+            )
+        }
+    }
+
+    fun dismissForceConfirm() {
+        _state.update { it.copy(pendingForce = null) }
+    }
+
+    fun confirmForceMapping() {
+        val pending = _state.value.pendingForce ?: return
+        _state.update { it.copy(pendingForce = null) }
+        runForceMapping(pending.cloudFolderId, push = pending.push)
+    }
+
+    private fun runForceMapping(cloudFolderId: String, push: Boolean) {
+        viewModelScope.launch {
+            val mapping = mappingStore.load().firstOrNull { it.cloudFolderId == cloudFolderId }
+            if (mapping == null) {
+                _state.update { it.copy(syncError = "Mapped folder not found") }
+                return@launch
+            }
+            if (!auth.isAuthenticated) {
+                _state.update { it.copy(syncError = "Log in before force sync") }
+                return@launch
+            }
+            if (_state.value.forceRunning) {
+                _state.update { it.copy(syncError = "Force sync already running") }
+                return@launch
+            }
+            _state.update {
+                it.copy(
+                    forceRunning = true,
+                    status = if (push) "Force upload…" else "Force download…"
+                )
+            }
+            var locked = false
+            try {
+                if (!SyncFlight.mutex.tryLock()) {
+                    _state.update { it.copy(status = "Waiting for sync lock…") }
+                    val acquired = withTimeoutOrNull(30_000) { SyncFlight.mutex.lock() } != null
+                    if (!acquired) {
+                        throw IllegalStateException("Timed out waiting for sync lock")
+                    }
+                }
+                locked = true
+                val count = withContext(Dispatchers.IO) {
+                    val engineMapping = SyncMapping(
+                        id = mapping.cloudFolderId.replace("-", ""),
+                        cloudFolderId = mapping.cloudFolderId,
+                        localRootPath = mapping.localPath,
+                        cloudFolderName = mapping.cloudFolderName
+                    )
+                    val engine = SyncEngine(metadataStore, localFs, remoteCloud)
+                    if (push) engine.forcePushMapping(engineMapping)
+                    else engine.forcePullMapping(engineMapping)
+                }
+                val msg = if (push) {
+                    "Force upload complete ($count file(s))"
+                } else {
+                    "Force download complete ($count file(s))"
+                }
+                if (push) {
+                    notifyOtherDevices()
+                }
+                _state.update {
+                    it.copy(
+                        forceRunning = false,
+                        status = msg,
+                        syncSuccess = msg
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e("ProtoLinkSync", "force sync failed", e)
+                _state.update {
+                    it.copy(
+                        forceRunning = false,
+                        status = "Force sync failed",
+                        syncError = e.message ?: e.javaClass.simpleName
+                    )
+                }
+            } finally {
+                if (locked && SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
             }
         }
     }
@@ -401,10 +660,7 @@ class MainViewModel @Inject constructor(
                     status = "Contacts: ${ready.size}"
                 )
             }
-            // Open first chat immediately (Windows parity)
-            if (_state.value.selectedContact == null && ready.isNotEmpty()) {
-                selectContact(ready.first())
-            }
+            // Stay on chat list until the user opens a conversation (phones show list first).
 
             // Enrich display names without blocking list/chat
             launch {
@@ -437,6 +693,10 @@ class MainViewModel @Inject constructor(
     fun selectContact(c: ContactItem) {
         _state.update { it.copy(selectedContact = c) }
         loadMessages(c)
+    }
+
+    fun clearSelectedContact() {
+        _state.update { it.copy(selectedContact = null, messages = emptyList()) }
     }
 
     fun loadMessages(c: ContactItem) = viewModelScope.launch {
@@ -524,6 +784,21 @@ class MainViewModel @Inject constructor(
                     )
                 )
             }
+            if (peer != me) {
+                runCatching {
+                    api.sendCommand(
+                        SendCommandRequest(
+                            commandType = "message_sent",
+                            targetUserId = me,
+                            parameters = mapOf(
+                                "senderId" to me,
+                                "messageText" to body,
+                                "timestamp" to sentAt
+                            )
+                        )
+                    )
+                }
+            }
             _state.value.selectedContact?.let { loadMessages(it) }
             _state.update { it.copy(status = "Sent ${id ?: ""}") }
         } catch (ex: Exception) {
@@ -543,6 +818,7 @@ class MainViewModel @Inject constructor(
                 settings = s,
                 notesExpandedIds = emptySet(),
                 selectedNotePath = null,
+                selectedNoteRelativePath = null,
                 selectedNoteDocumentId = null,
                 selectedNoteIndexUri = null,
                 notesContent = "",
@@ -636,6 +912,15 @@ class MainViewModel @Inject constructor(
                         empty
                     )
                     text = empty
+                } else {
+                    val healed = healJsEscapedHtml(text)
+                    if (healed != text) {
+                        Log.w("ProtoLinkNotes", "Healing JS-escaped HTML on disk for ${row.relativePath}")
+                        appContext.contentResolver.openOutputStream(index, "wt")?.use { out ->
+                            out.write(healed.toByteArray(Charsets.UTF_8))
+                        }
+                        text = healed
+                    }
                 }
                 index to text
             }
@@ -651,9 +936,12 @@ class MainViewModel @Inject constructor(
             _state.update {
                 it.copy(
                     selectedNotePath = row.name,
+                    selectedNoteRelativePath = row.relativePath,
                     selectedNoteDocumentId = row.documentId,
                     selectedNoteIndexUri = indexUri?.toString(),
                     notesContent = body,
+                    notesDirty = false,
+                    notesReloadPrompt = false,
                     notesExpandedIds = expanded,
                     notesTreeRows = rows,
                     status = if (indexUri == null) {
@@ -663,11 +951,18 @@ class MainViewModel @Inject constructor(
                     }
                 )
             }
+            if (indexUri != null) {
+                notesDiskFingerprint = ContentHashUtil.sha256Hex(body.toByteArray(Charsets.UTF_8))
+                startNotesDiskPoller()
+            } else {
+                stopNotesDiskPoller()
+            }
         } catch (e: Exception) {
             Log.e("ProtoLinkNotes", "select failed ${row.name}", e)
             _state.update {
                 it.copy(
                     selectedNotePath = row.name,
+                    selectedNoteRelativePath = row.relativePath,
                     selectedNoteDocumentId = row.documentId,
                     notesContent = "<p>Open failed: ${e.message}</p>",
                     status = "Open failed: ${e.message}"
@@ -676,30 +971,176 @@ class MainViewModel @Inject constructor(
         }
     }
 
+    private var notesSaveJob: Job? = null
+    private var notesDiskPollJob: Job? = null
+    /** Fingerprint of open note on disk after our last load/save; poller ignores matches. */
+    private var notesDiskFingerprint: String? = null
+
     fun clearSelectedNote() {
+        notesSaveJob?.cancel()
+        notesSaveJob = null
+        stopNotesDiskPoller()
         _state.update {
             it.copy(
                 selectedNotePath = null,
+                selectedNoteRelativePath = null,
                 selectedNoteDocumentId = null,
                 selectedNoteIndexUri = null,
-                notesContent = ""
+                notesContent = "",
+                notesDirty = false,
+                notesReloadPrompt = false
             )
         }
     }
 
-    fun saveSelectedNote(html: String) = viewModelScope.launch {
+    fun markNotesDirty() {
+        if (!_state.value.notesDirty) {
+            _state.update { it.copy(notesDirty = true) }
+        }
+    }
+
+    /** Debounce note writes ~5s after editor changes (disk only — Cloud watches FS separately). */
+    fun scheduleSaveSelectedNote(html: String) {
+        if (_state.value.selectedNoteIndexUri.isNullOrBlank()) return
+        val cleaned = healJsEscapedHtml(html)
+        if (cleaned == _state.value.notesContent && !_state.value.notesDirty) return
+        markNotesDirty()
+        _state.update { it.copy(status = "Changes will be saved in 5 seconds…") }
+        notesSaveJob?.cancel()
+        notesSaveJob = viewModelScope.launch {
+            delay(5_000)
+            persistSelectedNote(cleaned)
+        }
+    }
+
+    fun cancelNotesPendingSave() {
+        notesSaveJob?.cancel()
+        notesSaveJob = null
+    }
+
+    /** Immediate save (e.g. leave note). */
+    fun saveSelectedNoteNow(html: String, clearAfter: Boolean = false) {
+        notesSaveJob?.cancel()
+        notesSaveJob = null
+        viewModelScope.launch {
+            persistSelectedNote(healJsEscapedHtml(html))
+            if (clearAfter) clearSelectedNote()
+        }
+    }
+
+    fun confirmNotesReloadFromDisk() = viewModelScope.launch {
+        cancelNotesPendingSave()
+        _state.update { it.copy(notesReloadPrompt = false, notesDirty = false) }
+        forceReloadSelectedNoteFromDisk()
+    }
+
+    fun dismissNotesReloadPrompt() {
+        _state.update {
+            it.copy(
+                notesReloadPrompt = false,
+                status = "Keeping your edits; disk changes ignored until auto-save."
+            )
+        }
+    }
+
+    private fun startNotesDiskPoller() {
+        stopNotesDiskPoller()
+        notesDiskPollJob = viewModelScope.launch {
+            while (isActive) {
+                delay(1_500)
+                pollOpenNoteFromDisk()
+            }
+        }
+    }
+
+    private fun stopNotesDiskPoller() {
+        notesDiskPollJob?.cancel()
+        notesDiskPollJob = null
+        notesDiskFingerprint = null
+    }
+
+    private suspend fun pollOpenNoteFromDisk() {
+        val indexUri = _state.value.selectedNoteIndexUri ?: return
+        if (_state.value.notesReloadPrompt) return
+        try {
+            val text = withContext(Dispatchers.IO) {
+                NotesTreeBuilder.readUtf8(appContext, Uri.parse(indexUri))
+            }
+            val healed = healJsEscapedHtml(text)
+            val body = healed.ifBlank { "<p><br></p>" }
+            val fp = ContentHashUtil.sha256Hex(body.toByteArray(Charsets.UTF_8))
+            if (fp == notesDiskFingerprint) return
+            if (body == _state.value.notesContent && !_state.value.notesDirty) {
+                notesDiskFingerprint = fp
+                return
+            }
+            if (_state.value.notesDirty) {
+                _state.update {
+                    it.copy(
+                        notesReloadPrompt = true,
+                        status = "Note changed on disk — reload or keep edits?"
+                    )
+                }
+                return
+            }
+            notesDiskFingerprint = fp
+            _state.update {
+                it.copy(
+                    notesContent = body,
+                    notesDirty = false,
+                    status = "Reloaded"
+                )
+            }
+        } catch (e: Exception) {
+            Log.w("ProtoLinkNotes", "disk poll failed", e)
+        }
+    }
+
+    private suspend fun forceReloadSelectedNoteFromDisk() {
+        val indexUri = _state.value.selectedNoteIndexUri ?: return
+        try {
+            val text = withContext(Dispatchers.IO) {
+                NotesTreeBuilder.readUtf8(appContext, Uri.parse(indexUri))
+            }
+            val healed = healJsEscapedHtml(text)
+            val body = healed.ifBlank { "<p><br></p>" }
+            notesDiskFingerprint = ContentHashUtil.sha256Hex(body.toByteArray(Charsets.UTF_8))
+            _state.update {
+                it.copy(
+                    notesContent = body,
+                    notesDirty = false,
+                    status = "Reloaded"
+                )
+            }
+        } catch (e: Exception) {
+            Log.e("ProtoLinkNotes", "forced reload failed", e)
+            _state.update { it.copy(status = "Reload failed: ${e.message}") }
+        }
+    }
+
+    private suspend fun persistSelectedNote(cleaned: String) {
         val indexUri = _state.value.selectedNoteIndexUri
         if (indexUri.isNullOrBlank()) {
             _state.update { it.copy(status = "Nothing to save") }
-            return@launch
+            return
         }
         try {
+            val bytes = cleaned.toByteArray(Charsets.UTF_8)
             withContext(Dispatchers.IO) {
                 appContext.contentResolver.openOutputStream(Uri.parse(indexUri), "wt")?.use { out ->
-                    out.write(html.toByteArray(Charsets.UTF_8))
+                    out.write(bytes)
                 } ?: error("Cannot open output stream")
             }
-            _state.update { it.copy(notesContent = html, status = "Saved ${_state.value.selectedNotePath}") }
+            notesDiskFingerprint = ContentHashUtil.sha256Hex(bytes)
+            _state.update {
+                it.copy(
+                    notesContent = cleaned,
+                    notesDirty = false,
+                    notesReloadPrompt = false,
+                    status = "Saved ${_state.value.selectedNotePath}"
+                )
+            }
+            requestLocalPush()
         } catch (e: Exception) {
             Log.e("ProtoLinkNotes", "save failed", e)
             _state.update { it.copy(status = "Save failed: ${e.message}") }

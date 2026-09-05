@@ -8,6 +8,8 @@ import androidx.room.OnConflictStrategy
 import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import ru.protolink.communicator.sync.model.SyncItemMeta
 import ru.protolink.communicator.sync.ports.MetadataStore
 import java.time.Instant
@@ -23,7 +25,8 @@ data class SyncMetaEntity(
     val relativePath: String,
     val isFolder: Boolean,
     val sizeBytes: Long,
-    val remoteUpdateTimeEpochMs: Long?
+    val remoteUpdateTimeEpochMs: Long?,
+    val contentHash: String = ""
 )
 
 @Entity(tableName = "sync_root")
@@ -62,7 +65,13 @@ interface SyncMetaDao {
     suspend fun upsertRoot(entity: SyncRootEntity)
 }
 
-@Database(entities = [SyncMetaEntity::class, SyncRootEntity::class], version = 1, exportSchema = false)
+val MIGRATION_1_2 = object : Migration(1, 2) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sync_meta ADD COLUMN contentHash TEXT NOT NULL DEFAULT ''")
+    }
+}
+
+@Database(entities = [SyncMetaEntity::class, SyncRootEntity::class], version = 2, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun syncMetaDao(): SyncMetaDao
 }
@@ -93,7 +102,8 @@ class RoomMetadataStore @Inject constructor(
                     relativePath = item.relativePath,
                     isFolder = item.isFolder,
                     sizeBytes = item.sizeBytes,
-                    remoteUpdateTimeEpochMs = item.remoteUpdateTime?.toEpochMilli()
+                    remoteUpdateTimeEpochMs = item.remoteUpdateTime?.toEpochMilli(),
+                    contentHash = item.contentHash
                 )
             )
         }
@@ -129,6 +139,7 @@ class RoomMetadataStore @Inject constructor(
         relativePath = relativePath,
         isFolder = isFolder,
         sizeBytes = sizeBytes,
-        remoteUpdateTime = remoteUpdateTimeEpochMs?.let { Instant.ofEpochMilli(it) }
+        remoteUpdateTime = remoteUpdateTimeEpochMs?.let { Instant.ofEpochMilli(it) },
+        contentHash = contentHash
     )
 }

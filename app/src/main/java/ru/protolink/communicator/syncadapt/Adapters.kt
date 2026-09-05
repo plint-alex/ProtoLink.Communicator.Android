@@ -14,6 +14,7 @@ import ru.protolink.communicator.data.api.DeleteEntityRequest
 import ru.protolink.communicator.data.api.GetEntitiesRequest
 import ru.protolink.communicator.data.api.ProtoLinkApi
 import ru.protolink.communicator.data.api.RemoveParentRequest
+import ru.protolink.communicator.sync.engine.ContentHashUtil
 import ru.protolink.communicator.sync.engine.PathUtil
 import ru.protolink.communicator.sync.model.FsEntry
 import ru.protolink.communicator.sync.model.RemoteEntry
@@ -85,7 +86,9 @@ class ApiRemoteCloud(private val api: ProtoLinkApi) : RemoteCloud {
         val part = MultipartBody.Part.createFormData("File", name, body)
         val idBody = entityId.toRequestBody("text/plain".toMediaTypeOrNull())
         api.addFile(idBody, part)
-        // Live API may bump version with mime-only values and drop NAME_TYPE (→ file-{guid}).
+        // Always re-assert name after blob upload so entity UpdateTime bumps even when
+        // server-side mime/name rewrite in addFile is skipped or fails silently.
+        // Other clients (Windows) use UpdateTime + Content-Length to decide Read.
         if (name.isNotBlank() && !name.equals("file-${entityId.replace("-", "")}", ignoreCase = true)) {
             api.addValue(entityId, AddValueRequest(value = name, parentIds = listOf(CloudCodes.NAME_TYPE_ID)))
         }
@@ -98,13 +101,15 @@ class ApiRemoteCloud(private val api: ProtoLinkApi) : RemoteCloud {
     }
 
     override suspend fun fileSize(entityId: String): Long? {
-        // Prefer Content-Length without buffering the body. Full download was making sync endless.
+        // Headers only. OpenResty often omits Content-Length (chunked) — return null then.
+        // Never read the body here: enrich-all-files stalled mapped sync forever.
+        // Same-size edits use ContentHash / unseeded remote hash probe in SyncEngine instead.
         val resp = api.getFile(entityId)
         if (!resp.isSuccessful) return null
         val body = resp.body() ?: return null
         return try {
             val len = body.contentLength()
-            if (len >= 0L) len else null
+            if (len > 0L) len else null
         } finally {
             body.close()
         }
@@ -161,6 +166,11 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
         }.getOrDefault(0L)
     }
 
+    private fun uriContentHash(uri: Uri): String =
+        runCatching {
+            context.contentResolver.openInputStream(uri)?.use { ContentHashUtil.sha256Hex(it.readBytes()) } ?: ""
+        }.getOrDefault("")
+
     private fun root(rootPath: String): DocumentFile =
         DocumentFile.fromTreeUri(context, treeUri(rootPath))
             ?: error("Invalid tree URI $rootPath")
@@ -207,7 +217,7 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                 SafTreeLister.findIndexHtmlByGuess(context, tree, folderDocId)?.let { indexUri ->
                     val name = "index.html"
                     val childRel = if (rel.isEmpty()) name.lowercase() else "$rel/${name.lowercase()}"
-                    out.add(FsEntry(childRel, false, uriByteLength(indexUri)))
+                    out.add(FsEntry(childRel, false, uriByteLength(indexUri), uriContentHash(indexUri)))
                 }
             }
             for (child in entries) {
@@ -217,7 +227,7 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                     out.add(FsEntry(childRel, true, size))
                     walk(child.documentId, childRel)
                 } else {
-                    out.add(FsEntry(childRel, false, uriByteLength(child.uri)))
+                    out.add(FsEntry(childRel, false, uriByteLength(child.uri), uriContentHash(child.uri)))
                 }
             }
         }

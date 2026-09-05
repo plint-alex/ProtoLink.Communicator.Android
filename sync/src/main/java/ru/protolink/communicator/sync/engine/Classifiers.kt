@@ -93,7 +93,10 @@ class LocalChangeClassifier {
             val f = fsByPath.getValue(path)
             val s = storeByPath.getValue(path)
             if (f.isFolder != s.isFolder) continue
-            if (f.sizeBytes != s.sizeBytes) {
+            val sizeChanged = f.sizeBytes != s.sizeBytes
+            val hashChanged = !f.isFolder &&
+                ContentHashUtil.isLocalContentChanged(s.contentHash, f.contentHash)
+            if (sizeChanged || hashChanged) {
                 changes.add(LocalChange.Updated(s, f.sizeBytes))
             }
         }

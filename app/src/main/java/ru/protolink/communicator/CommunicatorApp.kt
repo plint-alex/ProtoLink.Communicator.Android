@@ -13,7 +13,8 @@ class CommunicatorApp : Application(), Configuration.Provider {
 
     override fun onCreate() {
         super.onCreate()
-        SyncWorker.enqueue(this)
+        // Interval + manual/force sync only — cancel any prior periodic WorkManager sync.
+        SyncWorker.cancelPeriodic(this)
     }
 
     override val workManagerConfiguration: Configuration

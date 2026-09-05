@@ -1,5 +1,6 @@
 package ru.protolink.communicator.sync.fakes
 
+import ru.protolink.communicator.sync.engine.ContentHashUtil
 import ru.protolink.communicator.sync.engine.PathUtil
 import ru.protolink.communicator.sync.model.FsEntry
 import ru.protolink.communicator.sync.model.RemoteEntry
@@ -63,7 +64,8 @@ class InMemoryFileSystem : LocalFileSystem {
 
         val result = mutableListOf<FsEntry>()
         for (rel in fileRels) {
-            result.add(FsEntry(rel, false, files.getValue(prefix + rel).size.toLong()))
+            val bytes = files.getValue(prefix + rel)
+            result.add(FsEntry(rel, false, bytes.size.toLong(), ContentHashUtil.sha256Hex(bytes)))
         }
         for (rel in dirRels) {
             val size = fileRels.filter { it == rel || it.startsWith("$rel/") }

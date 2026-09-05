@@ -27,9 +27,7 @@ data class AppSettings(
     val theme: String = "Light",
     val apiBaseAddress: String = "http://protolink.ru/",
     val publicSiteBaseUrl: String = "https://protolink.ru/",
-    val notesRootUri: String? = null,
-    /** When true, sync compares local/remote size and update time at start and chooses upload (write) or download (read). */
-    val compareSizeAndTimeOnSync: Boolean = true
+    val notesRootUri: String? = null
 )
 
 data class CloudSyncMappingDto(

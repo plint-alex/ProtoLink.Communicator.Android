@@ -16,13 +16,16 @@ data class SyncItemMeta(
     val relativePath: String,
     val isFolder: Boolean,
     val sizeBytes: Long,
-    val remoteUpdateTime: Instant? = null
+    val remoteUpdateTime: Instant? = null,
+    /** SHA-256 hex of file bytes at last sync; empty until first hash seed. */
+    val contentHash: String = ""
 )
 
 data class FsEntry(
     val relativePath: String,
     val isFolder: Boolean,
-    val sizeBytes: Long
+    val sizeBytes: Long,
+    val contentHash: String = ""
 )
 
 data class RemoteEntry(
