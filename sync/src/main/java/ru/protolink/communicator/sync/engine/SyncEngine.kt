@@ -68,11 +68,16 @@ class SyncEngine(
 
     /**
      * Upload local FS changes vs meta only (no remote walk / download).
-     * Returns number of local ops applied (uploads / creates / deletes / renames).
+     * Mappings with empty metadata are fully reconciled first (never blind-create remote entities).
      */
     suspend fun pushLocalChanges(mappings: List<SyncMapping>): Int {
+        val needFull = mappings.filter { store.getAll(it.id).isEmpty() }
+        val ready = mappings.filter { store.getAll(it.id).isNotEmpty() }
+        if (needFull.isNotEmpty()) {
+            reconcileAll(needFull)
+        }
         var applied = 0
-        for (mapping in mappings) {
+        for (mapping in ready) {
             val dirty = mutableSetOf<String>()
             applied += applyLocalPhase(mapping, dirty, skipSizeUpdates = false, remoteInMapping = emptyList())
             store.setLastSyncUtc(mapping.id, Instant.now())
