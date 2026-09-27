@@ -48,6 +48,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -113,6 +114,48 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
     // On phones, hide chrome while in chat/editor so content + keyboard get full height.
     val hideBottomBar = compactWidth && (notesEditing || messengerInChat)
     val hideTopBar = compactWidth && (messengerInChat || notesEditing)
+    val context = LocalContext.current
+    val activity = context as? androidx.activity.ComponentActivity
+
+    val notifPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* granted or not — notifications simply won't show if denied */ }
+
+    LaunchedEffect(Unit) {
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            notifPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    DisposableEffect(activity) {
+        val owner = activity ?: return@DisposableEffect onDispose { }
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_RESUME -> vm.setAppForeground(true)
+                androidx.lifecycle.Lifecycle.Event.ON_PAUSE -> vm.setAppForeground(false)
+                else -> Unit
+            }
+        }
+        owner.lifecycle.addObserver(observer)
+        onDispose { owner.lifecycle.removeObserver(observer) }
+    }
+
+    LaunchedEffect(activity?.intent?.getStringExtra("openContactId"), state.authenticated, state.contacts.size) {
+        val openId = activity?.intent?.getStringExtra("openContactId") ?: return@LaunchedEffect
+        if (!state.authenticated || openId.isBlank()) return@LaunchedEffect
+        tab = 0
+        vm.openContactById(openId)
+        activity.intent?.removeExtra("openContactId")
+    }
+
+    if (!state.authenticated && !state.showSettings) {
+        AuthFlowScreen(
+            vm = vm,
+            status = state.status,
+            onOpenSettings = { vm.toggleSettings(true) }
+        )
+        return
+    }
 
     if (state.showSettings) {
         if (state.syncError != null) {
@@ -211,20 +254,39 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
             }
         },
         bottomBar = {
-            if (!hideBottomBar) {
-                NavigationBar {
-                    NavigationBarItem(
-                        selected = tab == 0,
-                        onClick = {
-                            // Returning to Messenger shows the chat list (not a leftover thread).
-                            if (tab != 0 && compactWidth) vm.clearSelectedContact()
-                            tab = 0
-                        },
-                        icon = { Icon(Icons.Default.Message, null) }, label = { Text("Messenger") })
-                    NavigationBarItem(selected = tab == 1, onClick = { tab = 1 },
-                        icon = { Icon(Icons.Default.Note, null) }, label = { Text("Notes") })
-                    NavigationBarItem(selected = tab == 2, onClick = { tab = 2 },
-                        icon = { Icon(Icons.Default.Cloud, null) }, label = { Text("Cloud") })
+            val showStatus =
+                state.status.isNotBlank() && (!hideBottomBar || state.syncing)
+            if (!hideBottomBar || showStatus) {
+                Column(Modifier.fillMaxWidth()) {
+                    if (!hideBottomBar) {
+                        NavigationBar {
+                            NavigationBarItem(
+                                selected = tab == 0,
+                                onClick = {
+                                    // Returning to Messenger shows the chat list (not a leftover thread).
+                                    if (tab != 0 && compactWidth) vm.clearSelectedContact()
+                                    tab = 0
+                                },
+                                icon = { Icon(Icons.Default.Message, null) }, label = { Text("Messenger") })
+                            NavigationBarItem(selected = tab == 1, onClick = { tab = 1 },
+                                icon = { Icon(Icons.Default.Note, null) }, label = { Text("Notes") })
+                            NavigationBarItem(selected = tab == 2, onClick = { tab = 2 },
+                                icon = { Icon(Icons.Default.Cloud, null) }, label = { Text("Cloud") })
+                        }
+                    }
+                    if (showStatus) {
+                        Text(
+                            state.status,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
+                                .padding(horizontal = 12.dp, vertical = 6.dp)
+                        )
+                    }
                 }
             }
         }
@@ -236,9 +298,6 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
                 .imePadding()
                 .fillMaxSize()
         ) {
-            if (state.status.isNotBlank() && !hideTopBar) {
-                Text(state.status, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(8.dp))
-            }
             when (tab) {
                 0 -> MessengerScreen(vm, state, compactWidth = compactWidth)
                 1 -> NotesScreen(vm, state, compactWidth = compactWidth)
@@ -250,8 +309,6 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
 
 @Composable
 fun SettingsScreen(vm: MainViewModel, state: UiState, onClose: () -> Unit) {
-    var user by remember { mutableStateOf("") }
-    var pass by remember { mutableStateOf("") }
     var api by remember { mutableStateOf(state.settings.apiBaseAddress) }
     val tgBg = Color(0xFFEFEFF4)
     val tgBlue = Color(0xFF2AABEE)
@@ -311,13 +368,16 @@ fun SettingsScreen(vm: MainViewModel, state: UiState, onClose: () -> Unit) {
                         )
                     } else {
                         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                            OutlinedTextField(user, { user = it }, label = { Text("Login") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-                            OutlinedTextField(pass, { pass = it }, label = { Text("Password") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                            Text(
+                                "Sign in or create an account to use Messenger.",
+                                color = tgMuted,
+                                fontSize = 14.sp
+                            )
                             Button(
-                                onClick = { vm.login(user, pass) },
+                                onClick = onClose,
                                 modifier = Modifier.fillMaxWidth(),
                                 colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = tgBlue)
-                            ) { Text("Log in") }
+                            ) { Text("Sign in / Create account") }
                         }
                     }
                 }
@@ -849,6 +909,8 @@ private val TgHeaderBg = Color(0xFF527998)
 private val TgMineBubble = Color(0xFFDCF8C6)
 private val TgPeerBubble = Color(0xFFFFFFFF)
 private val TgAccent = Color(0xFF2AABEE)
+private val TgTickRead = Color(0xFF53BDEB)
+private val TgTickSent = Color(0xFF667781)
 
 @Composable
 private fun MessengerContactsPane(
@@ -894,6 +956,21 @@ private fun MessengerContactsPane(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1
                         )
+                    }
+                    if (c.hasUnread) {
+                        Box(
+                            modifier = Modifier
+                                .background(TgAccent, RoundedCornerShape(percent = 50))
+                                .padding(horizontal = 8.dp, vertical = 3.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                c.unreadLabel,
+                                color = Color.White,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
                     }
                 }
                 Divider(modifier = Modifier.padding(start = 68.dp), color = Color(0x14000000))
@@ -1092,13 +1169,27 @@ private fun MessageBubble(m: MessageItem) {
                         .padding(horizontal = 10.dp, vertical = 6.dp)
                 ) {
                     Text(m.text, color = Color(0xFF111111))
-                    if (m.timeLabel.isNotBlank()) {
-                        Text(
-                            m.timeLabel,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = Color(0xFF667781),
-                            modifier = Modifier.align(Alignment.End).padding(top = 2.dp)
-                        )
+                    if (m.timeLabel.isNotBlank() || m.mine) {
+                        Row(
+                            modifier = Modifier.align(Alignment.End).padding(top = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (m.timeLabel.isNotBlank()) {
+                                Text(
+                                    m.timeLabel,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Color(0xFF667781)
+                                )
+                            }
+                            if (m.mine) {
+                                Spacer(Modifier.width(4.dp))
+                                Text(
+                                    m.ticksText,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (m.ticksRead) TgTickRead else TgTickSent
+                                )
+                            }
+                        }
                     }
                 }
             }

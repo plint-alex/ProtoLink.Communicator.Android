@@ -23,7 +23,16 @@ data class LoginResponse(
     @SerializedName("expirationTime") val expirationTime: String?,
     @SerializedName("userId") val userId: String?,
     @SerializedName("id") val id: String?,
-    @SerializedName("login") val login: String?
+    @SerializedName("login") val login: String?,
+    @SerializedName("error") val error: String? = null
+)
+
+data class RegisterRequest(val email: String, val password: String)
+data class RegisterResponse(
+    @SerializedName("success") val success: Boolean? = null,
+    @SerializedName("userUpdated") val userUpdated: Boolean? = null,
+    @SerializedName("emailError") val emailError: String? = null,
+    @SerializedName("error") val error: String? = null
 )
 
 data class GetEntitiesRequest(
@@ -106,6 +115,12 @@ data class ServerVersionResponseDto(
 interface ProtoLinkApi {
     @POST("api/Authentication/login")
     suspend fun login(@Body body: LoginRequest): LoginResponse
+
+    @POST("api/Authentication/register")
+    suspend fun register(
+        @Body body: RegisterRequest,
+        @Query("lang") lang: String
+    ): RegisterResponse
 
     @GET("api/Version")
     suspend fun getVersion(): ServerVersionResponseDto

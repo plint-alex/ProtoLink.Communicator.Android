@@ -16,8 +16,8 @@ class SignalRService @Inject constructor(
     private val tokenStore: TokenStore
 ) {
     private var hub: HubConnection? = null
-    /** Invoked on main thread with optional commandType (e.g. message_sent, data_changed). */
-    var onCommand: ((String?) -> Unit)? = null
+    /** Invoked on main thread with commandType and optional parameters map. */
+    var onCommand: ((String?, Map<String, Any?>?) -> Unit)? = null
 
     fun start() {
         val token = tokenStore.load()?.accessToken ?: return
@@ -29,10 +29,10 @@ class SignalRService @Inject constructor(
             })
             .build()
 
-        // Server sends a CommandMessage JSON object; Gson typically yields LinkedTreeMap / Map.
         hub?.on("ReceiveCommand", { payload: Any? ->
             val type = extractCommandType(payload)
-            CoroutineScope(Dispatchers.Main).launch { onCommand?.invoke(type) }
+            val params = extractParameters(payload)
+            CoroutineScope(Dispatchers.Main).launch { onCommand?.invoke(type, params) }
         }, Any::class.java)
 
         CoroutineScope(Dispatchers.IO).launch {
@@ -51,6 +51,16 @@ class SignalRService @Inject constructor(
         is String -> payload
         is Map<*, *> -> (payload["commandType"] ?: payload["CommandType"])?.toString()
         else -> null
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun extractParameters(payload: Any?): Map<String, Any?>? {
+        if (payload !is Map<*, *>) return null
+        val raw = payload["parameters"] ?: payload["Parameters"] ?: return null
+        return when (raw) {
+            is Map<*, *> -> raw.entries.associate { (k, v) -> k.toString() to v }
+            else -> null
+        }
     }
 
     fun stop() {

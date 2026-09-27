@@ -13,6 +13,8 @@ import ru.protolink.communicator.data.AuthRepository
 import ru.protolink.communicator.data.CloudCodes
 import ru.protolink.communicator.data.CloudSyncMappingDto
 import ru.protolink.communicator.data.MappingStore
+import ru.protolink.communicator.data.MessengerNotifier
+import ru.protolink.communicator.data.MessengerReadStore
 import ru.protolink.communicator.data.NotesTreeBuilder
 import ru.protolink.communicator.data.SettingsStore
 import ru.protolink.communicator.data.SignalRService
@@ -47,15 +49,33 @@ import java.time.Instant
 import javax.inject.Inject
 
 data class CloudItem(val id: String, val name: String, val isFolder: Boolean)
-data class ContactItem(val userId: String, val displayName: String)
+data class ContactItem(
+    val userId: String,
+    val displayName: String,
+    val unreadCount: Int = 0
+) {
+    val hasUnread: Boolean get() = unreadCount > 0
+    val unreadLabel: String get() = if (unreadCount > 99) "99+" else unreadCount.toString()
+}
+
+enum class DeliveryStatus { Sending, Sent, Read }
+
 data class MessageItem(
     val id: String,
     val text: String,
     val mine: Boolean,
-    val timestampMillis: Long
+    val timestampMillis: Long,
+    val deliveryStatus: DeliveryStatus = DeliveryStatus.Sent
 ) {
     val timeLabel: String get() = ru.protolink.communicator.util.ChatTime.formatTime(timestampMillis)
     val dayLabel: String get() = ru.protolink.communicator.util.ChatTime.formatDayLabel(timestampMillis)
+    val ticksText: String
+        get() = when (deliveryStatus) {
+            DeliveryStatus.Sending -> "◌"
+            DeliveryStatus.Read -> "✓✓"
+            DeliveryStatus.Sent -> "✓"
+        }
+    val ticksRead: Boolean get() = deliveryStatus == DeliveryStatus.Read
 }
 data class NoteTreeRow(
     val documentId: String,
@@ -121,6 +141,8 @@ class MainViewModel @Inject constructor(
     private val metadataStore: MetadataStore,
     private val remoteCloud: ApiRemoteCloud,
     private val localFs: SafLocalFileSystem,
+    private val messengerReadStore: MessengerReadStore,
+    private val messengerNotifier: MessengerNotifier,
     @ApplicationContext private val appContext: Context
 ) : ViewModel() {
     private val _state = MutableStateFlow(UiState())
@@ -128,6 +150,8 @@ class MainViewModel @Inject constructor(
     private var autoSyncJob: Job? = null
     private var chatPollJob: Job? = null
     private var loadMessagesJob: Job? = null
+    private val readReceiptNotified = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    @Volatile var appInForeground: Boolean = true
 
     init {
         refreshAuth()
@@ -143,7 +167,7 @@ class MainViewModel @Inject constructor(
             // Contacts first — never wait on cloud root/sync or SignalR.
             loadContacts()
             viewModelScope.launch {
-                signalR.onCommand = { handleRealtimeCommand(it) }
+                signalR.onCommand = { type, params -> handleRealtimeCommand(type, params) }
                 runCatching { signalR.start() }
             }
             viewModelScope.launch {
@@ -219,20 +243,19 @@ class MainViewModel @Inject constructor(
 
 
     /** Messenger always; Cloud full sync only on data_changed. */
-    private fun handleRealtimeCommand(commandType: String?) {
+    private fun handleRealtimeCommand(commandType: String?, parameters: Map<String, Any?>? = null) {
         viewModelScope.launch {
             Log.i("ProtoLinkChat", "realtime command=$commandType selected=${_state.value.selectedContact?.userId}")
-            val openChat = _state.value.selectedContact
-            // message_sent: reload open chat first and skip heavy follow-up work.
-            if (openChat != null) {
-                loadMessages(openChat)
-            } else {
-                Log.i("ProtoLinkChat", "realtime: no open chat")
-            }
-            if (commandType.equals("message_sent", ignoreCase = true)) {
-                _state.update { it.copy(status = "Live update (message_sent)") }
+            if (commandType.equals("message_read", ignoreCase = true)) {
+                handleMessageRead(parameters)
                 return@launch
             }
+            if (commandType.equals("message_sent", ignoreCase = true)) {
+                handleIncomingMessageSent(parameters)
+                return@launch
+            }
+            val openChat = _state.value.selectedContact
+            if (openChat != null) loadMessages(openChat)
             loadContacts()
             if (!settingsStore.load().notesRootUri.isNullOrBlank()) {
                 refreshNotesTree()
@@ -241,6 +264,120 @@ class MainViewModel @Inject constructor(
                 requestFullSync()
             }
             _state.update { it.copy(status = "Live update${commandType?.let { t -> " ($t)" } ?: ""}") }
+        }
+    }
+
+    private suspend fun handleIncomingMessageSent(parameters: Map<String, Any?>?) {
+        val senderId = parameters?.get("senderId")?.toString()
+            ?: parameters?.get("SenderId")?.toString()
+        val text = parameters?.get("messageText")?.toString()
+            ?: parameters?.get("MessageText")?.toString()
+            ?: "New message"
+        val me = auth.current()?.userId
+        val fromOther = !senderId.isNullOrBlank() && me != null && !senderId.equals(me, true)
+        val openId = _state.value.selectedContact?.userId
+        val chatOpen = fromOther && openId != null && senderId.equals(openId, true)
+        if (fromOther && (!chatOpen || !appInForeground)) {
+            val title = _state.value.contacts.firstOrNull { it.userId.equals(senderId, true) }?.displayName
+                ?: senderId!!
+            messengerNotifier.notifyMessage(senderId!!, title, text)
+        }
+        val openChat = _state.value.selectedContact
+        if (openChat != null) loadMessages(openChat)
+        refreshUnreadBadges()
+        _state.update { it.copy(status = "Live update (message_sent)") }
+    }
+
+    private suspend fun handleMessageRead(parameters: Map<String, Any?>?) {
+        val rawIds = parameters?.get("messageIds") ?: parameters?.get("MessageIds")
+        val ids = when (rawIds) {
+            is Collection<*> -> rawIds.mapNotNull { it?.toString() }.filter { it.isNotBlank() }
+            is Array<*> -> rawIds.mapNotNull { it?.toString() }.filter { it.isNotBlank() }
+            else -> emptyList()
+        }
+        if (ids.isEmpty()) return
+        for (id in ids) {
+            runCatching {
+                api.addValue(
+                    id,
+                    AddValueRequest(
+                        type = AddValueRequest.TYPE_STRING,
+                        value = "status:read",
+                        parentIds = listOf(SystemEntities.MESSAGE)
+                    )
+                )
+            }
+        }
+        _state.update { s ->
+            s.copy(
+                messages = s.messages.map { m ->
+                    if (m.mine && ids.any { it.equals(m.id, true) })
+                        m.copy(deliveryStatus = DeliveryStatus.Read)
+                    else m
+                }
+            )
+        }
+    }
+
+    private suspend fun markOpenChatRead(contactId: String, messages: List<MessageItem>) {
+        messengerReadStore.markOpened(contactId)
+        messengerNotifier.cancelForContact(contactId)
+        val me = auth.current()?.userId ?: return
+        val incomingIds = messages
+            .filter { !it.mine && !it.id.startsWith("local-") }
+            .map { it.id }
+            .filter { readReceiptNotified.add(it.lowercase()) }
+        if (incomingIds.isEmpty()) {
+            refreshUnreadBadges()
+            return
+        }
+        runCatching {
+            api.sendCommand(
+                SendCommandRequest(
+                    commandType = "message_read",
+                    targetUserId = contactId,
+                    parameters = mapOf(
+                        "messageIds" to incomingIds,
+                        "peerId" to me
+                    )
+                )
+            )
+        }
+        refreshUnreadBadges()
+    }
+
+    private suspend fun refreshUnreadBadges() {
+        val me = auth.current()?.userId ?: return
+        val contacts = _state.value.contacts
+        if (contacts.isEmpty()) return
+        val all = runCatching {
+            api.getEntities(
+                GetEntitiesRequest(parentIds = listOf(SystemEntities.MESSAGE), includeValues = true, take = 5000)
+            )
+        }.getOrElse { return }
+        val counts = contacts.associate { it.userId.lowercase() to 0 }.toMutableMap()
+        for (e in all) {
+            val vals = e.values ?: continue
+            val texts = vals.mapNotNull { JsonValues.asText(it.value)?.trim()?.takeIf { t -> t.isNotEmpty() } }
+            val sender = texts.firstOrNull { it.startsWith("sender:", true) }?.substringAfter(":") ?: continue
+            val receiver = texts.firstOrNull { it.startsWith("receiver:", true) }?.substringAfter(":") ?: continue
+            if (!receiver.equals(me, true)) continue
+            if (sender.equals(me, true)) continue
+            val key = sender.lowercase()
+            if (!counts.containsKey(key)) continue
+            val millis = ChatTime.resolveMessageMillis(e.creationTime, e.updateTime, null)
+            val opened = messengerReadStore.getOpenedUtcMillis(sender)
+            if (millis > opened) counts[key] = (counts[key] ?: 0) + 1
+        }
+        _state.update { s ->
+            s.copy(
+                contacts = s.contacts.map { c ->
+                    c.copy(unreadCount = counts[c.userId.lowercase()] ?: 0)
+                },
+                selectedContact = s.selectedContact?.let { sel ->
+                    sel.copy(unreadCount = counts[sel.userId.lowercase()] ?: 0)
+                }
+            )
         }
     }
 
@@ -276,7 +413,7 @@ class MainViewModel @Inject constructor(
                 _state.update { s -> s.copy(authenticated = true, login = it.login, status = "Logged in", showSettings = false) }
                 loadContacts()
                 viewModelScope.launch {
-                    signalR.onCommand = { handleRealtimeCommand(it) }
+                    signalR.onCommand = { type, params -> handleRealtimeCommand(type, params) }
                     runCatching { signalR.start() }
                 }
                 viewModelScope.launch { runCatching { ensureCloudRoot() } }
@@ -286,6 +423,32 @@ class MainViewModel @Inject constructor(
             .onFailure { e ->
                 _state.update { it.copy(status = "Login failed: ${e.message}") }
             }
+    }
+
+    suspend fun registerAsync(
+        email: String,
+        password: String,
+        lang: String = java.util.Locale.getDefault().toLanguageTag()
+    ): ru.protolink.communicator.data.RegisterOutcome {
+        _state.update { it.copy(status = "Creating account…") }
+        val outcome = auth.register(email, password, lang).getOrElse { e ->
+            _state.update { it.copy(status = "Registration failed: ${e.message}") }
+            return ru.protolink.communicator.data.RegisterOutcome(
+                success = false,
+                error = e.message ?: "Registration failed"
+            )
+        }
+        _state.update {
+            it.copy(
+                status = when {
+                    !outcome.emailError.isNullOrBlank() -> "Email send failed"
+                    !outcome.error.isNullOrBlank() -> outcome.error
+                    outcome.success -> "Check your email"
+                    else -> "Registration failed"
+                }
+            )
+        }
+        return outcome
     }
 
     fun logout() {
@@ -723,6 +886,7 @@ class MainViewModel @Inject constructor(
                 )
             }
             // Stay on chat list until the user opens a conversation (phones show list first).
+            refreshUnreadBadges()
 
             // Enrich display names without blocking list/chat
             launch {
@@ -739,12 +903,19 @@ class MainViewModel @Inject constructor(
                 val selectedId = _state.value.selectedContact?.userId
                 _state.update { s ->
                     s.copy(
-                        contacts = enriched,
-                        selectedContact = selectedId?.let { id -> enriched.firstOrNull { it.userId.equals(id, true) } }
-                            ?: s.selectedContact,
+                        contacts = enriched.map { e ->
+                            val prev = s.contacts.firstOrNull { it.userId.equals(e.userId, true) }
+                            e.copy(unreadCount = prev?.unreadCount ?: 0)
+                        },
+                        selectedContact = selectedId?.let { id ->
+                            val hit = enriched.firstOrNull { it.userId.equals(id, true) }
+                            val prev = s.selectedContact
+                            hit?.copy(unreadCount = prev?.unreadCount ?: 0) ?: s.selectedContact
+                        } ?: s.selectedContact,
                         status = "Contacts: ${enriched.size}"
                     )
                 }
+                refreshUnreadBadges()
             }
         } catch (e: Exception) {
             Log.e("ProtoLinkContacts", "loadContacts failed", e)
@@ -805,12 +976,26 @@ class MainViewModel @Inject constructor(
                 val body = texts.firstOrNull { t ->
                     !t.startsWith("sender:", true) &&
                         !t.startsWith("receiver:", true) &&
+                        !t.equals("status:read", true) &&
+                        !t.startsWith("status:", true) &&
                         !ChatTime.looksLikeIsoDate(t)
                 } ?: return@mapNotNull null
 
                 val valueDateRaw = texts.firstOrNull { ChatTime.looksLikeIsoDate(it) }
                 val millis = ChatTime.resolveMessageMillis(e.creationTime, e.updateTime, valueDateRaw)
-                MessageItem(e.id, body, sender.equals(me, ignoreCase = true), millis)
+                val isMine = sender.equals(me, ignoreCase = true)
+                val isRead = isMine && texts.any { it.equals("status:read", true) }
+                MessageItem(
+                    id = e.id,
+                    text = body,
+                    mine = isMine,
+                    timestampMillis = millis,
+                    deliveryStatus = when {
+                        !isMine -> DeliveryStatus.Sent
+                        isRead -> DeliveryStatus.Read
+                        else -> DeliveryStatus.Sent
+                    }
+                )
             }.sortedWith(compareBy({ it.timestampMillis }, { it.id }))
 
             // Drop pending sends that now exist on the server (same body from me).
@@ -836,11 +1021,15 @@ class MainViewModel @Inject constructor(
             Log.i("ProtoLinkChat", "loadMessages done raw=${all.size} matched=${msgs.size} pending=${pendingForChat.size} merged=${merged.size}")
             val prev = _state.value.messages
             if (prev.size == merged.size &&
-                prev.zip(merged).all { (a, b) -> a.id == b.id && a.text == b.text && a.mine == b.mine }
+                prev.zip(merged).all { (a, b) ->
+                    a.id == b.id && a.text == b.text && a.mine == b.mine && a.deliveryStatus == b.deliveryStatus
+                }
             ) {
+                markOpenChatRead(contactId, merged)
                 return@launch
             }
             _state.update { it.copy(messages = merged, status = "Messages: ${merged.size}") }
+            markOpenChatRead(contactId, merged)
         } catch (ex: Exception) {
             if (ex is kotlinx.coroutines.CancellationException) throw ex
             showError("Load messages failed", httpDetail(ex), ex)
@@ -870,7 +1059,13 @@ class MainViewModel @Inject constructor(
         val sentAtMillis = System.currentTimeMillis()
 
         val optimisticId = "local-${System.nanoTime()}"
-        val optimistic = MessageItem(optimisticId, body, mine = true, timestampMillis = sentAtMillis)
+        val optimistic = MessageItem(
+            optimisticId,
+            body,
+            mine = true,
+            timestampMillis = sentAtMillis,
+            deliveryStatus = DeliveryStatus.Sending
+        )
         pendingChatSends[optimisticId] = optimistic
         pendingChatSendContact[optimisticId] = peer
         _state.update {
@@ -961,7 +1156,21 @@ class MainViewModel @Inject constructor(
                 }
             }
 
-            _state.update { it.copy(status = "Sent $id") }
+            val sentMsg = MessageItem(
+                id = id,
+                text = body,
+                mine = true,
+                timestampMillis = sentAtMillis,
+                deliveryStatus = DeliveryStatus.Sent
+            )
+            pendingChatSends.remove(optimisticId)
+            pendingChatSendContact.remove(optimisticId)
+            _state.update { s ->
+                s.copy(
+                    messages = s.messages.map { if (it.id == optimisticId) sentMsg else it },
+                    status = "Sent $id"
+                )
+            }
             _state.value.selectedContact?.let { loadMessages(it) }
         } catch (ex: Exception) {
             pendingChatSends.remove(optimisticId)
@@ -974,6 +1183,17 @@ class MainViewModel @Inject constructor(
             }
             showError("Send failed", httpDetail(ex), ex)
         }
+    }
+
+    fun openContactById(contactId: String) {
+        if (contactId.isBlank()) return
+        val hit = _state.value.contacts.firstOrNull { it.userId.equals(contactId, true) }
+            ?: ContactItem(contactId, contactId)
+        selectContact(hit)
+    }
+
+    fun setAppForeground(foreground: Boolean) {
+        appInForeground = foreground
     }
 
     private suspend fun ensureMessengerContainer(
