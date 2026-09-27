@@ -163,6 +163,17 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
         return
     }
 
+    if (state.userError != null) {
+        AlertDialog(
+            onDismissRequest = { vm.dismissUserError() },
+            title = { Text(state.userError!!.title) },
+            text = { Text(state.userError!!.detail) },
+            confirmButton = {
+                TextButton(onClick = { vm.dismissUserError() }) { Text("OK") }
+            }
+        )
+    }
+
     if (state.syncError != null) {
         AlertDialog(
             onDismissRequest = { vm.clearSyncError() },
@@ -723,6 +734,14 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
 @Composable
 fun MessengerScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true) {
     var draft by remember { mutableStateOf("") }
+    LaunchedEffect(state.composerClearNonce) {
+        if (state.composerClearNonce > 0) draft = ""
+    }
+    LaunchedEffect(state.composerDraftRestore) {
+        val restore = state.composerDraftRestore ?: return@LaunchedEffect
+        draft = restore
+        vm.consumeDraftRestore()
+    }
     var stickyDate by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     if (!state.authenticated) {
@@ -789,7 +808,6 @@ fun MessengerScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = t
                 onSend = {
                     if (draft.isNotBlank()) {
                         vm.sendMessage(draft)
-                        draft = ""
                     }
                 },
                 onBack = { vm.clearSelectedContact() },
@@ -816,7 +834,6 @@ fun MessengerScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = t
                 onSend = {
                     if (draft.isNotBlank()) {
                         vm.sendMessage(draft)
-                        draft = ""
                     }
                 },
                 onBack = { vm.clearSelectedContact() },

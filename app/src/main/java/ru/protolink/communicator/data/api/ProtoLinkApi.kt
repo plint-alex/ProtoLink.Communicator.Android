@@ -52,7 +52,16 @@ data class EntityValueDto(
 data class AddEntityRequest(
     val code: String,
     val parentIds: List<String>,
-    val values: List<AddValueRequest>? = null
+    val values: List<AddValueRequest>? = null,
+    /** Peer read (CanWrite=false) so the other user can load the message via GetEntities. */
+    val permissions: List<AddPermissionRequest>? = null
+)
+
+data class AddPermissionRequest(
+    val permissionForId: String,
+    val canWrite: Boolean = false,
+    /** Used by standalone AddPermission; ignored when nested under AddEntity. */
+    val id: String? = null
 )
 
 data class AddValueRequest(
@@ -123,7 +132,7 @@ interface ProtoLinkApi {
     suspend fun removeParent(@Body body: RemoveParentRequest): ResponseBody
 
     @POST("api/Entities/AddPermission")
-    suspend fun addPermission(@Body body: Map<String, Any?>): ResponseBody
+    suspend fun addPermission(@Body body: AddPermissionRequest): ResponseBody
 
     @Streaming
     @GET("api/Files/getFile/{id}")

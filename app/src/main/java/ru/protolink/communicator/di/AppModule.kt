@@ -52,8 +52,30 @@ object AppModule {
             // are common; clearing here logs the user out of Android when Windows is active too.
             resp
         }
+        val messengerLog = Interceptor { chain ->
+            val req = chain.request()
+            val path = req.url.encodedPath
+            val watch = path.contains("AddEntity", true) ||
+                path.contains("AddPermission", true) ||
+                path.contains("commands", true) ||
+                (path.contains("GetEntities", true) && req.method.equals("POST", true))
+            if (watch) {
+                val copy = req.newBuilder().build()
+                val buffer = okio.Buffer()
+                copy.body?.writeTo(buffer)
+                val reqBody = buffer.readUtf8().take(2000)
+                android.util.Log.i("ProtoLinkHttp", "--> ${req.method} $path body=$reqBody")
+            }
+            val resp = chain.proceed(req)
+            if (watch) {
+                val peek = resp.peekBody(2000)
+                android.util.Log.i("ProtoLinkHttp", "<-- ${resp.code} $path body=${peek.string()}")
+            }
+            resp
+        }
         return OkHttpClient.Builder()
             .addInterceptor(auth)
+            .addInterceptor(messengerLog)
             .addInterceptor(HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC })
             .connectTimeout(60, TimeUnit.SECONDS)
             .readTimeout(180, TimeUnit.SECONDS)

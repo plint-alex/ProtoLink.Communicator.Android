@@ -18,6 +18,7 @@ import ru.protolink.communicator.data.SettingsStore
 import ru.protolink.communicator.data.SignalRService
 import ru.protolink.communicator.data.SystemEntities
 import ru.protolink.communicator.data.api.AddEntityRequest
+import ru.protolink.communicator.data.api.AddPermissionRequest
 import ru.protolink.communicator.data.api.AddValueRequest
 import ru.protolink.communicator.data.api.EntityDto
 import ru.protolink.communicator.data.api.GetEntitiesRequest
@@ -68,6 +69,8 @@ data class NoteTreeRow(
     val indexUri: String?
 )
 
+data class UserError(val title: String, val detail: String)
+
 data class PendingForce(
     val cloudFolderId: String,
     val push: Boolean
@@ -77,6 +80,10 @@ data class UiState(
     val authenticated: Boolean = false,
     val login: String = "",
     val status: String = "",
+    /** Bumped after a send is accepted locally so the composer can clear the draft. */
+    val composerClearNonce: Int = 0,
+    /** When set, MessengerScreen puts this text back into the draft field. */
+    val composerDraftRestore: String? = null,
     val settings: AppSettings = AppSettings(),
     val cloudItems: List<CloudItem> = emptyList(),
     val breadcrumb: List<Pair<String, String>> = emptyList(),
@@ -98,6 +105,7 @@ data class UiState(
     val forceRunning: Boolean = false,
     val pendingForce: PendingForce? = null,
     val syncError: String? = null,
+    val userError: UserError? = null,
     val syncSuccess: String? = null,
     val appVersion: String = BuildConfig.VERSION_NAME,
     val apiVersionText: String = ""
@@ -118,6 +126,8 @@ class MainViewModel @Inject constructor(
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state
     private var autoSyncJob: Job? = null
+    private var chatPollJob: Job? = null
+    private var loadMessagesJob: Job? = null
 
     init {
         refreshAuth()
@@ -170,11 +180,60 @@ class MainViewModel @Inject constructor(
         _state.update { it.copy(authenticated = auth.isAuthenticated, login = auth.current()?.login.orEmpty()) }
     }
 
+    fun dismissUserError() {
+        _state.update { it.copy(userError = null) }
+    }
+
+    private fun showError(title: String, detail: String, ex: Throwable? = null) {
+        val full = buildString {
+            append(detail)
+            if (ex != null) {
+                append("\n\n")
+                append(ex.javaClass.simpleName)
+                append(": ")
+                append(ex.message ?: "")
+                val cause = ex.cause
+                if (cause != null) {
+                    append("\nCaused by: ")
+                    append(cause.javaClass.simpleName)
+                    append(": ")
+                    append(cause.message ?: "")
+                }
+            }
+        }
+        Log.e("ProtoLinkChat", "$title — $full", ex)
+        _state.update {
+            it.copy(
+                status = "$title: ${detail.take(120)}",
+                userError = UserError(title, full.take(4000))
+            )
+        }
+    }
+
+    private fun httpDetail(ex: Throwable): String {
+        val http = ex as? retrofit2.HttpException
+        if (http == null) return ex.message ?: ex.javaClass.simpleName
+        val body = runCatching { http.response()?.errorBody()?.string() }.getOrNull()?.take(1500)
+        return "HTTP ${http.code()} ${http.message()}" + (body?.let { "\n$it" } ?: "")
+    }
+
+
     /** Messenger always; Cloud full sync only on data_changed. */
     private fun handleRealtimeCommand(commandType: String?) {
         viewModelScope.launch {
+            Log.i("ProtoLinkChat", "realtime command=$commandType selected=${_state.value.selectedContact?.userId}")
+            val openChat = _state.value.selectedContact
+            // message_sent: reload open chat first and skip heavy follow-up work.
+            if (openChat != null) {
+                loadMessages(openChat)
+            } else {
+                Log.i("ProtoLinkChat", "realtime: no open chat")
+            }
+            if (commandType.equals("message_sent", ignoreCase = true)) {
+                _state.update { it.copy(status = "Live update (message_sent)") }
+                return@launch
+            }
             loadContacts()
-            _state.value.selectedContact?.let { loadMessages(it) }
             if (!settingsStore.load().notesRootUri.isNullOrBlank()) {
                 refreshNotesTree()
             }
@@ -231,9 +290,12 @@ class MainViewModel @Inject constructor(
 
     fun logout() {
         stopAutoSyncInterval()
+        chatPollJob?.cancel()
+        chatPollJob = null
+        loadMessagesJob?.cancel()
         signalR.stop()
         auth.logout()
-        _state.update { it.copy(authenticated = false, login = "", contacts = emptyList(), messages = emptyList()) }
+        _state.update { it.copy(authenticated = false, login = "", contacts = emptyList(), messages = emptyList(), selectedContact = null) }
     }
 
     private var cloudRootId: String? = null
@@ -693,18 +755,43 @@ class MainViewModel @Inject constructor(
     fun selectContact(c: ContactItem) {
         _state.update { it.copy(selectedContact = c) }
         loadMessages(c)
+        startChatPoll()
     }
 
     fun clearSelectedContact() {
+        chatPollJob?.cancel()
+        chatPollJob = null
+        loadMessagesJob?.cancel()
         _state.update { it.copy(selectedContact = null, messages = emptyList()) }
     }
 
-    fun loadMessages(c: ContactItem) = viewModelScope.launch {
+    private fun startChatPoll() {
+        chatPollJob?.cancel()
+        chatPollJob = viewModelScope.launch {
+            while (isActive) {
+                delay(2_000)
+                val open = _state.value.selectedContact ?: break
+                loadMessages(open)
+            }
+        }
+    }
+
+    fun loadMessages(c: ContactItem) {
+        loadMessagesJob?.cancel()
+        loadMessagesJob = viewModelScope.launch {
         val me = auth.current()?.userId ?: return@launch
+        val contactId = c.userId
+        Log.i("ProtoLinkChat", "loadMessages start contact=$contactId")
         try {
             val all = api.getEntities(
                 GetEntitiesRequest(parentIds = listOf(SystemEntities.MESSAGE), includeValues = true, take = 5000)
             )
+            val selectedId = _state.value.selectedContact?.userId
+            if (selectedId == null || !selectedId.equals(contactId, ignoreCase = true)) {
+                Log.w("ProtoLinkChat", "loadMessages skip stale contact=$contactId selected=$selectedId")
+                return@launch
+            }
+
             val msgs = all.mapNotNull { e ->
                 val vals = e.values ?: return@mapNotNull null
                 val texts = vals.mapNotNull { JsonValues.asText(it.value)?.trim()?.takeIf { t -> t.isNotEmpty() } }
@@ -712,7 +799,7 @@ class MainViewModel @Inject constructor(
                 val receiver = texts.firstOrNull { it.startsWith("receiver:", true) }?.substringAfter(":")
                 if (sender.isNullOrBlank() || receiver.isNullOrBlank()) return@mapNotNull null
                 val participants = setOf(sender.lowercase(), receiver.lowercase())
-                val wanted = setOf(me.lowercase(), c.userId.lowercase())
+                val wanted = setOf(me.lowercase(), contactId.lowercase())
                 if (participants != wanted) return@mapNotNull null
 
                 val body = texts.firstOrNull { t ->
@@ -721,29 +808,86 @@ class MainViewModel @Inject constructor(
                         !ChatTime.looksLikeIsoDate(t)
                 } ?: return@mapNotNull null
 
-                val timeRaw = texts.firstOrNull { ChatTime.looksLikeIsoDate(it) }
-                    ?: e.creationTime
-                    ?: e.updateTime
-                val millis = ChatTime.parseMillis(timeRaw).takeIf { it > 0 }
-                    ?: ChatTime.parseMillis(e.creationTime)
+                val valueDateRaw = texts.firstOrNull { ChatTime.looksLikeIsoDate(it) }
+                val millis = ChatTime.resolveMessageMillis(e.creationTime, e.updateTime, valueDateRaw)
                 MessageItem(e.id, body, sender.equals(me, ignoreCase = true), millis)
-            }.sortedBy { it.timestampMillis }
-            _state.update { it.copy(messages = msgs, status = "Messages: ${msgs.size}") }
+            }.sortedWith(compareBy({ it.timestampMillis }, { it.id }))
+
+            // Drop pending sends that now exist on the server (same body from me).
+            val serverMineBodies = msgs.filter { it.mine }.map { it.text.trim() }.toHashSet()
+            val contactKey = contactId.lowercase()
+            pendingChatSends.keys.toList().forEach { localId ->
+                val pendingContact = pendingChatSendContact[localId] ?: return@forEach
+                if (!pendingContact.equals(contactKey, ignoreCase = true)) return@forEach
+                val pendingMsg = pendingChatSends[localId] ?: return@forEach
+                if (pendingMsg.text.trim() in serverMineBodies) {
+                    pendingChatSends.remove(localId)
+                    pendingChatSendContact.remove(localId)
+                }
+            }
+
+            val pendingForChat = pendingChatSends.mapNotNull { (localId, msg) ->
+                val pc = pendingChatSendContact[localId] ?: return@mapNotNull null
+                if (pc.equals(contactKey, ignoreCase = true)) msg else null
+            }
+            val merged = (msgs + pendingForChat)
+                .distinctBy { it.id }
+                .sortedWith(compareBy({ it.timestampMillis }, { it.id }))
+            Log.i("ProtoLinkChat", "loadMessages done raw=${all.size} matched=${msgs.size} pending=${pendingForChat.size} merged=${merged.size}")
+            val prev = _state.value.messages
+            if (prev.size == merged.size &&
+                prev.zip(merged).all { (a, b) -> a.id == b.id && a.text == b.text && a.mine == b.mine }
+            ) {
+                return@launch
+            }
+            _state.update { it.copy(messages = merged, status = "Messages: ${merged.size}") }
         } catch (ex: Exception) {
-            Log.e("ProtoLinkChat", "loadMessages failed", ex)
-            _state.update { it.copy(status = "Messages failed: ${ex.message}") }
+            if (ex is kotlinx.coroutines.CancellationException) throw ex
+            showError("Load messages failed", httpDetail(ex), ex)
+        }
         }
     }
 
+    fun consumeDraftRestore() {
+        _state.update { it.copy(composerDraftRestore = null) }
+    }
+
     fun sendMessage(text: String) = viewModelScope.launch {
-        val me = auth.current()?.userId ?: return@launch
-        val peer = _state.value.selectedContact?.userId ?: return@launch
+        val me = auth.current()?.userId?.trim()?.lowercase()
+        if (me.isNullOrBlank()) {
+            Log.e("ProtoLinkChat", "sendMessage aborted: no userId")
+            showError("Send failed", "Not logged in"); _state.update { it.copy(composerDraftRestore = text) }
+            return@launch
+        }
+        val peer = _state.value.selectedContact?.userId?.trim()?.lowercase()
+        if (peer.isNullOrBlank()) {
+            Log.e("ProtoLinkChat", "sendMessage aborted: no selected contact")
+            showError("Send failed", "No contact selected"); _state.update { it.copy(composerDraftRestore = text) }
+            return@launch
+        }
         val body = text.trim()
         if (body.isEmpty()) return@launch
-        // .NET DateTimeValue.GetDateTime() rejects Instant nanos (9 digits); use millis ISO-8601.
-        val sentAt = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.MILLIS).toString()
+        val sentAtMillis = System.currentTimeMillis()
+
+        val optimisticId = "local-${System.nanoTime()}"
+        val optimistic = MessageItem(optimisticId, body, mine = true, timestampMillis = sentAtMillis)
+        pendingChatSends[optimisticId] = optimistic
+        pendingChatSendContact[optimisticId] = peer
+        _state.update {
+            it.copy(
+                messages = it.messages + optimistic,
+                status = "Sending.",
+                composerClearNonce = it.composerClearNonce + 1
+            )
+        }
+        Log.i("ProtoLinkChat", "sendMessage start me=$me peer=$peer bodyLen=${body.length}")
+
         try {
-            val id = api.addEntity(
+            runCatching { ensureMessengerContainer(SystemEntities.SENT, me, "Sent", grantWrite = false) }
+            runCatching { ensureMessengerContainer(SystemEntities.RECEIVED, peer, "Received", grantWrite = true) }
+
+            // Omit DateTime value: Instant JSON has caused AddEntity failures; creationTime is enough for UI.
+            val created = api.addEntity(
                 AddEntityRequest(
                     code = "Message",
                     parentIds = listOf(SystemEntities.MESSAGE),
@@ -751,11 +895,6 @@ class MainViewModel @Inject constructor(
                         AddValueRequest(
                             type = AddValueRequest.TYPE_STRING,
                             value = body,
-                            parentIds = listOf(SystemEntities.MESSAGE)
-                        ),
-                        AddValueRequest(
-                            type = AddValueRequest.TYPE_DATETIME,
-                            value = sentAt,
                             parentIds = listOf(SystemEntities.MESSAGE)
                         ),
                         AddValueRequest(
@@ -768,9 +907,31 @@ class MainViewModel @Inject constructor(
                             value = "receiver:$peer",
                             parentIds = listOf(SystemEntities.RECEIVED)
                         )
-                    )
+                    ),
+                    // Same as Windows: peer must get read permission or GetEntities hides the message.
+                    permissions = if (peer != me) {
+                        listOf(AddPermissionRequest(permissionForId = peer, canWrite = false))
+                    } else {
+                        null
+                    }
                 )
-            ).id
+            )
+            val id = created.id
+            Log.i("ProtoLinkChat", "sendMessage AddEntity ok id=$id")
+            if (id.isNullOrBlank()) error("AddEntity returned empty id")
+
+            if (peer != me) {
+                try {
+                    api.addPermission(AddPermissionRequest(permissionForId = peer, canWrite = false, id = id))
+                    Log.i("ProtoLinkChat", "sendMessage AddPermission ok peer=$peer")
+                } catch (ex: Exception) {
+                    val detail = (ex as? retrofit2.HttpException)?.response()?.errorBody()?.string()?.take(300)
+                    showError("Peer share failed", "Message id=$id" + "\n" + (detail ?: httpDetail(ex)), ex)
+                }
+            }
+
+            val sentAt = java.time.Instant.ofEpochMilli(sentAtMillis)
+                .truncatedTo(java.time.temporal.ChronoUnit.MILLIS).toString()
             runCatching {
                 api.sendCommand(
                     SendCommandRequest(
@@ -799,18 +960,48 @@ class MainViewModel @Inject constructor(
                     )
                 }
             }
+
+            _state.update { it.copy(status = "Sent $id") }
             _state.value.selectedContact?.let { loadMessages(it) }
-            _state.update { it.copy(status = "Sent ${id ?: ""}") }
         } catch (ex: Exception) {
-            val detail = (ex as? retrofit2.HttpException)?.response()?.errorBody()?.string()?.take(300)
-            Log.e("ProtoLinkChat", "sendMessage failed: ${ex.message} $detail", ex)
-            _state.update {
-                it.copy(status = "Send failed: ${ex.message}${detail?.let { d -> " — $d" } ?: ""}")
+            pendingChatSends.remove(optimisticId)
+            pendingChatSendContact.remove(optimisticId)
+            _state.update { s ->
+                s.copy(
+                    messages = s.messages.filterNot { it.id == optimisticId },
+                    composerDraftRestore = body
+                )
             }
+            showError("Send failed", httpDetail(ex), ex)
         }
     }
 
-    fun setNotesRoot(uri: String) {
+    private suspend fun ensureMessengerContainer(
+        systemParentId: String,
+        userId: String,
+        code: String,
+        grantWrite: Boolean
+    ): Boolean {
+        return try {
+            val existing = api.getEntities(
+                GetEntitiesRequest(parentIds = listOf(systemParentId, userId), includeValues = false, take = 10)
+            ).firstOrNull()
+            val containerId = existing?.id ?: api.addEntity(
+                AddEntityRequest(code = code, parentIds = listOf(systemParentId, userId))
+            ).id
+            if (containerId.isNullOrBlank()) return false
+            if (grantWrite) {
+                runCatching {
+                    api.addPermission(AddPermissionRequest(permissionForId = userId, canWrite = true, id = containerId))
+                }
+            }
+            true
+        } catch (ex: Exception) {
+            Log.e("ProtoLinkChat", "ensureMessengerContainer($code) failed", ex)
+            false
+        }
+    }
+fun setNotesRoot(uri: String) {
         val s = settingsStore.load().copy(notesRootUri = uri)
         settingsStore.save(s)
         _state.update {
@@ -829,6 +1020,10 @@ class MainViewModel @Inject constructor(
     }
 
     private var notesRootCache: NotesTreeBuilder.Node? = null
+
+    /** Survives loadMessages races that rewrite state.messages. */
+    private val pendingChatSends = java.util.concurrent.ConcurrentHashMap<String, MessageItem>()
+    private val pendingChatSendContact = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     fun refreshNotesTree() = viewModelScope.launch {
         val rootUriStr = settingsStore.load().notesRootUri
