@@ -94,8 +94,12 @@ import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material3.AlertDialog
 import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.sp
 import android.os.Handler
@@ -1453,7 +1457,79 @@ private fun NotesEditorPane(
     scope: kotlinx.coroutines.CoroutineScope,
     modifier: Modifier = Modifier
 ) {
-    Column(modifier.fillMaxSize().background(Color.White)) {
+    val context = LocalContext.current
+    var selBold by remember { mutableStateOf(false) }
+    var selItalic by remember { mutableStateOf(false) }
+    var selUnderline by remember { mutableStateOf(false) }
+    var selStrike by remember { mutableStateOf(false) }
+    var selCheckbox by remember { mutableStateOf(false) }
+    var selBlock by remember { mutableStateOf("p") }
+    var showLinkDialog by remember { mutableStateOf(false) }
+    var linkUrl by remember { mutableStateOf("https://") }
+    var showHeadingMenu by remember { mutableStateOf(false) }
+
+    fun runJs(js: String) {
+        getWebView()?.evaluateJavascript(js, null)
+    }
+
+    if (showLinkDialog) {
+        AlertDialog(
+            onDismissRequest = { showLinkDialog = false },
+            title = { Text("Insert link") },
+            text = {
+                OutlinedTextField(
+                    value = linkUrl,
+                    onValueChange = { linkUrl = it },
+                    singleLine = true,
+                    label = { Text("URL") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val url = linkUrl.trim()
+                    showLinkDialog = false
+                    if (url.startsWith("http://") || url.startsWith("https://")) {
+                        runJs(notesEditorInsertLinkJs(url))
+                    }
+                }) { Text("Insert") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showLinkDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    if (showHeadingMenu) {
+        AlertDialog(
+            onDismissRequest = { showHeadingMenu = false },
+            title = { Text("Paragraph style") },
+            text = {
+                Column {
+                    listOf(
+                        "p" to "Normal",
+                        "h1" to "Heading 1",
+                        "h2" to "Heading 2",
+                        "h3" to "Heading 3"
+                    ).forEach { (tag, label) ->
+                        TextButton(
+                            onClick = {
+                                showHeadingMenu = false
+                                runJs(notesEditorApplyJs(tag))
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text(label) }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showHeadingMenu = false }) { Text("Close") }
+            }
+        )
+    }
+
+    Column(modifier.fillMaxSize().background(Color.White).imePadding()) {
         Row(
             Modifier
                 .fillMaxWidth()
@@ -1481,14 +1557,33 @@ private fun NotesEditorPane(
             var loadedSig by remember(documentId) { mutableStateOf<Int?>(null) }
             val scheduleState = rememberUpdatedState(onScheduleSave)
             val contentState = rememberUpdatedState(content)
-            val dirtyBridge = remember(documentId) {
-                NotesDirtyBridge {
-                    val web = getWebView() ?: return@NotesDirtyBridge
-                    web.evaluateJavascript(GET_HTML_JS) { value ->
-                        val html = decodeEvaluateJavascriptString(value).ifBlank { contentState.value }
-                        scheduleState.value(html)
+            val bridge = remember(documentId) {
+                NotesEditorBridge(
+                    onDirty = {
+                        val web = getWebView() ?: return@NotesEditorBridge
+                        web.evaluateJavascript(NOTES_GET_HTML_JS) { value ->
+                            val html = decodeEvaluateJavascriptString(value).ifBlank { contentState.value }
+                            scheduleState.value(html)
+                        }
+                    },
+                    onSelectionState = { bold, italic, underline, strike, checkbox, block ->
+                        selBold = bold
+                        selItalic = italic
+                        selUnderline = underline
+                        selStrike = strike
+                        selCheckbox = checkbox
+                        selBlock = block
+                    },
+                    onRequestLink = {
+                        linkUrl = "https://"
+                        showLinkDialog = true
+                    },
+                    onOpenLink = { url ->
+                        runCatching {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+                        }
                     }
-                }
+                )
             }
             AndroidView(
                 factory = { ctx ->
@@ -1497,11 +1592,10 @@ private fun NotesEditorPane(
                         settings.domStorageEnabled = true
                         isFocusable = true
                         isFocusableInTouchMode = true
-                        addJavascriptInterface(dirtyBridge, "ProtoLinkNotes")
+                        addJavascriptInterface(bridge, "ProtoLinkNotes")
                         webViewClient = object : WebViewClient() {
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 view?.evaluateJavascript(FOCUS_SCROLL_JS, null)
-                                view?.evaluateJavascript(DIRTY_TRACK_JS, null)
                             }
                         }
                         webViewRef(this)
@@ -1512,7 +1606,7 @@ private fun NotesEditorPane(
                     val sig = content.length xor content.hashCode()
                     if (loadedSig != sig) {
                         loadedSig = sig
-                        val editable = wrapEditableHtml(content)
+                        val editable = NotesEditorHtml.wrap(context, content)
                         val encoded = android.util.Base64.encodeToString(
                             editable.toByteArray(Charsets.UTF_8),
                             android.util.Base64.NO_WRAP
@@ -1523,9 +1617,136 @@ private fun NotesEditorPane(
                 modifier = Modifier
                     .fillMaxSize()
                     .weight(1f)
-                    .imePadding()
             )
         }
+
+        NotesFormatBar(
+            bold = selBold,
+            italic = selItalic,
+            underline = selUnderline,
+            strike = selStrike,
+            checkbox = selCheckbox,
+            block = selBlock,
+            onBold = { runJs(notesEditorApplyJs("bold")) },
+            onItalic = { runJs(notesEditorApplyJs("italic")) },
+            onUnderline = { runJs(notesEditorApplyJs("underline")) },
+            onStrike = { runJs(notesEditorApplyJs("strikeThrough")) },
+            onHeading = { showHeadingMenu = true },
+            onBullet = { runJs(notesEditorApplyJs("insertUnorderedList")) },
+            onNumbered = { runJs(notesEditorApplyJs("insertOrderedList")) },
+            onCheckbox = { runJs(notesEditorApplyJs("checkboxList")) },
+            onOutdent = { runJs(notesEditorApplyJs("outdent")) },
+            onIndent = { runJs(notesEditorApplyJs("indent")) },
+            onLink = {
+                linkUrl = "https://"
+                showLinkDialog = true
+            }
+        )
+    }
+}
+
+@Composable
+private fun NotesFormatBar(
+    bold: Boolean,
+    italic: Boolean,
+    underline: Boolean,
+    strike: Boolean,
+    checkbox: Boolean,
+    block: String,
+    onBold: () -> Unit,
+    onItalic: () -> Unit,
+    onUnderline: () -> Unit,
+    onStrike: () -> Unit,
+    onHeading: () -> Unit,
+    onBullet: () -> Unit,
+    onNumbered: () -> Unit,
+    onCheckbox: () -> Unit,
+    onOutdent: () -> Unit,
+    onIndent: () -> Unit,
+    onLink: () -> Unit
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(Color(0xFFF7F8FA))
+            .border(1.dp, Color(0xFFE0E3E7))
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 6.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        FmtToggle("B", bold, onBold, boldWeight = true)
+        FmtToggle("I", italic, onItalic, italicStyle = true)
+        FmtToggle("U", underline, onUnderline, underline = true)
+        FmtToggle("S", strike, onStrike, strike = true)
+        FmtSep()
+        FmtToggle(
+            when (block) {
+                "h1" -> "H1"
+                "h2" -> "H2"
+                "h3" -> "H3"
+                else -> "¶"
+            },
+            active = block == "h1" || block == "h2" || block == "h3",
+            onClick = onHeading
+        )
+        FmtSep()
+        FmtToggle("•", false, onBullet)
+        FmtToggle("1.", false, onNumbered)
+        FmtToggle("☐", checkbox, onCheckbox)
+        FmtToggle("⇤", false, onOutdent)
+        FmtToggle("⇥", false, onIndent)
+        FmtSep()
+        FmtToggle("🔗", false, onLink)
+    }
+}
+
+@Composable
+private fun FmtSep() {
+    Spacer(Modifier.width(4.dp))
+    Box(
+        Modifier
+            .width(1.dp)
+            .height(28.dp)
+            .background(Color(0xFFD0D5DB))
+    )
+    Spacer(Modifier.width(4.dp))
+}
+
+@Composable
+private fun FmtToggle(
+    label: String,
+    active: Boolean,
+    onClick: () -> Unit,
+    boldWeight: Boolean = false,
+    italicStyle: Boolean = false,
+    underline: Boolean = false,
+    strike: Boolean = false
+) {
+    Box(
+        modifier = Modifier
+            .size(width = 44.dp, height = 44.dp)
+            .padding(2.dp)
+            .background(
+                if (active) Color(0x1A2AABEE) else Color.Transparent,
+                RoundedCornerShape(8.dp)
+            )
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.titleMedium.copy(
+                fontWeight = if (boldWeight) FontWeight.Bold else FontWeight.Medium,
+                fontStyle = if (italicStyle) FontStyle.Italic else FontStyle.Normal,
+                textDecoration = when {
+                    underline && strike -> TextDecoration.Underline + TextDecoration.LineThrough
+                    underline -> TextDecoration.Underline
+                    strike -> TextDecoration.LineThrough
+                    else -> TextDecoration.None
+                }
+            ),
+            color = Color(0xFF1C1C1E)
+        )
     }
 }
 
@@ -1540,16 +1761,13 @@ private fun flushNoteAndLeave(
     }
     scope.launch {
         val html = suspendCancellableCoroutine { cont ->
-            web.evaluateJavascript(GET_HTML_JS) { value ->
+            web.evaluateJavascript(NOTES_GET_HTML_JS) { value ->
                 cont.resume(decodeEvaluateJavascriptString(value))
             }
         }
         vm.saveSelectedNoteNow(html.ifBlank { vm.state.value.notesContent }, clearAfter = true)
     }
 }
-
-private const val GET_HTML_JS =
-    "(function(){var b=document.body;return b?(b.getAttribute('contenteditable')!==null?b.innerHTML:document.documentElement.outerHTML):'';})();"
 
 /** Keep caret visible above the soft keyboard inside the contenteditable WebView. */
 private const val FOCUS_SCROLL_JS = """
@@ -1586,49 +1804,41 @@ private const val FOCUS_SCROLL_JS = """
 })();
 """
 
-private const val DIRTY_TRACK_JS = """
-(function(){
-  if (window.__plDirtyTrack) return;
-  window.__plDirtyTrack = true;
-  function notify(){
-    try { if (window.ProtoLinkNotes && ProtoLinkNotes.markDirty) ProtoLinkNotes.markDirty(); } catch(e) {}
-  }
-  document.addEventListener('input', notify, true);
-  document.addEventListener('keyup', notify, true);
-})();
-"""
-
-/** Decode helpers live in NotesHtmlCodec.kt (shared with ViewModel + unit tests). */
-
-private fun wrapEditableHtml(html: String): String {
-    val trimmed = healJsEscapedHtml(html.trim())
-    if (trimmed.contains("contenteditable", ignoreCase = true)) return trimmed
-    // Windows editable surface: body contenteditable around note HTML
-    val inner = when {
-        trimmed.contains("<body", ignoreCase = true) -> trimmed
-        else -> "<!DOCTYPE html><html><head><meta charset=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/></head><body>$trimmed</body></html>"
-    }
-    val withViewport = if (inner.contains("name=\"viewport\"", ignoreCase = true)) {
-        inner
-    } else {
-        inner.replace(
-            Regex("<head([^>]*)>", RegexOption.IGNORE_CASE),
-            "<head$1><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/>"
-        )
-    }
-    return if (withViewport.contains("contenteditable", ignoreCase = true)) {
-        withViewport
-    } else {
-        withViewport.replace(
-            Regex("<body([^>]*)>", RegexOption.IGNORE_CASE),
-            "<body$1 contenteditable=\"true\" style=\"overflow-wrap:break-word;padding-bottom:40vh;\">"
-        )
-    }
-}
-
-private class NotesDirtyBridge(private val onDirty: () -> Unit) {
+private class NotesEditorBridge(
+    private val onDirty: () -> Unit,
+    private val onSelectionState: (Boolean, Boolean, Boolean, Boolean, Boolean, String) -> Unit,
+    private val onRequestLink: () -> Unit,
+    private val onOpenLink: (String) -> Unit
+) {
     private val main = Handler(Looper.getMainLooper())
 
+    @JavascriptInterface
+    fun onMessage(json: String?) {
+        if (json.isNullOrBlank()) return
+        main.post {
+            runCatching {
+                val obj = org.json.JSONObject(json)
+                when (obj.optString("type")) {
+                    "contentChanged" -> onDirty()
+                    "requestLink" -> onRequestLink()
+                    "openLink" -> {
+                        val url = obj.optString("url")
+                        if (url.startsWith("http://") || url.startsWith("https://")) onOpenLink(url)
+                    }
+                    "selectionState" -> onSelectionState(
+                        obj.optBoolean("bold"),
+                        obj.optBoolean("italic"),
+                        obj.optBoolean("underline"),
+                        obj.optBoolean("strike"),
+                        obj.optBoolean("checkbox"),
+                        obj.optString("block", "p")
+                    )
+                }
+            }
+        }
+    }
+
+    /** Backward-compatible alias if older injected scripts call markDirty. */
     @JavascriptInterface
     fun markDirty() {
         main.post { onDirty() }
