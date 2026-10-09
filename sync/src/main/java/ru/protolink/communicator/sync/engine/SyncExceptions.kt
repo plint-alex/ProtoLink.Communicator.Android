@@ -31,5 +31,6 @@ class SyncConflictException(
     localHash: String,
     remoteHash: String,
     metaHash: String?,
-    reason: String
+    reason: String,
+    val mappingId: String? = null
 ) : SyncException(reason, relativePath, localHash, remoteHash, metaHash)

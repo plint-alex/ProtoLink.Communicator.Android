@@ -14,6 +14,7 @@ import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import ru.protolink.communicator.BuildConfig
 import ru.protolink.communicator.data.SettingsStore
+import ru.protolink.communicator.data.TokenAuthenticator
 import ru.protolink.communicator.data.TokenStore
 import ru.protolink.communicator.data.api.ProtoLinkApi
 import ru.protolink.communicator.data.db.AppDatabase
@@ -42,15 +43,15 @@ object AppModule {
     fun metadataStore(dao: SyncMetaDao): MetadataStore = RoomMetadataStore(dao)
 
     @Provides @Singleton
-    fun okHttp(tokenStore: TokenStore, settingsStore: SettingsStore): OkHttpClient {
+    fun okHttp(
+        tokenStore: TokenStore,
+        authenticator: TokenAuthenticator
+    ): OkHttpClient {
         val auth = Interceptor { chain ->
             val token = tokenStore.load()?.accessToken
             val req = if (token.isNullOrBlank()) chain.request()
             else chain.request().newBuilder().header("Authorization", "Bearer $token").build()
-            val resp = chain.proceed(req)
-            // Do not clear the session on 401 — expired JWTs and multi-device refresh races
-            // are common; clearing here logs the user out of Android when Windows is active too.
-            resp
+            chain.proceed(req)
         }
         val messengerLog = Interceptor { chain ->
             val req = chain.request()
@@ -77,6 +78,7 @@ object AppModule {
             .addInterceptor(auth)
             .addInterceptor(messengerLog)
             .addInterceptor(HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC })
+            .authenticator(authenticator)
             .connectTimeout(60, TimeUnit.SECONDS)
             .readTimeout(180, TimeUnit.SECONDS)
             .build()

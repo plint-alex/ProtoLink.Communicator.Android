@@ -338,12 +338,50 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
     }
 
     override fun delete(rootPath: String, relativePath: String, isFolder: Boolean) {
-        find(rootPath, relativePath)?.delete()
-            ?: run {
-                val tree = treeUri(rootPath)
-                val id = NotesTreeBuilder.folderDocumentId(tree, relativePath.replace('\\', '/').trim('/'))
-                DocumentsContract.deleteDocument(context.contentResolver, SafTreeLister.documentUri(tree, id))
+        val tree = treeUri(rootPath)
+        val n = relativePath.replace('\\', '/').trim('/')
+        if (n.isEmpty()) error("Cannot delete tree root")
+
+        val found = find(rootPath, n)
+        val docId = found?.let { runCatching { DocumentsContract.getDocumentId(it.uri) }.getOrNull() }
+            ?: NotesTreeBuilder.folderDocumentId(tree, n)
+
+        if (isFolder) {
+            deleteDocumentRecursive(tree, docId)
+        } else {
+            val uri = found?.uri ?: SafTreeLister.documentUri(tree, docId)
+            if (!DocumentsContract.deleteDocument(context.contentResolver, uri)) {
+                found?.delete()
             }
+        }
+    }
+
+    /**
+     * Bottom-up delete: children first (OEM [DocumentFile.delete] often leaves nested files),
+     * then the folder itself. Also probes guessed index.html when listChildren is blind.
+     */
+    private fun deleteDocumentRecursive(tree: Uri, documentId: String) {
+        val children = SafTreeLister.listChildren(context, tree, documentId)
+        for (child in children) {
+            if (child.isDirectory) {
+                deleteDocumentRecursive(tree, child.documentId)
+            } else {
+                runCatching {
+                    DocumentsContract.deleteDocument(context.contentResolver, child.uri)
+                }
+            }
+        }
+        // Leaf OEM quirk: children query may omit index.html — remove by guess before folder.
+        SafTreeLister.findIndexHtmlByGuess(context, tree, documentId)?.let { indexUri ->
+            runCatching { DocumentsContract.deleteDocument(context.contentResolver, indexUri) }
+        }
+        val folderUri = SafTreeLister.documentUri(tree, documentId)
+        val ok = runCatching {
+            DocumentsContract.deleteDocument(context.contentResolver, folderUri)
+        }.getOrDefault(false)
+        if (!ok) {
+            DocumentFile.fromSingleUri(context, folderUri)?.delete()
+        }
     }
 
     override fun move(rootPath: String, fromRelative: String, toRelative: String, isFolder: Boolean) {

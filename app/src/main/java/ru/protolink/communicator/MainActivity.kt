@@ -13,6 +13,11 @@ import ru.protolink.communicator.ui.theme.ProtoLinkTheme
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Before setContent so ViewModel init can see the pending force flag.
+        PendingDebugIntent.consumeForceFile(applicationContext)
+        PendingDebugIntent.consumeCreateNoteFile(applicationContext)
+        PendingDebugIntent.consumeDeleteNoteFile(applicationContext)
+        PendingDebugIntent.consumeFrom(intent)
         enableEdgeToEdge()
         setContent {
             ProtoLinkTheme {
@@ -24,5 +29,9 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        PendingDebugIntent.consumeForceFile(applicationContext)
+        PendingDebugIntent.consumeCreateNoteFile(applicationContext)
+        PendingDebugIntent.consumeDeleteNoteFile(applicationContext)
+        PendingDebugIntent.consumeFrom(intent)
     }
 }

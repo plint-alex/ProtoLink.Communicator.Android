@@ -8,8 +8,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import ru.protolink.communicator.BuildConfig
+import ru.protolink.communicator.PendingDebugIntent
 import ru.protolink.communicator.data.AppSettings
 import ru.protolink.communicator.data.AuthRepository
+import ru.protolink.communicator.data.TokenRefresher
 import ru.protolink.communicator.data.CloudCodes
 import ru.protolink.communicator.data.CloudSyncMappingDto
 import ru.protolink.communicator.data.MappingStore
@@ -96,6 +98,32 @@ data class PendingForce(
     val push: Boolean
 )
 
+/** One-file sync conflict: user picks server or local. */
+data class PendingConflict(
+    val cloudFolderId: String,
+    val relativePath: String
+)
+
+/** Dialog: create note under [parentRelativePath] (empty = notes root). */
+data class PendingCreateNote(
+    val parentRelativePath: String,
+    val sectionLabel: String,
+    val titleDraft: String = "",
+    val titleError: String? = null,
+    /** Editor flow: choose Same section vs Inside this note. */
+    val fromEditor: Boolean = false,
+    val insideCurrent: Boolean = false,
+    val editorNoteRelativePath: String? = null,
+    val editorNoteName: String? = null
+)
+
+/** Dialog: confirm delete page folder (recursive). */
+data class PendingDeleteNote(
+    val relativePath: String,
+    val name: String,
+    val hasChildren: Boolean
+)
+
 data class UiState(
     val authenticated: Boolean = false,
     val login: String = "",
@@ -124,6 +152,9 @@ data class UiState(
     val syncing: Boolean = false,
     val forceRunning: Boolean = false,
     val pendingForce: PendingForce? = null,
+    val pendingConflict: PendingConflict? = null,
+    val pendingCreateNote: PendingCreateNote? = null,
+    val pendingDeleteNote: PendingDeleteNote? = null,
     val syncError: String? = null,
     val userError: UserError? = null,
     val syncSuccess: String? = null,
@@ -143,6 +174,7 @@ class MainViewModel @Inject constructor(
     private val localFs: SafLocalFileSystem,
     private val messengerReadStore: MessengerReadStore,
     private val messengerNotifier: MessengerNotifier,
+    private val tokenRefresher: TokenRefresher,
     @ApplicationContext private val appContext: Context
 ) : ViewModel() {
     private val _state = MutableStateFlow(UiState())
@@ -174,11 +206,38 @@ class MainViewModel @Inject constructor(
                 runCatching { ensureCloudRoot() }
             }
             startAutoSyncInterval()
-            requestFullSync()
+            // adb force-download must win over startup reconcile (conflicts abort full sync).
+            if (PendingDebugIntent.takeForceDownload()) {
+                forceDownloadAllMappedNow()
+            } else {
+                requestFullSync()
+            }
         }
         if (!settingsStore.load().notesRootUri.isNullOrBlank()) {
             refreshNotesTree()
         }
+        PendingDebugIntent.takeCreateNoteTitle()?.let { title ->
+            Log.e("ProtoLinkNotes", "debug create note: $title")
+            createNote("", title)
+        }
+        PendingDebugIntent.takeDeleteNotePath()?.let { path ->
+            Log.e("ProtoLinkNotes", "debug delete note: $path")
+            deleteNote(path)
+        }
+    }
+
+    /** adb self-test: files/force_create_note → create + open at notes root. */
+    fun consumePendingDebugCreateNote() {
+        val title = PendingDebugIntent.takeCreateNoteTitle() ?: return
+        Log.e("ProtoLinkNotes", "debug create note (resume): $title")
+        createNote("", title)
+    }
+
+    /** adb self-test: files/force_delete_note → recursive delete by relative path. */
+    fun consumePendingDebugDeleteNote() {
+        val path = PendingDebugIntent.takeDeleteNotePath() ?: return
+        Log.e("ProtoLinkNotes", "debug delete note (resume): $path")
+        deleteNote(path)
     }
 
     /** Interval: local-only push (no remote scan). Skips while any sync is active. */
@@ -607,16 +666,125 @@ class MainViewModel @Inject constructor(
                 }
             } catch (e: Exception) {
                 Log.e("ProtoLinkSync", "sync failed", e)
-                _state.update {
-                    it.copy(
-                        status = "Sync failed: ${e.message ?: e.javaClass.simpleName}",
-                        syncing = false,
-                        syncError = e.message ?: e.javaClass.simpleName
-                    )
-                }
+                handleSyncFailure(e)
             } finally {
                 if (SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
             }
+        }
+    }
+
+    private fun handleSyncFailure(e: Exception) {
+        val conflict = e as? ru.protolink.communicator.sync.engine.SyncConflictException
+        if (conflict != null && !conflict.relativePath.isNullOrBlank()) {
+            val path = conflict.relativePath!!
+            val mappingId = conflict.mappingId
+            val dto = mappingStore.load().firstOrNull { m ->
+                mappingId != null && m.cloudFolderId.replace("-", "").equals(mappingId, ignoreCase = true)
+            } ?: mappingStore.load().singleOrNull()
+            if (dto != null) {
+                _state.update {
+                    it.copy(
+                        status = "Sync conflict: $path",
+                        syncing = false,
+                        pendingConflict = PendingConflict(
+                            cloudFolderId = dto.cloudFolderId,
+                            relativePath = path
+                        ),
+                        syncError = null
+                    )
+                }
+                return
+            }
+        }
+        val detail = e.message ?: e.javaClass.simpleName
+        _state.update {
+            it.copy(
+                status = "Sync failed: $detail",
+                syncing = false,
+                syncError = detail
+            )
+        }
+    }
+
+    fun dismissConflict() {
+        _state.update { it.copy(pendingConflict = null) }
+    }
+
+    /** Keep phone file and overwrite server for the conflicted path, then resume sync. */
+    fun resolveConflictKeepLocal() {
+        val pending = _state.value.pendingConflict ?: return
+        _state.update { it.copy(pendingConflict = null) }
+        resolveConflictPath(pending, takeServer = false)
+    }
+
+    /** Take server file and overwrite phone for the conflicted path, then resume sync. */
+    fun resolveConflictTakeServer() {
+        val pending = _state.value.pendingConflict ?: return
+        _state.update { it.copy(pendingConflict = null) }
+        resolveConflictPath(pending, takeServer = true)
+    }
+
+    private fun resolveConflictPath(pending: PendingConflict, takeServer: Boolean) {
+        viewModelScope.launch {
+            val mapping = mappingStore.load().firstOrNull { it.cloudFolderId == pending.cloudFolderId }
+            if (mapping == null) {
+                _state.update { it.copy(syncError = "Mapped folder not found for conflict resolve") }
+                return@launch
+            }
+            if (!auth.isAuthenticated) {
+                _state.update { it.copy(syncError = "Log in before resolving conflict") }
+                return@launch
+            }
+            _state.update {
+                it.copy(
+                    status = if (takeServer) "Taking server version…" else "Uploading local version…",
+                    forceRunning = true
+                )
+            }
+            var locked = false
+            try {
+                if (!SyncFlight.mutex.tryLock()) {
+                    val acquired = withTimeoutOrNull(120_000) { SyncFlight.mutex.lock() } != null
+                    if (!acquired) throw IllegalStateException("Timed out waiting for sync lock")
+                }
+                locked = true
+                withContext(Dispatchers.IO) {
+                    val engineMapping = SyncMapping(
+                        id = mapping.cloudFolderId.replace("-", ""),
+                        cloudFolderId = mapping.cloudFolderId,
+                        localRootPath = mapping.localPath,
+                        cloudFolderName = mapping.cloudFolderName
+                    )
+                    val engine = SyncEngine(metadataStore, localFs, remoteCloud)
+                    if (takeServer) engine.forcePullPath(engineMapping, pending.relativePath)
+                    else engine.forcePushPath(engineMapping, pending.relativePath)
+                }
+                if (!takeServer) notifyOtherDevices()
+                _state.update {
+                    it.copy(
+                        forceRunning = false,
+                        status = if (takeServer) "Took server: ${pending.relativePath}"
+                        else "Uploaded local: ${pending.relativePath}",
+                        syncSuccess = if (takeServer) "Server version saved on phone"
+                        else "Phone version uploaded to server"
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e("ProtoLinkSync", "conflict resolve failed", e)
+                _state.update {
+                    it.copy(
+                        forceRunning = false,
+                        status = "Conflict resolve failed",
+                        syncError = e.message ?: e.javaClass.simpleName
+                    )
+                }
+                return@launch
+            } finally {
+                if (locked && SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
+            }
+            // Continue sync — may hit another conflict file.
+            requestFullSync()
+            refreshNotesTree()
         }
     }
 
@@ -669,13 +837,7 @@ class MainViewModel @Inject constructor(
                 }
             } catch (e: Exception) {
                 Log.e("ProtoLinkSync", "local push failed", e)
-                _state.update {
-                    it.copy(
-                        status = "Upload failed: ${e.message ?: e.javaClass.simpleName}",
-                        syncing = false,
-                        syncError = e.message ?: e.javaClass.simpleName
-                    )
-                }
+                handleSyncFailure(e)
             } finally {
                 if (SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
             }
@@ -719,6 +881,29 @@ class MainViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Overwrite phone FS from cloud for every mapped folder (no confirm dialog).
+     * Used by adb: `am start … --es protolink_force download`
+     */
+    fun forceDownloadAllMappedNow() {
+        viewModelScope.launch {
+            android.util.Log.e("ProtoLinkSync", "forceDownloadAllMappedNow start")
+            withContext(Dispatchers.IO) { tokenRefresher.refreshBlocking() }
+            val ids = mappingStore.load().map { it.cloudFolderId }
+            if (ids.isEmpty()) {
+                _state.update { it.copy(syncError = "No mapped folders for force download") }
+                android.util.Log.e("ProtoLinkSync", "force download: no mapped folders")
+                return@launch
+            }
+            for (id in ids) {
+                // runForceMapping launches its own job; await by calling body inline sequentially
+                runForceMappingAndAwait(id, push = false)
+            }
+            refreshNotesTree()
+            android.util.Log.e("ProtoLinkSync", "forceDownloadAllMappedNow finished status=${_state.value.status}")
+        }
+    }
+
     fun dismissForceConfirm() {
         _state.update { it.copy(pendingForce = null) }
     }
@@ -730,74 +915,83 @@ class MainViewModel @Inject constructor(
     }
 
     private fun runForceMapping(cloudFolderId: String, push: Boolean) {
-        viewModelScope.launch {
-            val mapping = mappingStore.load().firstOrNull { it.cloudFolderId == cloudFolderId }
-            if (mapping == null) {
-                _state.update { it.copy(syncError = "Mapped folder not found") }
-                return@launch
+        viewModelScope.launch { runForceMappingAndAwait(cloudFolderId, push) }
+    }
+
+    private suspend fun runForceMappingAndAwait(cloudFolderId: String, push: Boolean) {
+        val mapping = mappingStore.load().firstOrNull { it.cloudFolderId == cloudFolderId }
+        if (mapping == null) {
+            _state.update { it.copy(syncError = "Mapped folder not found") }
+            return
+        }
+        if (!auth.isAuthenticated) {
+            _state.update { it.copy(syncError = "Log in before force sync") }
+            return
+        }
+        if (_state.value.forceRunning) {
+            _state.update { it.copy(syncError = "Force sync already running") }
+            return
+        }
+        _state.update {
+            it.copy(
+                forceRunning = true,
+                status = if (push) "Force upload…" else "Force download…"
+            )
+        }
+        var locked = false
+        try {
+            if (!SyncFlight.mutex.tryLock()) {
+                _state.update { it.copy(status = "Waiting for sync lock…") }
+                // Force pull of a large Notes tree can wait behind startup sync.
+                val acquired = withTimeoutOrNull(600_000) { SyncFlight.mutex.lock() } != null
+                if (!acquired) {
+                    throw IllegalStateException("Timed out waiting for sync lock")
+                }
             }
-            if (!auth.isAuthenticated) {
-                _state.update { it.copy(syncError = "Log in before force sync") }
-                return@launch
+            locked = true
+            android.util.Log.e("ProtoLinkSync", "force ${if (push) "upload" else "download"} locked, pulling…")
+            val count = withContext(Dispatchers.IO) {
+                val engineMapping = SyncMapping(
+                    id = mapping.cloudFolderId.replace("-", ""),
+                    cloudFolderId = mapping.cloudFolderId,
+                    localRootPath = mapping.localPath,
+                    cloudFolderName = mapping.cloudFolderName
+                )
+                val engine = SyncEngine(metadataStore, localFs, remoteCloud)
+                if (push) engine.forcePushMapping(engineMapping)
+                else engine.forcePullMapping(engineMapping)
             }
-            if (_state.value.forceRunning) {
-                _state.update { it.copy(syncError = "Force sync already running") }
-                return@launch
+            val msg = if (push) {
+                "Force upload complete ($count file(s))"
+            } else {
+                "Force download complete ($count file(s))"
+            }
+            android.util.Log.e("ProtoLinkSync", msg)
+            if (push) {
+                notifyOtherDevices()
             }
             _state.update {
                 it.copy(
-                    forceRunning = true,
-                    status = if (push) "Force upload…" else "Force download…"
+                    forceRunning = false,
+                    status = msg,
+                    syncSuccess = msg
                 )
             }
-            var locked = false
-            try {
-                if (!SyncFlight.mutex.tryLock()) {
-                    _state.update { it.copy(status = "Waiting for sync lock…") }
-                    val acquired = withTimeoutOrNull(30_000) { SyncFlight.mutex.lock() } != null
-                    if (!acquired) {
-                        throw IllegalStateException("Timed out waiting for sync lock")
-                    }
-                }
-                locked = true
-                val count = withContext(Dispatchers.IO) {
-                    val engineMapping = SyncMapping(
-                        id = mapping.cloudFolderId.replace("-", ""),
-                        cloudFolderId = mapping.cloudFolderId,
-                        localRootPath = mapping.localPath,
-                        cloudFolderName = mapping.cloudFolderName
-                    )
-                    val engine = SyncEngine(metadataStore, localFs, remoteCloud)
-                    if (push) engine.forcePushMapping(engineMapping)
-                    else engine.forcePullMapping(engineMapping)
-                }
-                val msg = if (push) {
-                    "Force upload complete ($count file(s))"
-                } else {
-                    "Force download complete ($count file(s))"
-                }
-                if (push) {
-                    notifyOtherDevices()
-                }
-                _state.update {
-                    it.copy(
-                        forceRunning = false,
-                        status = msg,
-                        syncSuccess = msg
-                    )
-                }
-            } catch (e: Exception) {
-                Log.e("ProtoLinkSync", "force sync failed", e)
-                _state.update {
-                    it.copy(
-                        forceRunning = false,
-                        status = "Force sync failed",
-                        syncError = e.message ?: e.javaClass.simpleName
-                    )
-                }
-            } finally {
-                if (locked && SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
+        } catch (e: Exception) {
+            Log.e("ProtoLinkSync", "force sync failed", e)
+            runCatching {
+                java.io.File(appContext.filesDir, "force_last_error.txt")
+                    .writeText("${e.javaClass.simpleName}: ${e.message}\n${e.stackTraceToString().take(4000)}")
             }
+            _state.update {
+                it.copy(
+                    forceRunning = false,
+                    status = "Force sync failed",
+                    syncError = e.message ?: e.javaClass.simpleName
+                )
+            }
+        } finally {
+            if (locked && SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
         }
     }
 
@@ -1245,14 +1439,16 @@ fun setNotesRoot(uri: String) {
     private val pendingChatSends = java.util.concurrent.ConcurrentHashMap<String, MessageItem>()
     private val pendingChatSendContact = java.util.concurrent.ConcurrentHashMap<String, String>()
 
-    fun refreshNotesTree() = viewModelScope.launch {
+    fun refreshNotesTree() = viewModelScope.launch { refreshNotesTreeSuspend() }
+
+    private suspend fun refreshNotesTreeSuspend() {
         val rootUriStr = settingsStore.load().notesRootUri
         if (rootUriStr.isNullOrBlank()) {
             notesRootCache = null
             _state.update {
                 it.copy(notesTreeRows = emptyList(), status = "Choose a notes folder")
             }
-            return@launch
+            return
         }
         val treeUri = Uri.parse(rootUriStr)
         val root = withContext(Dispatchers.IO) {
@@ -1298,9 +1494,383 @@ fun setNotesRoot(uri: String) {
         }
     }
 
+    /** FAB / long-press: parent = selected tree node (or explicit [parentRelativePath]). */
+    fun requestCreateNote(parentRelativePath: String? = null) {
+        if (settingsStore.load().notesRootUri.isNullOrBlank()) {
+            _state.update { it.copy(syncError = "Choose a notes folder first") }
+            return
+        }
+        val selectedRel = parentRelativePath
+            ?: _state.value.selectedNoteRelativePath
+            ?: ""
+        val label = if (selectedRel.isBlank()) {
+            "Notes root"
+        } else {
+            selectedRel.substringAfterLast('/').ifBlank { selectedRel }
+        }
+        _state.update {
+            it.copy(
+                pendingCreateNote = PendingCreateNote(
+                    parentRelativePath = selectedRel,
+                    sectionLabel = label
+                )
+            )
+        }
+    }
+
+    /** Long-press “New note here”: parent is the pressed node. */
+    fun requestCreateNoteHere(row: NoteTreeRow) {
+        requestCreateNote(parentRelativePath = row.relativePath)
+    }
+
+    /** From editor menu: destination radios (default = same section / sibling). */
+    fun requestCreateNoteFromEditor() {
+        if (settingsStore.load().notesRootUri.isNullOrBlank()) {
+            _state.update { it.copy(syncError = "Choose a notes folder first") }
+            return
+        }
+        val noteRel = _state.value.selectedNoteRelativePath.orEmpty()
+        val noteName = _state.value.selectedNotePath.orEmpty().ifBlank { "note" }
+        val parentRel = parentRelativeOf(noteRel)
+        val sectionLabel = if (parentRel.isBlank()) "Notes root"
+        else parentRel.substringAfterLast('/').ifBlank { parentRel }
+        _state.update {
+            it.copy(
+                pendingCreateNote = PendingCreateNote(
+                    parentRelativePath = parentRel,
+                    sectionLabel = sectionLabel,
+                    fromEditor = true,
+                    insideCurrent = false,
+                    editorNoteRelativePath = noteRel,
+                    editorNoteName = noteName
+                )
+            )
+        }
+    }
+
+    fun dismissCreateNote() {
+        _state.update { it.copy(pendingCreateNote = null) }
+    }
+
+    fun requestDeleteNote(row: NoteTreeRow) {
+        val rel = row.relativePath.replace('\\', '/').trim('/')
+        if (rel.isEmpty()) {
+            _state.update { it.copy(status = "Cannot delete the notes root") }
+            return
+        }
+        _state.update {
+            it.copy(
+                pendingDeleteNote = PendingDeleteNote(
+                    relativePath = rel,
+                    name = row.name,
+                    hasChildren = row.hasChildren
+                )
+            )
+        }
+    }
+
+    fun requestDeleteCurrentNote() {
+        val rel = _state.value.selectedNoteRelativePath?.replace('\\', '/')?.trim('/').orEmpty()
+        if (rel.isEmpty()) {
+            _state.update { it.copy(status = "Cannot delete the notes root") }
+            return
+        }
+        val name = _state.value.selectedNotePath?.ifBlank { rel.substringAfterLast('/') }
+            ?: rel.substringAfterLast('/')
+        val hasChildren = _state.value.notesTreeRows
+            .firstOrNull { it.relativePath.replace('\\', '/').trim('/').equals(rel, ignoreCase = true) }
+            ?.hasChildren
+            ?: run {
+                val root = notesRootCache ?: return@run false
+                var cur = root
+                for (part in rel.split('/').filter { it.isNotEmpty() }) {
+                    cur = cur.children.firstOrNull { it.name.equals(part, ignoreCase = true) }
+                        ?: return@run false
+                }
+                cur.children.isNotEmpty()
+            }
+        _state.update {
+            it.copy(
+                pendingDeleteNote = PendingDeleteNote(
+                    relativePath = rel,
+                    name = name,
+                    hasChildren = hasChildren
+                )
+            )
+        }
+    }
+
+    fun dismissDeleteNote() {
+        _state.update { it.copy(pendingDeleteNote = null) }
+    }
+
+    fun confirmDeleteNote() {
+        val pending = _state.value.pendingDeleteNote ?: return
+        _state.update { it.copy(pendingDeleteNote = null) }
+        deleteNote(pending.relativePath, pending.name)
+    }
+
+    /**
+     * Recursive delete of page folder under notes root (Windows parity).
+     * Empty [relativePath] = root — refused.
+     */
+    fun deleteNote(relativePath: String, displayName: String? = null) {
+        viewModelScope.launch {
+            val rootUri = settingsStore.load().notesRootUri
+            if (rootUri.isNullOrBlank()) {
+                _state.update { it.copy(syncError = "Choose a notes folder first") }
+                return@launch
+            }
+            val target = relativePath.replace('\\', '/').trim('/')
+            if (target.isEmpty()) {
+                _state.update { it.copy(status = "Cannot delete the notes root") }
+                return@launch
+            }
+            val name = displayName?.ifBlank { null } ?: target.substringAfterLast('/')
+            val openRel = _state.value.selectedNoteRelativePath?.replace('\\', '/')?.trim('/').orEmpty()
+            val affectsOpen = openRel.isNotEmpty() &&
+                (openRel.equals(target, ignoreCase = true) ||
+                    openRel.startsWith("$target/", ignoreCase = true))
+            if (affectsOpen) {
+                cancelNotesPendingSave()
+            }
+            try {
+                withContext(Dispatchers.IO) {
+                    localFs.delete(rootUri, target, isFolder = true)
+                }
+            } catch (e: Exception) {
+                Log.e("ProtoLinkNotes", "deleteNote failed $target", e)
+                val msg = e.message ?: e.javaClass.simpleName
+                _state.update { it.copy(syncError = "Could not delete note: $msg") }
+                writeDeleteNoteDebugResult("FAIL delete=$target msg=$msg")
+                runCatching { refreshNotesTreeSuspend() }
+                return@launch
+            }
+            if (affectsOpen) {
+                clearSelectedNote()
+            }
+            refreshNotesTreeSuspend()
+            _state.update { it.copy(status = "Deleted “$name”") }
+            writeDeleteNoteDebugResult("OK delete=$target")
+            requestLocalPush()
+        }
+    }
+
+    private fun writeDeleteNoteDebugResult(line: String) {
+        runCatching {
+            java.io.File(appContext.filesDir, "delete_note_last.txt")
+                .writeText("${java.time.Instant.now()}\n$line\n", Charsets.UTF_8)
+            Log.e("ProtoLinkNotes", "delete_note_last: $line")
+        }
+    }
+
+    fun updateCreateNoteTitle(title: String) {
+        val pending = _state.value.pendingCreateNote ?: return
+        _state.update {
+            it.copy(pendingCreateNote = pending.copy(titleDraft = title, titleError = null))
+        }
+    }
+
+    fun setCreateNoteInsideCurrent(inside: Boolean) {
+        val pending = _state.value.pendingCreateNote ?: return
+        if (!pending.fromEditor) return
+        val noteRel = pending.editorNoteRelativePath.orEmpty()
+        val parentRel = if (inside) noteRel else parentRelativeOf(noteRel)
+        val label = when {
+            inside -> pending.editorNoteName?.ifBlank { "this note" } ?: "this note"
+            parentRel.isBlank() -> "Notes root"
+            else -> parentRel.substringAfterLast('/').ifBlank { parentRel }
+        }
+        _state.update {
+            it.copy(
+                pendingCreateNote = pending.copy(
+                    insideCurrent = inside,
+                    parentRelativePath = parentRel,
+                    sectionLabel = label,
+                    titleError = null
+                )
+            )
+        }
+    }
+
+    fun confirmCreateNote() {
+        val pending = _state.value.pendingCreateNote ?: return
+        val raw = pending.titleDraft.trim()
+        if (raw.isEmpty()) {
+            _state.update {
+                it.copy(pendingCreateNote = pending.copy(titleError = "Title is required"))
+            }
+            return
+        }
+        val name = sanitizeNoteName(raw)
+        if (name.isEmpty()) {
+            _state.update {
+                it.copy(pendingCreateNote = pending.copy(titleError = "Title has no valid characters"))
+            }
+            return
+        }
+        if (name != raw.trim()) {
+            // Soft sanitize — keep going with cleaned name; surface if empty already handled.
+        }
+        createNote(pending.parentRelativePath, name)
+    }
+
+    /**
+     * Create folder + index.html under [parentRelativePath] (empty = root).
+     * Opens the new note in the editor (Windows parity).
+     */
+    fun createNote(parentRelativePath: String, name: String) {
+        viewModelScope.launch {
+            val rootUri = settingsStore.load().notesRootUri
+            if (rootUri.isNullOrBlank()) {
+                _state.update { it.copy(pendingCreateNote = null, syncError = "Choose a notes folder first") }
+                return@launch
+            }
+            val parent = parentRelativePath.replace('\\', '/').trim('/')
+            val folderName = sanitizeNoteName(name)
+            if (folderName.isEmpty()) {
+                _state.update {
+                    it.copy(
+                        pendingCreateNote = it.pendingCreateNote?.copy(titleError = "Title is required")
+                    )
+                }
+                return@launch
+            }
+            val childRel = if (parent.isEmpty()) folderName else "$parent/$folderName"
+            val created: CreatedNoteRefs
+            try {
+                created = withContext(Dispatchers.IO) {
+                    val treeUri = Uri.parse(rootUri)
+                    // Duplicate sibling check (case-insensitive).
+                    val parentId = if (parent.isEmpty()) {
+                        ru.protolink.communicator.data.SafTreeLister.treeDocumentId(treeUri)
+                    } else {
+                        NotesTreeBuilder.folderDocumentId(treeUri, parent)
+                    }
+                    val siblings = ru.protolink.communicator.data.SafTreeLister.listChildren(
+                        appContext, treeUri, parentId
+                    )
+                    if (siblings.any { it.isDirectory && it.name.equals(folderName, ignoreCase = true) }) {
+                        throw IllegalStateException("A note with this name already exists")
+                    }
+                    localFs.createDirectory(rootUri, childRel)
+                    val html =
+                        "<h1>${android.text.Html.escapeHtml(folderName)}</h1>\n<p><br></p>"
+                    localFs.writeFile(
+                        rootUri,
+                        "$childRel/index.html",
+                        html.toByteArray(Charsets.UTF_8)
+                    )
+                    // Resolve *actual* SAF ids (guess "$root/$rel" is wrong on some OEMs).
+                    val folderEntry = ru.protolink.communicator.data.SafTreeLister.listChildren(
+                        appContext, treeUri, parentId
+                    ).firstOrNull { it.isDirectory && it.name.equals(folderName, ignoreCase = true) }
+                    val safId = folderEntry?.documentId
+                        ?: NotesTreeBuilder.folderDocumentId(treeUri, childRel)
+                    val indexUri = ru.protolink.communicator.data.SafTreeLister.resolveIndexHtml(
+                        appContext, treeUri, safId
+                    ) ?: NotesTreeBuilder.resolveIndexViaDocumentFile(appContext, treeUri, childRel)
+                    CreatedNoteRefs(safId, folderEntry?.uri, indexUri)
+                }
+            } catch (e: Exception) {
+                Log.e("ProtoLinkNotes", "createNote failed", e)
+                val msg = e.message ?: e.javaClass.simpleName
+                if (msg.contains("already exists", ignoreCase = true)) {
+                    _state.update {
+                        it.copy(
+                            pendingCreateNote = it.pendingCreateNote?.copy(
+                                titleError = "A note with this name already exists"
+                            )
+                        )
+                    }
+                } else {
+                    _state.update {
+                        it.copy(pendingCreateNote = null, syncError = "Could not create note: $msg")
+                    }
+                }
+                return@launch
+            }
+            _state.update { it.copy(pendingCreateNote = null, status = "Created “$folderName”") }
+            val treeUri = Uri.parse(rootUri)
+            val folderUri = created.folderUri
+                ?: ru.protolink.communicator.data.SafTreeLister.documentUri(treeUri, created.safDocumentId)
+            val openRow = NoteTreeRow(
+                documentId = folderUri.toString(),
+                safDocumentId = created.safDocumentId,
+                name = folderName,
+                relativePath = childRel,
+                depth = childRel.count { it == '/' },
+                hasChildren = false,
+                expanded = false,
+                folderUri = folderUri.toString(),
+                indexUri = created.indexUri?.toString()
+            )
+            // Await open — selectNotesNode is fire-and-forget and raced with tree refresh.
+            openNotesNode(openRow)
+            val opened = !_state.value.selectedNoteIndexUri.isNullOrBlank() &&
+                _state.value.selectedNoteRelativePath == childRel
+            writeCreateNoteDebugResult(
+                if (opened) "OK open=$childRel index=${_state.value.selectedNoteIndexUri}"
+                else "FAIL open=$childRel status=${_state.value.status}"
+            )
+            refreshNotesTreeSuspend()
+            expandPathAncestors(childRel)
+            refreshNotesTreeSuspend()
+            requestLocalPush()
+        }
+    }
+
+    private fun writeCreateNoteDebugResult(line: String) {
+        runCatching {
+            java.io.File(appContext.filesDir, "create_note_last.txt")
+                .writeText("${java.time.Instant.now()}\n$line\n", Charsets.UTF_8)
+            Log.e("ProtoLinkNotes", "create_note_last: $line")
+        }
+    }
+
+    private data class CreatedNoteRefs(
+        val safDocumentId: String,
+        val folderUri: Uri?,
+        val indexUri: Uri?
+    )
+
+    private fun parentRelativeOf(relativePath: String): String {
+        val n = relativePath.replace('\\', '/').trim('/')
+        val i = n.lastIndexOf('/')
+        return if (i <= 0) "" else n.substring(0, i)
+    }
+
+    private fun sanitizeNoteName(raw: String): String {
+        var s = raw.trim()
+        val invalid = Regex("""[\\/:*?"<>|]""")
+        s = invalid.replace(s, " ").replace(Regex("""\s+"""), " ").trim()
+        while (s.startsWith('.')) s = s.drop(1).trim()
+        while (s.endsWith('.')) s = s.dropLast(1).trim()
+        if (s.length > 120) s = s.take(120).trim()
+        return s
+    }
+
+    private fun expandPathAncestors(relativePath: String) {
+        val root = notesRootCache ?: return
+        val parts = relativePath.replace('\\', '/').trim('/').split('/').filter { it.isNotEmpty() }
+        val ids = mutableSetOf(root.documentId)
+        var cur = root
+        for (part in parts) {
+            val child = cur.children.firstOrNull { it.name.equals(part, ignoreCase = true) } ?: break
+            ids.add(child.documentId)
+            cur = child
+        }
+        // Also expand parent chain without the leaf if leaf is the new page (still expand parents).
+        _state.update { it.copy(notesExpandedIds = it.notesExpandedIds + ids) }
+    }
+
     /** Windows parity: selecting a folder node opens/edits that folder's index.html. */
     fun selectNotesNode(row: NoteTreeRow) = viewModelScope.launch {
-        val rootUriStr = settingsStore.load().notesRootUri ?: return@launch
+        openNotesNode(row)
+    }
+
+    private suspend fun openNotesNode(row: NoteTreeRow) {
+        val rootUriStr = settingsStore.load().notesRootUri ?: return
         val treeUri = Uri.parse(rootUriStr)
         _state.update { it.copy(status = "Opening ${row.name}…") }
         try {
@@ -1383,6 +1953,7 @@ fun setNotesRoot(uri: String) {
                     status = "Open failed: ${e.message}"
                 )
             }
+            stopNotesDiskPoller()
         }
     }
 

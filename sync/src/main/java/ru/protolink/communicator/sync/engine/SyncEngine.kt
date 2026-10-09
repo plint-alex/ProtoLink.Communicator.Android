@@ -215,7 +215,8 @@ class SyncEngine(
                         localHash,
                         remoteHash,
                         meta.contentHash,
-                        "Local and remote both differ from sync baseline (or baseline is empty). Use Force Upload or Force Download."
+                        "Local and remote both differ from sync baseline (or baseline is empty).",
+                        mappingId = mapping.id
                     )
                 }
             }
@@ -425,7 +426,8 @@ class SyncEngine(
                                 localHash,
                                 remoteHash,
                                 null,
-                                "Local add collides with different remote content. Use Force Upload or Force Download."
+                                "Local add collides with different remote content.",
+                                mappingId = mapping.id
                             )
                         }
                     }
@@ -672,6 +674,71 @@ class SyncEngine(
         name.endsWith(".jpg", true) || name.endsWith(".jpeg", true) -> "image/jpeg"
         name.endsWith(".json", true) -> "application/json"
         else -> "application/octet-stream"
+    }
+
+    /** Overwrite server with one local file; meta follows local. */
+    suspend fun forcePushPath(mapping: SyncMapping, relativePath: String) {
+        val path = PathUtil.normalize(relativePath)
+        if (!fs.exists(mapping.localRootPath, path)) {
+            throw SyncException("Local file missing for conflict resolve.", relativePath = path)
+        }
+        val bytes = fs.readFile(mapping.localRootPath, path)
+        val hash = ContentHashUtil.sha256Hex(bytes)
+        val parentPath = PathUtil.parentOf(path)
+        val parentId = resolveParentId(mapping, parentPath) ?: mapping.cloudFolderId
+        val name = PathUtil.nameOf(path)
+        val existing = store.getAll(mapping.id)
+            .firstOrNull { PathUtil.normalize(it.relativePath) == path && !it.isFolder }
+        val remoteId = if (existing != null) {
+            remote.uploadFile(existing.remoteId, name, bytes, mimeOf(name))
+            existing.remoteId
+        } else {
+            remote.addFile(parentId, name, bytes, mimeOf(name))
+        }
+        store.upsert(
+            SyncItemMeta(
+                mappingId = mapping.id,
+                remoteId = remoteId,
+                parentRemoteId = existing?.parentRemoteId ?: parentId,
+                relativePath = path,
+                isFolder = false,
+                sizeBytes = bytes.size.toLong(),
+                contentHash = hash,
+                remoteUpdateTime = Instant.now()
+            )
+        )
+    }
+
+    /** Overwrite local file from server; meta follows remote. */
+    suspend fun forcePullPath(mapping: SyncMapping, relativePath: String) {
+        val path = PathUtil.normalize(relativePath)
+        val located = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
+        walkRemote(mapping.cloudFolderId, mapping.id, "", located)
+        val loc = located.firstOrNull {
+            PathUtil.normalize(it.relativePath) == path && !it.entry.isFolder
+        } ?: throw SyncException("Remote file missing for conflict resolve.", relativePath = path)
+        val bytes = remote.downloadFile(loc.entry.id)
+            ?: throw SyncException("Force download failed: remote file missing.", relativePath = path)
+        if (bytes.isEmpty()) {
+            throw SyncException("Force download returned empty file.", relativePath = path)
+        }
+        val parent = PathUtil.parentOf(path)
+        if (parent.isNotEmpty() && !fs.exists(mapping.localRootPath, parent)) {
+            fs.createDirectory(mapping.localRootPath, parent)
+        }
+        fs.writeFile(mapping.localRootPath, path, bytes)
+        store.upsert(
+            SyncItemMeta(
+                mappingId = mapping.id,
+                remoteId = loc.entry.id,
+                parentRemoteId = loc.entry.parentId,
+                relativePath = path,
+                isFolder = false,
+                sizeBytes = bytes.size.toLong(),
+                contentHash = ContentHashUtil.sha256Hex(bytes),
+                remoteUpdateTime = loc.entry.updateTime ?: Instant.now()
+            )
+        )
     }
 
     /** Overwrite server with all local files; meta follows local. Returns files uploaded. */

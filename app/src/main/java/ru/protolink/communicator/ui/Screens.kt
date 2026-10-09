@@ -1,7 +1,9 @@
 package ru.protolink.communicator.ui
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,6 +21,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Description
@@ -28,13 +31,17 @@ import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Message
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Note
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.Button
 import androidx.compose.material3.Divider
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
@@ -42,6 +49,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -89,11 +97,15 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material3.AlertDialog
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.text.font.FontStyle
@@ -106,7 +118,7 @@ import android.os.Handler
 import android.os.Looper
 import android.webkit.JavascriptInterface
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
     val state by vm.state.collectAsState()
@@ -152,6 +164,34 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
         activity.intent?.removeExtra("openContactId")
     }
 
+    // adb: am start -n …/.MainActivity --es protolink_force download
+    // Prefer MainActivity → PendingDebugIntent (survives auth timing). This is a backup.
+    LaunchedEffect(state.authenticated, state.mappings.size) {
+        if (!state.authenticated || state.mappings.isEmpty()) return@LaunchedEffect
+        activity?.intent?.let { ru.protolink.communicator.PendingDebugIntent.consumeFrom(it) }
+        if (!ru.protolink.communicator.PendingDebugIntent.takeForceDownload()) return@LaunchedEffect
+        tab = 2
+        vm.forceDownloadAllMappedNow()
+    }
+
+    // adb self-test: force_create_note / force_delete_note under files/
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(800)
+            val act = activity ?: continue
+            ru.protolink.communicator.PendingDebugIntent.consumeCreateNoteFile(act.applicationContext)
+            if (ru.protolink.communicator.PendingDebugIntent.hasPendingCreateNote()) {
+                tab = 1
+                vm.consumePendingDebugCreateNote()
+            }
+            ru.protolink.communicator.PendingDebugIntent.consumeDeleteNoteFile(act.applicationContext)
+            if (ru.protolink.communicator.PendingDebugIntent.hasPendingDeleteNote()) {
+                tab = 1
+                vm.consumePendingDebugDeleteNote()
+            }
+        }
+    }
+
     if (!state.authenticated && !state.showSettings) {
         AuthFlowScreen(
             vm = vm,
@@ -162,6 +202,30 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
     }
 
     if (state.showSettings) {
+        if (state.pendingConflict != null) {
+            val path = state.pendingConflict!!.relativePath
+            AlertDialog(
+                onDismissRequest = { vm.dismissConflict() },
+                title = { Text("Sync conflict") },
+                text = {
+                    Text(
+                        "This file differs on the phone and on the server:\n\n$path\n\n" +
+                            "Take from server — overwrite the phone.\n" +
+                            "Keep local — upload the phone version to the server."
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = { vm.resolveConflictTakeServer() }) {
+                        Text("Take from server")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { vm.resolveConflictKeepLocal() }) {
+                        Text("Keep local")
+                    }
+                }
+            )
+        }
         if (state.syncError != null) {
             AlertDialog(
                 onDismissRequest = { vm.clearSyncError() },
@@ -221,6 +285,30 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
         )
     }
 
+    if (state.pendingConflict != null) {
+        val path = state.pendingConflict!!.relativePath
+        AlertDialog(
+            onDismissRequest = { vm.dismissConflict() },
+            title = { Text("Sync conflict") },
+            text = {
+                Text(
+                    "This file differs on the phone and on the server:\n\n$path\n\n" +
+                        "Take from server — overwrite the phone.\n" +
+                        "Keep local — upload the phone version to the server."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { vm.resolveConflictTakeServer() }) {
+                    Text("Take from server")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { vm.resolveConflictKeepLocal() }) {
+                    Text("Keep local")
+                }
+            }
+        )
+    }
     if (state.syncError != null) {
         AlertDialog(
             onDismissRequest = { vm.clearSyncError() },
@@ -1244,6 +1332,35 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
         )
     }
 
+    if (state.pendingCreateNote != null) {
+        NewNoteDialog(vm = vm, pending = state.pendingCreateNote!!)
+    }
+
+    if (state.pendingDeleteNote != null) {
+        val pending = state.pendingDeleteNote!!
+        val body = if (pending.hasChildren) {
+            "Delete “${pending.name}” and all notes inside? This cannot be undone."
+        } else {
+            "Delete “${pending.name}”? This cannot be undone."
+        }
+        AlertDialog(
+            onDismissRequest = { vm.dismissDeleteNote() },
+            title = { Text("Delete note") },
+            text = { Text(body) },
+            confirmButton = {
+                TextButton(
+                    onClick = { vm.confirmDeleteNote() },
+                    colors = androidx.compose.material3.ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    )
+                ) { Text("Delete") }
+            },
+            dismissButton = {
+                TextButton(onClick = { vm.dismissDeleteNote() }) { Text("Cancel") }
+            }
+        )
+    }
+
     val showTree = !compactWidth || !editing
     val showEditor = editing
 
@@ -1257,6 +1374,9 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
                 onRefresh = { vm.refreshNotesTree() },
                 onToggleExpand = { vm.toggleNotesExpand(it) },
                 onOpen = { vm.selectNotesNode(it) },
+                onCreateNote = { vm.requestCreateNote() },
+                onCreateNoteHere = { vm.requestCreateNoteHere(it) },
+                onDeleteNote = { vm.requestDeleteNote(it) },
                 modifier = Modifier.fillMaxSize()
             )
         } else if (showEditor) {
@@ -1267,6 +1387,8 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
                 showBack = true,
                 onBack = { web, sc -> flushNoteAndLeave(web, sc, vm) },
                 onScheduleSave = { html -> vm.scheduleSaveSelectedNote(html) },
+                onNewNote = { vm.requestCreateNoteFromEditor() },
+                onDeleteNote = { vm.requestDeleteCurrentNote() },
                 webViewRef = { webViewRef = it },
                 getWebView = { webViewRef },
                 scope = scope,
@@ -1283,6 +1405,9 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
                 onRefresh = { vm.refreshNotesTree() },
                 onToggleExpand = { vm.toggleNotesExpand(it) },
                 onOpen = { vm.selectNotesNode(it) },
+                onCreateNote = { vm.requestCreateNote() },
+                onCreateNoteHere = { vm.requestCreateNoteHere(it) },
+                onDeleteNote = { vm.requestDeleteNote(it) },
                 modifier = Modifier.weight(0.38f)
             )
             if (showEditor) {
@@ -1293,6 +1418,8 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
                     showBack = false,
                     onBack = { web, sc -> flushNoteAndLeave(web, sc, vm) },
                     onScheduleSave = { html -> vm.scheduleSaveSelectedNote(html) },
+                    onNewNote = { vm.requestCreateNoteFromEditor() },
+                    onDeleteNote = { vm.requestDeleteCurrentNote() },
                     webViewRef = { webViewRef = it },
                     getWebView = { webViewRef },
                     scope = scope,
@@ -1310,6 +1437,80 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
     }
 }
 
+@Composable
+private fun NewNoteDialog(vm: MainViewModel, pending: PendingCreateNote) {
+    val focusRequester = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+    }
+    AlertDialog(
+        onDismissRequest = { vm.dismissCreateNote() },
+        title = { Text("New note") },
+        text = {
+            Column {
+                if (pending.fromEditor) {
+                    Text("Where to create:", style = MaterialTheme.typography.labelLarge)
+                    Spacer(Modifier.height(4.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { vm.setCreateNoteInsideCurrent(false) }
+                    ) {
+                        RadioButton(
+                            selected = !pending.insideCurrent,
+                            onClick = { vm.setCreateNoteInsideCurrent(false) }
+                        )
+                        Text("Same section", modifier = Modifier.padding(start = 4.dp))
+                    }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { vm.setCreateNoteInsideCurrent(true) }
+                    ) {
+                        RadioButton(
+                            selected = pending.insideCurrent,
+                            onClick = { vm.setCreateNoteInsideCurrent(true) }
+                        )
+                        Text("Inside this note", modifier = Modifier.padding(start = 4.dp))
+                    }
+                    Spacer(Modifier.height(8.dp))
+                }
+                Text(
+                    "Section: ${pending.sectionLabel}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(0xFF667781)
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = pending.titleDraft,
+                    onValueChange = { vm.updateCreateNoteTitle(it) },
+                    singleLine = true,
+                    label = { Text("Title") },
+                    isError = pending.titleError != null,
+                    supportingText = pending.titleError?.let { { Text(it) } },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(focusRequester)
+                        .onKeyEvent { ev ->
+                            if (ev.key == Key.Enter) {
+                                vm.confirmCreateNote()
+                                true
+                            } else false
+                        }
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { vm.confirmCreateNote() }) { Text("Create") }
+        },
+        dismissButton = {
+            TextButton(onClick = { vm.dismissCreateNote() }) { Text("Cancel") }
+        }
+    )
+}
+
 private val NotesHeaderBg = Color(0xFF527998)
 private val NotesFolderIcon = Color(0xFFFFC107)
 private val NotesFileIcon = Color(0xFF64B5F6)
@@ -1323,44 +1524,68 @@ private fun NotesTreePane(
     onRefresh: () -> Unit,
     onToggleExpand: (String) -> Unit,
     onOpen: (NoteTreeRow) -> Unit,
+    onCreateNote: () -> Unit,
+    onCreateNoteHere: (NoteTreeRow) -> Unit,
+    onDeleteNote: (NoteTreeRow) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Column(modifier.background(MaterialTheme.colorScheme.surface)) {
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text("Notes", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
-            TextButton(onClick = onPickRoot) { Text(if (hasRoot) "Folder" else "Choose") }
-            TextButton(onClick = onRefresh) { Text("Refresh") }
-        }
-        Divider()
-
-        if (!hasRoot) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("No notes folder", color = Color(0xFF667781))
-                    Spacer(Modifier.height(8.dp))
-                    Button(onClick = onPickRoot) { Text("Choose notes folder") }
+    Box(modifier.background(MaterialTheme.colorScheme.surface)) {
+        Column(Modifier.fillMaxSize()) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Notes", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                TextButton(onClick = onPickRoot) { Text(if (hasRoot) "Folder" else "Choose") }
+                TextButton(onClick = onRefresh) { Text("Refresh") }
+                if (hasRoot && LocalConfiguration.current.screenWidthDp >= 600) {
+                    TextButton(onClick = onCreateNote) { Text("New note") }
                 }
             }
-            return
-        }
+            Divider()
 
-        LazyColumn(Modifier.fillMaxSize()) {
-            items(rows, key = { it.documentId }) { row ->
-                NotesTreeItem(
-                    row = row,
-                    selected = row.documentId == selectedId,
-                    onToggleExpand = { onToggleExpand(row.documentId) },
-                    onOpen = { onOpen(row) }
-                )
-                Divider(
-                    modifier = Modifier.padding(start = (12 + row.depth * 20 + 28 + 40).dp),
-                    color = Color(0x14000000)
-                )
+            if (!hasRoot) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("No notes folder", color = Color(0xFF667781))
+                        Spacer(Modifier.height(8.dp))
+                        Button(onClick = onPickRoot) { Text("Choose notes folder") }
+                    }
+                }
+            } else {
+                LazyColumn(
+                    Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(bottom = 88.dp)
+                ) {
+                    items(rows, key = { it.documentId }) { row ->
+                        NotesTreeItem(
+                            row = row,
+                            selected = row.documentId == selectedId,
+                            onToggleExpand = { onToggleExpand(row.documentId) },
+                            onOpen = { onOpen(row) },
+                            onLongCreateHere = { onCreateNoteHere(row) },
+                            onDelete = { onDeleteNote(row) }
+                        )
+                        Divider(
+                            modifier = Modifier.padding(start = (12 + row.depth * 20 + 28 + 40).dp),
+                            color = Color(0x14000000)
+                        )
+                    }
+                }
+            }
+        }
+        if (hasRoot) {
+            FloatingActionButton(
+                onClick = onCreateNote,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(16.dp),
+                containerColor = NotesHeaderBg,
+                contentColor = Color.White
+            ) {
+                Icon(Icons.Default.Add, contentDescription = "New note")
             }
         }
     }
@@ -1370,19 +1595,27 @@ private fun NotesTreePane(
  * Telegram-style tree row: same-level icons share one vertical line.
  * [indent][chevron 28dp][type icon 40dp][title]
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun NotesTreeItem(
     row: NoteTreeRow,
     selected: Boolean,
     onToggleExpand: () -> Unit,
-    onOpen: () -> Unit
+    onOpen: () -> Unit,
+    onLongCreateHere: () -> Unit,
+    onDelete: () -> Unit
 ) {
     val indent = (row.depth * 20).dp
+    var showMenu by remember { mutableStateOf(false) }
+    Box {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .background(if (selected) Color(0x142AABEE) else Color.Transparent)
-            .clickable(onClick = onOpen)
+            .combinedClickable(
+                onClick = onOpen,
+                onLongClick = { showMenu = true }
+            )
             .padding(start = 12.dp + indent, end = 12.dp, top = 10.dp, bottom = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -1442,6 +1675,25 @@ private fun NotesTreeItem(
             )
         }
     }
+        DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+            DropdownMenuItem(
+                text = { Text("New note here") },
+                onClick = {
+                    showMenu = false
+                    onLongCreateHere()
+                }
+            )
+            if (row.relativePath.replace('\\', '/').trim('/').isNotEmpty()) {
+                DropdownMenuItem(
+                    text = { Text("Delete", color = MaterialTheme.colorScheme.error) },
+                    onClick = {
+                        showMenu = false
+                        onDelete()
+                    }
+                )
+            }
+        }
+    }
 }
 
 @Composable
@@ -1452,6 +1704,8 @@ private fun NotesEditorPane(
     showBack: Boolean,
     onBack: (WebView?, kotlinx.coroutines.CoroutineScope) -> Unit,
     onScheduleSave: (String) -> Unit,
+    onNewNote: () -> Unit,
+    onDeleteNote: () -> Unit,
     webViewRef: (WebView?) -> Unit,
     getWebView: () -> WebView?,
     scope: kotlinx.coroutines.CoroutineScope,
@@ -1467,6 +1721,7 @@ private fun NotesEditorPane(
     var showLinkDialog by remember { mutableStateOf(false) }
     var linkUrl by remember { mutableStateOf("https://") }
     var showHeadingMenu by remember { mutableStateOf(false) }
+    var showOverflow by remember { mutableStateOf(false) }
 
     fun runJs(js: String) {
         getWebView()?.evaluateJavascript(js, null)
@@ -1551,7 +1806,52 @@ private fun NotesEditorPane(
                 maxLines = 1,
                 modifier = Modifier.weight(1f)
             )
+            Box {
+                IconButton(onClick = { showOverflow = true }) {
+                    Icon(Icons.Default.MoreVert, contentDescription = "More", tint = Color.White)
+                }
+                DropdownMenu(expanded = showOverflow, onDismissRequest = { showOverflow = false }) {
+                    DropdownMenuItem(
+                        text = { Text("New note…") },
+                        onClick = {
+                            showOverflow = false
+                            onNewNote()
+                        }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Delete note", color = MaterialTheme.colorScheme.error) },
+                        onClick = {
+                            showOverflow = false
+                            onDeleteNote()
+                        }
+                    )
+                }
+            }
         }
+
+        // Format bar above the editor (not under IME) — mobile UX preference.
+        NotesFormatBar(
+            bold = selBold,
+            italic = selItalic,
+            underline = selUnderline,
+            strike = selStrike,
+            checkbox = selCheckbox,
+            block = selBlock,
+            onBold = { runJs(notesEditorApplyJs("bold")) },
+            onItalic = { runJs(notesEditorApplyJs("italic")) },
+            onUnderline = { runJs(notesEditorApplyJs("underline")) },
+            onStrike = { runJs(notesEditorApplyJs("strikeThrough")) },
+            onHeading = { showHeadingMenu = true },
+            onBullet = { runJs(notesEditorApplyJs("insertUnorderedList")) },
+            onNumbered = { runJs(notesEditorApplyJs("insertOrderedList")) },
+            onCheckbox = { runJs(notesEditorApplyJs("checkboxList")) },
+            onOutdent = { runJs(notesEditorApplyJs("outdent")) },
+            onIndent = { runJs(notesEditorApplyJs("indent")) },
+            onLink = {
+                linkUrl = "https://"
+                showLinkDialog = true
+            }
+        )
 
         key(documentId) {
             var loadedSig by remember(documentId) { mutableStateOf<Int?>(null) }
@@ -1619,29 +1919,6 @@ private fun NotesEditorPane(
                     .weight(1f)
             )
         }
-
-        NotesFormatBar(
-            bold = selBold,
-            italic = selItalic,
-            underline = selUnderline,
-            strike = selStrike,
-            checkbox = selCheckbox,
-            block = selBlock,
-            onBold = { runJs(notesEditorApplyJs("bold")) },
-            onItalic = { runJs(notesEditorApplyJs("italic")) },
-            onUnderline = { runJs(notesEditorApplyJs("underline")) },
-            onStrike = { runJs(notesEditorApplyJs("strikeThrough")) },
-            onHeading = { showHeadingMenu = true },
-            onBullet = { runJs(notesEditorApplyJs("insertUnorderedList")) },
-            onNumbered = { runJs(notesEditorApplyJs("insertOrderedList")) },
-            onCheckbox = { runJs(notesEditorApplyJs("checkboxList")) },
-            onOutdent = { runJs(notesEditorApplyJs("outdent")) },
-            onIndent = { runJs(notesEditorApplyJs("indent")) },
-            onLink = {
-                linkUrl = "https://"
-                showLinkDialog = true
-            }
-        )
     }
 }
 
