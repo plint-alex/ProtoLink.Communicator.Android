@@ -15,10 +15,10 @@ Android-клиент ProtoLink Communicator (Messenger, Notes, Cloud) с общ�
 ## Как запускать / проверять
 
 ```bat
-gradlew.bat :sync:test :app:assembleDebug
+gradlew.bat assembleDebug testDebugUnitTest
 ```
 
-Нужен `sdk.dir` в `local.properties`. API по умолчанию: `http://protolink.ru/`.
+Нужен JDK 17 в `JAVA_HOME` (путь JDK в репозитории не пинить) и `sdk.dir` в `local.properties`. API по умолчанию: `http://protolink.ru/`.
 
 Editor JS tests (на машине разработки, из Windows repo):
 

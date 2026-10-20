@@ -1,0 +1,3 @@
+# Unix wrapper must stay LF; CRLF breaks the shebang on Linux CI.
+gradlew text eol=lf
+gradlew.bat text eol=crlf
