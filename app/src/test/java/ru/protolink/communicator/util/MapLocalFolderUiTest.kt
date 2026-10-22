@@ -44,6 +44,15 @@ class MapLocalFolderUiTest {
                 shareRootCanWrite = emptyMap()
             )
         ).isFalse()
+        assertThat(
+            MapLocalFolderUi.showHubCta(
+                authenticated = true,
+                currentFolderId = CloudVirtualNodes.RECENT_ID,
+                breadcrumbIds = listOf(CloudVirtualNodes.HUB_ID, CloudVirtualNodes.RECENT_ID),
+                mappedFolderIds = emptySet(),
+                shareRootCanWrite = emptyMap()
+            )
+        ).isFalse()
     }
 
     @Test

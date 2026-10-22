@@ -20,6 +20,10 @@ object ShareSheetCloudStrings {
     fun cloudHub(lang: String?): String =
         if (isRussian(lang)) "Облако" else "Cloud"
 
+    /** C6 Recent hub row (EN/RU). */
+    fun recent(lang: String?): String =
+        if (isRussian(lang)) "Недавние" else "Recent"
+
     fun emptySharedTitle(lang: String?): String =
         if (isRussian(lang)) "Вам пока ничего не открыли" else "Nothing shared with you yet"
 
@@ -28,6 +32,15 @@ object ShareSheetCloudStrings {
             "Когда кто-то даст вам доступ, это появится здесь."
         else
             "When someone gives you access, it shows up here."
+
+    fun emptyRecentTitle(lang: String?): String =
+        if (isRussian(lang)) "Пока нет недавних" else "No recent items yet"
+
+    fun emptyRecentBody(lang: String?): String =
+        if (isRussian(lang))
+            "Откройте папку в облаке — она появится здесь."
+        else
+            "Open a Cloud folder and it will show up here."
 
     fun emptyFolderTitle(lang: String?): String =
         if (isRussian(lang)) "Папка пуста" else "This folder is empty"

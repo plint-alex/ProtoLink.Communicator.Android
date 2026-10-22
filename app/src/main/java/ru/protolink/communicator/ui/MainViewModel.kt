@@ -14,6 +14,7 @@ import ru.protolink.communicator.data.AuthRepository
 import ru.protolink.communicator.data.TokenRefresher
 import ru.protolink.communicator.data.CloudCodes
 import ru.protolink.communicator.data.CloudSyncMappingDto
+import ru.protolink.communicator.data.CloudRecentStore
 import ru.protolink.communicator.data.MappingStore
 import ru.protolink.communicator.data.MessengerNotifier
 import ru.protolink.communicator.data.MessengerReadStore
@@ -39,6 +40,7 @@ import ru.protolink.communicator.data.messenger.MessengerChatFolderResolver
 import ru.protolink.communicator.data.messenger.PendingAttachmentDraft
 import ru.protolink.communicator.data.messenger.ProgressRequestBody
 import ru.protolink.communicator.util.ChatTime
+import ru.protolink.communicator.util.CloudRecentList
 import ru.protolink.communicator.util.CloudSharedScope
 import ru.protolink.communicator.util.CloudVirtualNodes
 import ru.protolink.communicator.util.JsonValues
@@ -239,6 +241,7 @@ class MainViewModel @Inject constructor(
     private val api: ProtoLinkApi,
     private val settingsStore: SettingsStore,
     private val mappingStore: MappingStore,
+    private val cloudRecentStore: CloudRecentStore,
     private val signalR: SignalRService,
     private val metadataStore: MetadataStore,
     private val remoteCloud: ApiRemoteCloud,
@@ -637,6 +640,8 @@ class MainViewModel @Inject constructor(
             folderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true) -> buildHubListing(lang)
             folderId.equals(CloudVirtualNodes.SHARED_WITH_ME_ID, ignoreCase = true) ->
                 loadSharedWithMeListing(lang)
+            folderId.equals(CloudVirtualNodes.RECENT_ID, ignoreCase = true) ->
+                loadRecentListing()
             else -> {
                 val children = api.getEntities(
                     GetEntitiesRequest(parentIds = listOf(folderId), includeValues = true, take = 500)
@@ -668,8 +673,81 @@ class MainViewModel @Inject constructor(
                 name = ShareSheetCloudStrings.sharedWithMe(lang),
                 isFolder = true,
                 isVirtualEntry = true
+            ),
+            CloudItem(
+                id = CloudVirtualNodes.RECENT_ID,
+                name = ShareSheetCloudStrings.recent(lang),
+                isFolder = true,
+                isVirtualEntry = true
             )
         )
+    }
+
+    /**
+     * Recent (C6): show durable MRU; silently drop deleted/forbidden (prune store).
+     */
+    private suspend fun loadRecentListing(): List<CloudItem> {
+        val userId = auth.current()?.userId ?: return emptyList()
+        val stored = cloudRecentStore.load(userId)
+        if (stored.isEmpty()) return emptyList()
+
+        val ids = stored.map { it.entityId }
+        val found = try {
+            api.getEntities(GetEntitiesRequest(ids = ids, includeValues = true, take = ids.size))
+        } catch (_: Exception) {
+            // Offline / transient: show cached names without crashing chrome.
+            return stored.map { e ->
+                CloudItem(id = e.entityId, name = e.name, isFolder = e.isFolder)
+            }
+        }
+
+        val byId = found
+            .filter { isNavigableCloudCode(it.code) }
+            .associateBy { it.id.lowercase() }
+        val fresh = ArrayList<CloudItem>()
+        val pruned = ArrayList<CloudRecentList.Entry>()
+        for (entry in stored) {
+            val entity = byId[entry.entityId.lowercase()] ?: continue
+            val name = entityDisplayName(entity)
+            val isFolder =
+                entity.code == CloudCodes.CLOUD_FOLDER || entity.code == CloudCodes.CLOUD_ROOT
+            fresh.add(CloudItem(id = entity.id, name = name, isFolder = isFolder))
+            pruned.add(
+                CloudRecentList.Entry(
+                    entityId = entity.id,
+                    name = name,
+                    isFolder = isFolder,
+                    openedUtcMillis = entry.openedUtcMillis
+                )
+            )
+        }
+        if (pruned.size != stored.size) {
+            cloudRecentStore.replace(userId, pruned)
+        }
+        return fresh
+    }
+
+    private fun isNavigableCloudCode(code: String?): Boolean =
+        code == CloudCodes.CLOUD_FILE ||
+            code == CloudCodes.CLOUD_FOLDER ||
+            code == CloudCodes.CLOUD_ROOT
+
+    private fun recordRecentOpen(entityId: String, name: String, isFolder: Boolean) {
+        if (!CloudRecentList.shouldRecordOpen(entityId, cloudRootId)) return
+        val userId = auth.current()?.userId ?: return
+        try {
+            cloudRecentStore.recordOpen(
+                userId,
+                CloudRecentList.Entry(
+                    entityId = entityId,
+                    name = name,
+                    isFolder = isFolder,
+                    openedUtcMillis = System.currentTimeMillis()
+                )
+            )
+        } catch (_: Exception) {
+            // Best-effort; navigation must not fail.
+        }
     }
 
     private suspend fun loadSharedWithMeListing(lang: String): List<CloudItem> {
@@ -735,12 +813,59 @@ class MainViewModel @Inject constructor(
         }
         _state.update { it.copy(breadcrumb = crumbs) }
         loadCloudFolder(folderId)
+        recordRecentOpen(folderId, name.ifBlank { "Folder" }, isFolder = true)
     }
 
     fun openCloudFolder(item: CloudItem) {
         if (!item.isFolder) return
+        // Recent rows are not children of the virtual folder — open via real Cloud path (silent skip if gone).
+        if (currentFolderId.equals(CloudVirtualNodes.RECENT_ID, ignoreCase = true)) {
+            openRecentItem(item)
+            return
+        }
         _state.update { it.copy(breadcrumb = it.breadcrumb + (item.id to item.name)) }
         loadCloudFolder(item.id)
+        recordRecentOpen(item.id, item.name, isFolder = true)
+    }
+
+    /**
+     * Open a Recent row like normal browse; missing/forbidden skipped silently and pruned.
+     */
+    private fun openRecentItem(item: CloudItem) = viewModelScope.launch {
+        val userId = auth.current()?.userId ?: return@launch
+        try {
+            val found = api.getEntities(
+                GetEntitiesRequest(ids = listOf(item.id), includeValues = true, take = 1)
+            )
+            val entity = found.firstOrNull()
+            if (entity == null || !isNavigableCloudCode(entity.code)) {
+                cloudRecentStore.remove(userId, item.id)
+                loadCloudFolder(CloudVirtualNodes.RECENT_ID)
+                return@launch
+            }
+            val name = entityDisplayName(entity)
+            val isFolder =
+                entity.code == CloudCodes.CLOUD_FOLDER || entity.code == CloudCodes.CLOUD_ROOT
+            // Files: same as normal Cloud browse (no file viewer yet) — silent no-op.
+            if (!isFolder) return@launch
+
+            val lang = uiLang()
+            val hub = CloudVirtualNodes.HUB_ID to ShareSheetCloudStrings.cloudHub(lang)
+            val isRoot = entity.code == CloudCodes.CLOUD_ROOT ||
+                entity.id.equals(cloudRootId, ignoreCase = true)
+            val crumbs = if (isRoot) {
+                listOf(hub, entity.id to ShareSheetCloudStrings.myCloud(lang))
+            } else {
+                val myCloud = cloudRootId?.let { id -> id to ShareSheetCloudStrings.myCloud(lang) }
+                if (myCloud != null) listOf(hub, myCloud, entity.id to name)
+                else listOf(hub, entity.id to name)
+            }
+            _state.update { it.copy(breadcrumb = crumbs) }
+            loadCloudFolder(entity.id)
+            recordRecentOpen(entity.id, name, isFolder = true)
+        } catch (_: Exception) {
+            // Silent skip — keep listing; no raw errors in chrome.
+        }
     }
 
     fun cloudNavigateTo(index: Int) {

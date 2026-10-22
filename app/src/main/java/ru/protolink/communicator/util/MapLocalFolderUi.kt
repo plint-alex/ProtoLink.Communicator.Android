@@ -14,6 +14,7 @@ object MapLocalFolderUi {
         if (!authenticated) return false
         if (currentFolderId.isNullOrBlank()) return false
         if (currentFolderId.equals(CloudVirtualNodes.SHARED_WITH_ME_ID, ignoreCase = true)) return false
+        if (currentFolderId.equals(CloudVirtualNodes.RECENT_ID, ignoreCase = true)) return false
         if (CloudSharedScope.showSharedBrowseOnlyHint(currentFolderId, breadcrumbIds, shareRootCanWrite)) {
             return false
         }

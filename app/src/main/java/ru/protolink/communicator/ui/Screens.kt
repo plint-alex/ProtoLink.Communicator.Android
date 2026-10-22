@@ -702,6 +702,10 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
         ru.protolink.communicator.util.CloudVirtualNodes.SHARED_WITH_ME_ID,
         ignoreCase = true
     )
+    val isRecentListing = currentId.equals(
+        ru.protolink.communicator.util.CloudVirtualNodes.RECENT_ID,
+        ignoreCase = true
+    )
     val isVirtualCurrent = currentId != null &&
         ru.protolink.communicator.util.CloudVirtualNodes.isVirtual(currentId)
     val canMap = ru.protolink.communicator.util.CloudSharedScope.canMapCurrentFolder(
@@ -942,20 +946,28 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                     Icon(Icons.Default.Cloud, null, Modifier.size(48.dp), tint = Color(0xFFDBDBDB))
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        if (isSharedListing)
-                            ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedTitle(lang)
-                        else
-                            ru.protolink.communicator.util.ShareSheetCloudStrings.emptyFolderTitle(lang),
+                        when {
+                            isSharedListing ->
+                                ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedTitle(lang)
+                            isRecentListing ->
+                                ru.protolink.communicator.util.ShareSheetCloudStrings.emptyRecentTitle(lang)
+                            else ->
+                                ru.protolink.communicator.util.ShareSheetCloudStrings.emptyFolderTitle(lang)
+                        },
                         color = igAccent,
                         fontWeight = FontWeight.SemiBold,
                         textAlign = TextAlign.Center
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        if (isSharedListing)
-                            ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedBody(lang)
-                        else
-                            ru.protolink.communicator.util.ShareSheetCloudStrings.emptyFolderBody(lang),
+                        when {
+                            isSharedListing ->
+                                ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedBody(lang)
+                            isRecentListing ->
+                                ru.protolink.communicator.util.ShareSheetCloudStrings.emptyRecentBody(lang)
+                            else ->
+                                ru.protolink.communicator.util.ShareSheetCloudStrings.emptyFolderBody(lang)
+                        },
                         color = Color(0xFF8E8E8E),
                         fontSize = 13.sp,
                         textAlign = TextAlign.Center
