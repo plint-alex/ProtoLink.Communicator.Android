@@ -170,6 +170,77 @@ class CloudSharedWithMeScopeTest {
 
         assertThat(ShareSheetCloudStrings.browseOnlyHint("en")).contains("Browse only")
         assertThat(ShareSheetCloudStrings.browseOnlyHint("ru")).contains("просмотр")
+
+        assertThat(ShareSheetCloudStrings.leave("en")).isEqualTo("Leave")
+        assertThat(ShareSheetCloudStrings.leave("ru-RU")).isEqualTo("Покинуть")
+        assertThat(ShareSheetCloudStrings.leaveMenu("en")).isEqualTo("Remove from Shared with me")
+        assertThat(ShareSheetCloudStrings.leaveMenu("ru")).isEqualTo("Убрать из «Доступные мне»")
+        assertThat(ShareSheetCloudStrings.leaveConfirm("en")).contains("lose access")
+        assertThat(ShareSheetCloudStrings.leaveConfirm("ru")).contains("пропадет")
+        assertThat(ShareSheetCloudStrings.leaveSuccess("en")).isEqualTo("Removed from Shared with me")
+        assertThat(ShareSheetCloudStrings.leaveSuccess("ru")).isEqualTo("Убрано из «Доступные мне»")
+        assertThat(ShareSheetCloudStrings.leaveFailed("en")).isEqualTo("Couldn't leave. Try again.")
+        assertThat(ShareSheetCloudStrings.leaveFailed("ru")).isEqualTo("Не удалось покинуть. Повторите.")
+    }
+
+    @Test
+    fun canLeave_sharedListRow_and_openShareRoot() {
+        val shareRoot = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val known = mapOf(shareRoot.lowercase() to false)
+        assertThat(
+            CloudSharedScope.canLeaveSharedListRow(
+                isSharedWithMeListing = true,
+                isShareRoot = true,
+                isVirtualEntry = false
+            )
+        ).isTrue()
+        assertThat(
+            CloudSharedScope.canLeaveSharedListRow(
+                isSharedWithMeListing = false,
+                isShareRoot = true,
+                isVirtualEntry = false
+            )
+        ).isFalse()
+        assertThat(
+            CloudSharedScope.canLeaveSharedListRow(
+                isSharedWithMeListing = true,
+                isShareRoot = false,
+                isVirtualEntry = false
+            )
+        ).isFalse()
+        assertThat(
+            CloudSharedScope.canLeaveSharedListRow(
+                isSharedWithMeListing = true,
+                isShareRoot = true,
+                isVirtualEntry = true
+            )
+        ).isFalse()
+
+        val openCrumbs = listOf(
+            CloudVirtualNodes.HUB_ID,
+            CloudVirtualNodes.SHARED_WITH_ME_ID,
+            shareRoot
+        )
+        assertThat(
+            CloudSharedScope.canLeaveOpenShareRoot(shareRoot, openCrumbs, known)
+        ).isTrue()
+        assertThat(
+            CloudSharedScope.canLeaveOpenShareRoot(
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                openCrumbs,
+                known
+            )
+        ).isFalse()
+        assertThat(
+            CloudSharedScope.canLeaveOpenShareRoot(
+                shareRoot,
+                listOf(CloudVirtualNodes.HUB_ID, CloudVirtualNodes.SHARED_WITH_ME_ID),
+                known
+            )
+        ).isFalse()
+        assertThat(
+            CloudSharedScope.canLeaveOpenShareRoot(shareRoot, openCrumbs, emptyMap())
+        ).isFalse()
     }
 
     @Test

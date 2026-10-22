@@ -689,6 +689,8 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
     var showCreateFolder by remember { mutableStateOf(false) }
     var newFolder by remember { mutableStateOf("") }
     var itemMenuId by remember { mutableStateOf<String?>(null) }
+    var headerOverflowOpen by remember { mutableStateOf(false) }
+    var leaveConfirmEntityId by remember { mutableStateOf<String?>(null) }
     val lang = remember { java.util.Locale.getDefault().toLanguageTag() }
     val folderName = state.breadcrumb.lastOrNull()?.second
         ?: ru.protolink.communicator.util.ShareSheetCloudStrings.cloudHub(lang)
@@ -716,6 +718,11 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
         state.shareRootCanWrite
     )
     val showBrowseOnlyHint = ru.protolink.communicator.util.CloudSharedScope.showSharedBrowseOnlyHint(
+        currentId,
+        crumbIds,
+        state.shareRootCanWrite
+    )
+    val canLeaveCurrentSharedRoot = ru.protolink.communicator.util.CloudSharedScope.canLeaveOpenShareRoot(
         currentId,
         crumbIds,
         state.shareRootCanWrite
@@ -798,6 +805,31 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
             if (canMutate) {
                 IconButton(onClick = { showCreateFolder = true }) {
                     Icon(Icons.Default.Add, contentDescription = "New", tint = igAccent)
+                }
+            }
+            if (canLeaveCurrentSharedRoot) {
+                Box {
+                    IconButton(onClick = { headerOverflowOpen = true }) {
+                        Icon(
+                            Icons.Default.MoreVert,
+                            contentDescription = ru.protolink.communicator.util.ShareSheetCloudStrings.leave(lang),
+                            tint = igAccent
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = headerOverflowOpen,
+                        onDismissRequest = { headerOverflowOpen = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = {
+                                Text(ru.protolink.communicator.util.ShareSheetCloudStrings.leaveMenu(lang))
+                            },
+                            onClick = {
+                                headerOverflowOpen = false
+                                currentId?.let { leaveConfirmEntityId = it }
+                            }
+                        )
+                    }
                 }
             }
         }
@@ -986,6 +1018,11 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                 gridItems(state.cloudItems, key = { it.id }) { item ->
                     val mapped = mappedIds.contains(item.id)
                     val showMenu = itemMenuId == item.id && !item.isVirtualEntry
+                    val canLeaveRow = ru.protolink.communicator.util.CloudSharedScope.canLeaveSharedListRow(
+                        isSharedListing,
+                        item.isShareRoot,
+                        item.isVirtualEntry
+                    )
                     Box {
                     Column(
                         Modifier
@@ -1071,6 +1108,17 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                                 )
                             }
                         )
+                        if (canLeaveRow) {
+                            DropdownMenuItem(
+                                text = {
+                                    Text(ru.protolink.communicator.util.ShareSheetCloudStrings.leave(lang))
+                                },
+                                onClick = {
+                                    itemMenuId = null
+                                    leaveConfirmEntityId = item.id
+                                }
+                            )
+                        }
                     }
                     }
                 }
@@ -1079,6 +1127,33 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
     }
 
     ProtoLinkShareSheetHost(vm = vm, state = state, lang = lang)
+
+    leaveConfirmEntityId?.let { leaveId ->
+        AlertDialog(
+            onDismissRequest = { leaveConfirmEntityId = null },
+            title = {
+                Text(ru.protolink.communicator.util.ShareSheetCloudStrings.leave(lang))
+            },
+            text = {
+                Text(ru.protolink.communicator.util.ShareSheetCloudStrings.leaveConfirm(lang))
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        leaveConfirmEntityId = null
+                        vm.leaveShared(leaveId)
+                    }
+                ) {
+                    Text(ru.protolink.communicator.util.ShareSheetCloudStrings.leave(lang))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { leaveConfirmEntityId = null }) {
+                    Text(ShareSheetStrings.cancel(lang))
+                }
+            }
+        )
+    }
 
     if (showCreateFolder) {
         AlertDialog(

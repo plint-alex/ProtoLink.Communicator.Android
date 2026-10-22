@@ -64,6 +64,7 @@ import ru.protolink.communicator.ui.share.ShareContactPickerItem
 import ru.protolink.communicator.ui.share.SharePersonUi
 import ru.protolink.communicator.ui.share.ShareSheetUiState
 import ru.protolink.communicator.data.api.CreateShareLinkRequest
+import ru.protolink.communicator.data.api.LeaveSharedWithMeRequest
 import ru.protolink.communicator.data.api.RemovePermissionRequest
 import ru.protolink.communicator.data.api.RevokeShareLinkRequest
 import ru.protolink.communicator.data.api.UpdateShareLinkRequest
@@ -100,6 +101,8 @@ data class CloudItem(
     val name: String,
     val isFolder: Boolean,
     val isVirtualEntry: Boolean = false,
+    /** True for Shared-with-me listing rows (share roots from S6). */
+    val isShareRoot: Boolean = false,
     val subtitle: String? = null
 )
 data class ContactItem(
@@ -803,11 +806,50 @@ class MainViewModel @Inject constructor(
                     id = e.id,
                     name = entityDisplayName(e),
                     isFolder = isFolder,
+                    isShareRoot = true,
                     subtitle = ShareSheetCloudStrings.sharedRowSubtitle(lang, creatorName, canWrite)
                 )
             }
         _state.update { it.copy(shareRootCanWrite = canWriteByRoot.toMap()) }
         return items
+    }
+
+    /**
+     * UX-LS: remove caller's direct personal grant on a Shared-with-me share root.
+     * Confirm is owned by the UI; this performs the Api call + listing refresh.
+     */
+    fun leaveShared(entityId: String) = viewModelScope.launch {
+        val id = entityId.takeIf { it.isNotBlank() && !CloudVirtualNodes.isVirtual(it) } ?: return@launch
+        val lang = uiLang()
+        val wasOpenRoot = currentFolderId.equals(id, ignoreCase = true)
+        try {
+            api.leaveSharedWithMe(LeaveSharedWithMeRequest(entityId = id))
+            val nextCanWrite = _state.value.shareRootCanWrite.toMutableMap().apply {
+                remove(id.lowercase())
+            }
+            val nextItems = _state.value.cloudItems.filterNot { it.id.equals(id, ignoreCase = true) }
+            _state.update {
+                it.copy(
+                    shareRootCanWrite = nextCanWrite,
+                    cloudItems = nextItems,
+                    status = ShareSheetCloudStrings.leaveSuccess(lang)
+                )
+            }
+            if (wasOpenRoot) {
+                navigateToSharedWithMeListing(lang)
+            } else if (currentFolderId.equals(CloudVirtualNodes.SHARED_WITH_ME_ID, ignoreCase = true)) {
+                loadCloudFolder(CloudVirtualNodes.SHARED_WITH_ME_ID)
+            }
+        } catch (_: Exception) {
+            _state.update { it.copy(status = ShareSheetCloudStrings.leaveFailed(lang)) }
+        }
+    }
+
+    private fun navigateToSharedWithMeListing(lang: String) {
+        val hub = CloudVirtualNodes.HUB_ID to ShareSheetCloudStrings.cloudHub(lang)
+        val shared = CloudVirtualNodes.SHARED_WITH_ME_ID to ShareSheetCloudStrings.sharedWithMe(lang)
+        _state.update { it.copy(breadcrumb = listOf(hub, shared)) }
+        loadCloudFolder(CloudVirtualNodes.SHARED_WITH_ME_ID)
     }
 
     /** Jump to a mapped folder (stories strip) with a sensible breadcrumb. */

@@ -78,4 +78,25 @@ object ShareSheetCloudStrings {
 
     fun unmap(lang: String?): String =
         if (isRussian(lang)) "Отвязать" else "Unmap"
+
+    // --- Leave Shared with me (UX §7b / UX-LS-*) ---
+
+    fun leave(lang: String?): String =
+        if (isRussian(lang)) "Покинуть" else "Leave"
+
+    /** Long form for header overflow when space is tight on the row. */
+    fun leaveMenu(lang: String?): String =
+        if (isRussian(lang)) "Убрать из «Доступные мне»" else "Remove from Shared with me"
+
+    fun leaveConfirm(lang: String?): String =
+        if (isRussian(lang))
+            "Покинуть общий элемент? Доступ пропадет, пока вам снова не откроют."
+        else
+            "Leave this shared item? You lose access until someone shares it again."
+
+    fun leaveSuccess(lang: String?): String =
+        if (isRussian(lang)) "Убрано из «Доступные мне»" else "Removed from Shared with me"
+
+    fun leaveFailed(lang: String?): String =
+        if (isRussian(lang)) "Не удалось покинуть. Повторите." else "Couldn't leave. Try again."
 }

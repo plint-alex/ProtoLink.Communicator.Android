@@ -221,6 +221,10 @@ interface ProtoLinkApi {
     @GET("api/Share/ListGrants")
     suspend fun listShareGrants(@Query("entityId") entityId: String): List<ShareGrantDto>
 
+    /** UX §7b / AT-S46: remove caller's direct personal grant (Can view OK). Idempotent. */
+    @POST("api/Share/LeaveSharedWithMe")
+    suspend fun leaveSharedWithMe(@Body body: LeaveSharedWithMeRequest): LeaveSharedWithMeResult
+
     @POST("api/Entities/RemovePermission")
     suspend fun removePermission(@Body body: RemovePermissionRequest): ResponseBody
 }
@@ -294,4 +298,13 @@ data class ShareGrantDto(
 data class RemovePermissionRequest(
     val id: String,
     val permissionForId: String
+)
+
+/** Grantee Leave Shared with me (UX §7b / AT-S46). */
+data class LeaveSharedWithMeRequest(val entityId: String)
+
+data class LeaveSharedWithMeResult(
+    val entityId: String? = null,
+    /** True when a direct personal grant was removed; false when already absent (idempotent). */
+    val left: Boolean = true
 )

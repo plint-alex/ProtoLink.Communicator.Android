@@ -79,4 +79,26 @@ object CloudSharedScope {
         }
         return true
     }
+
+    /**
+     * UX-LS-1: open Shared-with-me share root may Leave via header overflow.
+     * [knownShareRoots] keys are lowercased share-root ids from the SWM listing.
+     */
+    fun canLeaveOpenShareRoot(
+        currentEntityId: String?,
+        breadcrumbIds: Iterable<String>,
+        knownShareRoots: Map<String, Boolean>
+    ): Boolean {
+        if (currentEntityId.isNullOrBlank()) return false
+        val root = tryGetActiveShareRootId(breadcrumbIds) ?: return false
+        return root.equals(currentEntityId, ignoreCase = true) &&
+            knownShareRoots.containsKey(root.lowercase())
+    }
+
+    /** UX-LS-1: Leave on Shared-with-me list rows only (share roots from S6). */
+    fun canLeaveSharedListRow(
+        isSharedWithMeListing: Boolean,
+        isShareRoot: Boolean,
+        isVirtualEntry: Boolean
+    ): Boolean = isSharedWithMeListing && isShareRoot && !isVirtualEntry
 }
