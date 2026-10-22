@@ -18,7 +18,9 @@ import ru.protolink.communicator.data.CloudRecentStore
 import ru.protolink.communicator.data.MappingStore
 import ru.protolink.communicator.data.MessengerNotifier
 import ru.protolink.communicator.data.MessengerReadStore
+import ru.protolink.communicator.data.NotesSiblingFiles
 import ru.protolink.communicator.data.NotesTreeBuilder
+import ru.protolink.communicator.data.SafTreeLister
 import ru.protolink.communicator.data.SettingsStore
 import ru.protolink.communicator.data.SignalRService
 import ru.protolink.communicator.data.SystemEntities
@@ -66,6 +68,7 @@ import ru.protolink.communicator.data.api.UpdateShareLinkRequest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
@@ -213,7 +216,10 @@ data class UiState(
     val selectedNotePath: String? = null,
     val selectedNoteRelativePath: String? = null,
     val selectedNoteDocumentId: String? = null,
+    val selectedNoteSafDocumentId: String? = null,
     val selectedNoteIndexUri: String? = null,
+    /** E5/E5a Folder files under the open note (direct-child files only; empty → hide panel). */
+    val notesSiblingFiles: List<NotesSiblingFiles.SiblingFile> = emptyList(),
     val showSettings: Boolean = false,
     val syncing: Boolean = false,
     val forceRunning: Boolean = false,
@@ -2822,7 +2828,9 @@ fun setNotesRoot(uri: String) {
                 selectedNotePath = null,
                 selectedNoteRelativePath = null,
                 selectedNoteDocumentId = null,
+                selectedNoteSafDocumentId = null,
                 selectedNoteIndexUri = null,
+                notesSiblingFiles = emptyList(),
                 notesContent = "",
                 notesTreeRows = emptyList()
             )
@@ -2862,6 +2870,7 @@ fun setNotesRoot(uri: String) {
                 status = "Notes tree: ${countFolders(root)} page folder(s)"
             )
         }
+        refreshNotesSiblingFilesSuspend()
     }
 
     private fun countFolders(node: NotesTreeBuilder.Node): Int =
@@ -3320,6 +3329,7 @@ fun setNotesRoot(uri: String) {
                     selectedNotePath = row.name,
                     selectedNoteRelativePath = row.relativePath,
                     selectedNoteDocumentId = row.documentId,
+                    selectedNoteSafDocumentId = row.safDocumentId.ifBlank { null },
                     selectedNoteIndexUri = indexUri?.toString(),
                     notesContent = body,
                     notesDirty = false,
@@ -3333,6 +3343,10 @@ fun setNotesRoot(uri: String) {
                     }
                 )
             }
+            refreshNotesSiblingFilesSuspend(
+                safDocumentId = row.safDocumentId.ifBlank { null },
+                relativePath = row.relativePath
+            )
             if (indexUri != null) {
                 notesDiskFingerprint = ContentHashUtil.sha256Hex(body.toByteArray(Charsets.UTF_8))
                 startNotesDiskPoller()
@@ -3346,6 +3360,8 @@ fun setNotesRoot(uri: String) {
                     selectedNotePath = row.name,
                     selectedNoteRelativePath = row.relativePath,
                     selectedNoteDocumentId = row.documentId,
+                    selectedNoteSafDocumentId = row.safDocumentId.ifBlank { null },
+                    notesSiblingFiles = emptyList(),
                     notesContent = "<p>Open failed: ${e.message}</p>",
                     status = "Open failed: ${e.message}"
                 )
@@ -3368,11 +3384,74 @@ fun setNotesRoot(uri: String) {
                 selectedNotePath = null,
                 selectedNoteRelativePath = null,
                 selectedNoteDocumentId = null,
+                selectedNoteSafDocumentId = null,
                 selectedNoteIndexUri = null,
+                notesSiblingFiles = emptyList(),
                 notesContent = "",
                 notesDirty = false,
                 notesReloadPrompt = false
             )
+        }
+    }
+
+    /** Re-enumerate Folder files under the open note (E5/E5a). Soft-empty on gone URI / errors. */
+    fun refreshNotesSiblingFiles() = viewModelScope.launch {
+        refreshNotesSiblingFilesSuspend()
+    }
+
+    private suspend fun refreshNotesSiblingFilesSuspend(
+        safDocumentId: String? = _state.value.selectedNoteSafDocumentId,
+        relativePath: String? = _state.value.selectedNoteRelativePath
+    ) {
+        val rootUriStr = settingsStore.load().notesRootUri
+        if (rootUriStr.isNullOrBlank() || _state.value.selectedNoteDocumentId.isNullOrBlank()) {
+            _state.update { it.copy(notesSiblingFiles = emptyList()) }
+            return
+        }
+        val treeUri = Uri.parse(rootUriStr)
+        val folderId = safDocumentId?.takeIf { it.isNotBlank() }
+            ?: NotesTreeBuilder.folderDocumentId(treeUri, relativePath.orEmpty())
+        val siblings = withContext(Dispatchers.IO) {
+            try {
+                val entries = SafTreeLister.listChildren(appContext, treeUri, folderId)
+                NotesSiblingFiles.listSiblingFiles(
+                    entries.map {
+                        NotesSiblingFiles.ChildEntry(
+                            name = it.name,
+                            isDirectory = it.isDirectory,
+                            documentId = it.documentId,
+                            uri = it.uri.toString()
+                        )
+                    }
+                )
+            } catch (e: Exception) {
+                Log.w("ProtoLinkNotes", "sibling list soft-fail for $folderId: ${e.message}")
+                emptyList()
+            }
+        }
+        _state.update { it.copy(notesSiblingFiles = siblings) }
+    }
+
+    /** AT-N9: open sibling with VIEW intent; stay on Notes (no Cloud switch). Soft status on failure. */
+    fun openNotesSiblingFile(file: NotesSiblingFiles.SiblingFile) {
+        if (file.uri.isBlank()) {
+            _state.update { it.copy(status = "File not found") }
+            return
+        }
+        try {
+            val uri = Uri.parse(file.uri)
+            val ext = file.name.substringAfterLast('.', missingDelimiterValue = "").lowercase(Locale.US)
+            val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, mime)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            appContext.startActivity(intent)
+            _state.update { it.copy(status = "Opened ${file.name}") }
+        } catch (e: Exception) {
+            Log.w("ProtoLinkNotes", "open sibling failed ${file.name}", e)
+            _state.update { it.copy(status = "Could not open ${file.name}") }
         }
     }
 
@@ -3523,6 +3602,7 @@ fun setNotesRoot(uri: String) {
                     status = "Saved ${_state.value.selectedNotePath}"
                 )
             }
+            refreshNotesSiblingFilesSuspend()
             requestLocalPush()
         } catch (e: Exception) {
             Log.e("ProtoLinkNotes", "save failed", e)

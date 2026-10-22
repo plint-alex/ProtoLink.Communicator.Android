@@ -1922,6 +1922,13 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
         }
     }
 
+    // E5: re-list Folder files when the editor becomes visible (SAF has no reliable watcher).
+    LaunchedEffect(editing, state.selectedNoteDocumentId) {
+        if (editing && state.selectedNoteDocumentId != null) {
+            vm.refreshNotesSiblingFiles()
+        }
+    }
+
     if (compactWidth && editing) {
         BackHandler {
             flushNoteAndLeave(webViewRef, scope, vm)
@@ -2006,11 +2013,14 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
                 title = state.selectedNotePath.orEmpty(),
                 content = state.notesContent,
                 documentId = state.selectedNoteDocumentId,
+                siblingFiles = state.notesSiblingFiles,
                 showBack = true,
                 onBack = { web, sc -> flushNoteAndLeave(web, sc, vm) },
                 onScheduleSave = { html -> vm.scheduleSaveSelectedNote(html) },
                 onNewNote = { vm.requestCreateNoteFromEditor() },
                 onDeleteNote = { vm.requestDeleteCurrentNote() },
+                onOpenSibling = { vm.openNotesSiblingFile(it) },
+                onRefreshSiblings = { vm.refreshNotesSiblingFiles() },
                 webViewRef = { webViewRef = it },
                 getWebView = { webViewRef },
                 scope = scope,
@@ -2042,11 +2052,14 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
                     title = state.selectedNotePath.orEmpty(),
                     content = state.notesContent,
                     documentId = state.selectedNoteDocumentId,
+                    siblingFiles = state.notesSiblingFiles,
                     showBack = false,
                     onBack = { web, sc -> flushNoteAndLeave(web, sc, vm) },
                     onScheduleSave = { html -> vm.scheduleSaveSelectedNote(html) },
                     onNewNote = { vm.requestCreateNoteFromEditor() },
                     onDeleteNote = { vm.requestDeleteCurrentNote() },
+                    onOpenSibling = { vm.openNotesSiblingFile(it) },
+                    onRefreshSiblings = { vm.refreshNotesSiblingFiles() },
                     webViewRef = { webViewRef = it },
                     getWebView = { webViewRef },
                     scope = scope,
@@ -2327,11 +2340,14 @@ private fun NotesEditorPane(
     title: String,
     content: String,
     documentId: String?,
+    siblingFiles: List<ru.protolink.communicator.data.NotesSiblingFiles.SiblingFile> = emptyList(),
     showBack: Boolean,
     onBack: (WebView?, kotlinx.coroutines.CoroutineScope) -> Unit,
     onScheduleSave: (String) -> Unit,
     onNewNote: () -> Unit,
     onDeleteNote: () -> Unit,
+    onOpenSibling: (ru.protolink.communicator.data.NotesSiblingFiles.SiblingFile) -> Unit = {},
+    onRefreshSiblings: () -> Unit = {},
     webViewRef: (WebView?) -> Unit,
     getWebView: () -> WebView?,
     scope: kotlinx.coroutines.CoroutineScope,
@@ -2544,6 +2560,61 @@ private fun NotesEditorPane(
                     .fillMaxSize()
                     .weight(1f)
             )
+        }
+
+        // E5/E5a: Folder files — direct-child files only; hide when empty.
+        if (siblingFiles.isNotEmpty()) {
+            Divider(color = Color(0xFFE0E3E7))
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFFF7F8FA))
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "Folder files",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = onRefreshSiblings) { Text("Refresh") }
+            }
+            LazyColumn(
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 220.dp)
+                    .background(Color.White)
+            ) {
+                items(siblingFiles, key = { it.documentId.ifBlank { it.uri } }) { file ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable { onOpenSibling(file) }
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.InsertDriveFile,
+                            contentDescription = null,
+                            tint = Color(0xFF667781),
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            file.name,
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    Divider(
+                        modifier = Modifier.padding(start = 42.dp),
+                        color = Color(0x14000000)
+                    )
+                }
+            }
         }
     }
 }
