@@ -1332,19 +1332,12 @@ private fun MessengerContactsPane(
                 ) {
                     ContactAvatar(c.displayName)
                     Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(
-                            c.displayName,
-                            style = MaterialTheme.typography.titleMedium,
-                            maxLines = 1
-                        )
-                        Text(
-                            "Tap to open chat",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1
-                        )
-                    }
+                    Text(
+                        c.displayName,
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 1,
+                        modifier = Modifier.weight(1f)
+                    )
                     if (c.hasUnread) {
                         Box(
                             modifier = Modifier
