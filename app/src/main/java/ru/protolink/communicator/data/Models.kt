@@ -27,7 +27,9 @@ data class AppSettings(
     val theme: String = "Light",
     val apiBaseAddress: String = "http://protolink.ru/",
     val publicSiteBaseUrl: String = "https://protolink.ru/",
-    val notesRootUri: String? = null
+    val notesRootUri: String? = null,
+    /** Cache: "ownerUserId:partnerUserId" → chat folder entity id (client-contract §4). */
+    val messengerChatFolderIds: Map<String, String> = emptyMap()
 )
 
 data class CloudSyncMappingDto(

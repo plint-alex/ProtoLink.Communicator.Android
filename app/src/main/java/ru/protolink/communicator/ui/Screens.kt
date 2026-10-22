@@ -24,8 +24,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Cloud
-import androidx.compose.material.icons.filled.Description
-import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.InsertDriveFile
@@ -77,12 +75,24 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import kotlin.coroutines.resume
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.provider.OpenableColumns
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import java.io.File
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.consumeWindowInsets
@@ -98,8 +108,16 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.filled.CreateNewFolder
+import androidx.compose.material.icons.filled.IosShare
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material3.AlertDialog
+import ru.protolink.communicator.ui.share.ShareSheetScreen
+import ru.protolink.communicator.util.MapLocalFolderStrings
+import ru.protolink.communicator.util.MapLocalFolderUi
+import ru.protolink.communicator.util.ShareAccountStrings
+import ru.protolink.communicator.util.ShareSheetStrings
+import androidx.documentfile.provider.DocumentFile
+import android.net.Uri
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -136,6 +154,10 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
     val notifPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { /* granted or not — notifications simply won't show if denied */ }
+
+    LaunchedEffect(state.preferCloudTabNonce) {
+        if (state.preferCloudTabNonce > 0) tab = 2
+    }
 
     LaunchedEffect(Unit) {
         if (android.os.Build.VERSION.SDK_INT >= 33) {
@@ -458,6 +480,17 @@ fun SettingsScreen(vm: MainViewModel, state: UiState, onClose: () -> Unit) {
                                 }
                             }
                         )
+                        Divider(Modifier.padding(start = 16.dp), color = tgDivider, thickness = 0.5.dp)
+                        val accountLang = remember { java.util.Locale.getDefault().toLanguageTag() }
+                        TgSettingsRow(
+                            title = ShareAccountStrings.copyMyIdLabel(accountLang),
+                            subtitle = ShareAccountStrings.copyMyIdHint(accountLang),
+                            trailing = {
+                                TextButton(onClick = { vm.copyMyUserId() }) {
+                                    Text(ShareAccountStrings.copyMyIdLabel(accountLang), color = tgBlue)
+                                }
+                            }
+                        )
                     } else {
                         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             Text(
@@ -499,6 +532,27 @@ fun SettingsScreen(vm: MainViewModel, state: UiState, onClose: () -> Unit) {
                         TextButton(onClick = { vm.saveSettings(state.settings.copy(apiBaseAddress = api)) }) {
                             Text("Save API", color = tgBlue)
                         }
+                    }
+                }
+            }
+
+            if (state.authenticated) {
+                item {
+                    val mapLang = remember { java.util.Locale.getDefault().toLanguageTag() }
+                    TgSettingsSectionLabel("Cloud sync")
+                    TgSettingsCard {
+                        TgSettingsRow(
+                            title = MapLocalFolderStrings.hubCta(mapLang),
+                            subtitle = "Opens Cloud wizard (not Settings-only)",
+                            trailing = {
+                                TextButton(onClick = {
+                                    onClose()
+                                    vm.requestAddLocalFolderWizard()
+                                }) {
+                                    Text("Open", color = tgBlue)
+                                }
+                            }
+                        )
                     }
                 }
             }
@@ -594,10 +648,12 @@ private fun TgSettingsRow(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun CloudScreen(vm: MainViewModel, state: UiState) {
     val context = LocalContext.current
-    val pickTree = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+    var wizardLocalUri by remember { mutableStateOf<String?>(null) }
+    val pickTreeForCurrentMap = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
             context.contentResolver.takePersistableUriPermission(
                 uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
@@ -605,14 +661,69 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
             vm.mapCurrentFolder(uri.toString())
         }
     }
+    val pickTreeForWizard = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            context.contentResolver.takePersistableUriPermission(
+                uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+            wizardLocalUri = uri.toString()
+            vm.refreshMapWizardCandidates()
+        } else {
+            // User cancelled SAF — close wizard (AT-MAP-1 entry must not stick open empty).
+            vm.dismissMapLocalFolderWizard()
+        }
+    }
+    LaunchedEffect(state.mapWizardOpen, state.mapWizardPrefillUri) {
+        if (!state.mapWizardOpen) {
+            wizardLocalUri = null
+            return@LaunchedEffect
+        }
+        val prefill = state.mapWizardPrefillUri
+        if (!prefill.isNullOrBlank()) {
+            wizardLocalUri = prefill
+        } else if (wizardLocalUri.isNullOrBlank()) {
+            pickTreeForWizard.launch(null)
+        }
+    }
     var showCreateFolder by remember { mutableStateOf(false) }
     var newFolder by remember { mutableStateOf("") }
-    val folderName = state.breadcrumb.lastOrNull()?.second ?: "Cloud"
+    var itemMenuId by remember { mutableStateOf<String?>(null) }
+    val lang = remember { java.util.Locale.getDefault().toLanguageTag() }
+    val folderName = state.breadcrumb.lastOrNull()?.second
+        ?: ru.protolink.communicator.util.ShareSheetCloudStrings.cloudHub(lang)
     val igSurface = Color(0xFFFAFAFA)
     val igBorder = Color(0xFFDBDBDB)
     val igAccent = Color(0xFF262626)
     val mappedIds = remember(state.mappings) { state.mappings.map { it.cloudFolderId }.toSet() }
     val canGoUp = state.breadcrumb.size > 1
+    val currentId = state.breadcrumb.lastOrNull()?.first
+    val crumbIds = remember(state.breadcrumb) { state.breadcrumb.map { it.first } }
+    val isSharedListing = currentId.equals(
+        ru.protolink.communicator.util.CloudVirtualNodes.SHARED_WITH_ME_ID,
+        ignoreCase = true
+    )
+    val isVirtualCurrent = currentId != null &&
+        ru.protolink.communicator.util.CloudVirtualNodes.isVirtual(currentId)
+    val canMap = ru.protolink.communicator.util.CloudSharedScope.canMapCurrentFolder(
+        currentId,
+        crumbIds,
+        mappedIds,
+        state.shareRootCanWrite
+    )
+    val showBrowseOnlyHint = ru.protolink.communicator.util.CloudSharedScope.showSharedBrowseOnlyHint(
+        currentId,
+        crumbIds,
+        state.shareRootCanWrite
+    )
+    val showAddLocalCta = MapLocalFolderUi.showHubCta(
+        state.authenticated,
+        currentId,
+        crumbIds,
+        mappedIds,
+        state.shareRootCanWrite
+    )
+    val canMutate = currentId != null && !isVirtualCurrent
+    val canShareCurrent = currentId != null && !isVirtualCurrent
 
     Column(
         Modifier
@@ -661,6 +772,14 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                     color = Color(0xFF8E8E8E)
                 )
             }
+            if (canShareCurrent) {
+                IconButton(onClick = { vm.copyCanonicalLink(currentId) }) {
+                    Icon(Icons.Default.Link, contentDescription = ShareSheetStrings.copyLink(lang), tint = igAccent)
+                }
+                IconButton(onClick = { vm.openShareForCurrentFolder() }) {
+                    Icon(Icons.Default.IosShare, contentDescription = ShareSheetStrings.shareButton(lang), tint = igAccent)
+                }
+            }
             IconButton(onClick = { state.breadcrumb.lastOrNull()?.first?.let { vm.loadCloudFolder(it) } }) {
                 Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = igAccent)
             }
@@ -671,12 +790,27 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                     tint = if (state.syncing) Color(0xFF8E8E8E) else igAccent
                 )
             }
-            IconButton(onClick = { showCreateFolder = true }) {
-                Icon(Icons.Default.Add, contentDescription = "New", tint = igAccent)
+            if (canMutate) {
+                IconButton(onClick = { showCreateFolder = true }) {
+                    Icon(Icons.Default.Add, contentDescription = "New", tint = igAccent)
+                }
             }
         }
 
         Divider(color = igBorder, thickness = 0.5.dp)
+
+        if (showAddLocalCta) {
+            TextButton(
+                onClick = { vm.requestAddLocalFolderWizard() },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Icon(Icons.Default.CreateNewFolder, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(MapLocalFolderStrings.hubCta(lang))
+            }
+        }
 
         if (state.mappings.isNotEmpty()) {
             LazyRow(
@@ -766,31 +900,66 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
             }
         }
 
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            TextButton(onClick = { pickTree.launch(null) }) {
-                Icon(Icons.Default.Link, null, Modifier.size(16.dp))
-                Spacer(Modifier.width(4.dp))
-                Text("Map folder")
-            }
-            val currentId = state.breadcrumb.lastOrNull()?.first
-            if (currentId != null && mappedIds.contains(currentId)) {
-                TextButton(onClick = { vm.unmapFolder(currentId) }) {
-                    Text("Unmap")
+        if (canMap || (currentId != null && mappedIds.contains(currentId))) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (canMap) {
+                    TextButton(onClick = { pickTreeForCurrentMap.launch(null) }) {
+                        Icon(Icons.Default.Link, null, Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(MapLocalFolderStrings.mapThisFolder(lang))
+                    }
+                }
+                if (currentId != null && mappedIds.contains(currentId)) {
+                    TextButton(onClick = { vm.unmapFolder(currentId) }) {
+                        Text(ru.protolink.communicator.util.ShareSheetCloudStrings.unmap(lang))
+                    }
                 }
             }
         }
 
+        if (showBrowseOnlyHint) {
+            Text(
+                ru.protolink.communicator.util.ShareSheetCloudStrings.browseOnlyHint(lang),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                fontSize = 13.sp,
+                color = Color(0xFF8E8E8E)
+            )
+        }
+
         if (state.cloudItems.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(horizontal = 24.dp)
+                ) {
                     Icon(Icons.Default.Cloud, null, Modifier.size(48.dp), tint = Color(0xFFDBDBDB))
                     Spacer(Modifier.height(8.dp))
-                    Text("No items here", color = Color(0xFF8E8E8E))
+                    Text(
+                        if (isSharedListing)
+                            ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedTitle(lang)
+                        else
+                            ru.protolink.communicator.util.ShareSheetCloudStrings.emptyFolderTitle(lang),
+                        color = igAccent,
+                        fontWeight = FontWeight.SemiBold,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        if (isSharedListing)
+                            ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedBody(lang)
+                        else
+                            ru.protolink.communicator.util.ShareSheetCloudStrings.emptyFolderBody(lang),
+                        color = Color(0xFF8E8E8E),
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center
+                    )
                 }
             }
         } else {
@@ -803,10 +972,17 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
             ) {
                 gridItems(state.cloudItems, key = { it.id }) { item ->
                     val mapped = mappedIds.contains(item.id)
+                    val showMenu = itemMenuId == item.id && !item.isVirtualEntry
+                    Box {
                     Column(
                         Modifier
                             .fillMaxWidth()
-                            .clickable { vm.openCloudFolder(item) }
+                            .combinedClickable(
+                                onClick = { vm.openCloudFolder(item) },
+                                onLongClick = {
+                                    if (!item.isVirtualEntry) itemMenuId = item.id
+                                }
+                            )
                             .background(Color.White)
                             .padding(bottom = 8.dp)
                     ) {
@@ -845,11 +1021,86 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                                 .fillMaxWidth()
                                 .padding(horizontal = 4.dp, vertical = 4.dp)
                         )
+                        if (!item.subtitle.isNullOrBlank()) {
+                            Text(
+                                item.subtitle,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                fontSize = 10.sp,
+                                color = Color(0xFF8E8E8E),
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 4.dp)
+                            )
+                        }
+                    }
+                    DropdownMenu(
+                        expanded = showMenu,
+                        onDismissRequest = { itemMenuId = null }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text(ShareSheetStrings.copyLink(lang)) },
+                            onClick = {
+                                itemMenuId = null
+                                vm.copyCanonicalLink(item.id)
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(ShareSheetStrings.shareButton(lang)) },
+                            onClick = {
+                                itemMenuId = null
+                                vm.openShareSheet(
+                                    entityId = item.id,
+                                    entityName = item.name,
+                                    isFolder = item.isFolder,
+                                    childCount = 0
+                                )
+                            }
+                        )
+                    }
                     }
                 }
             }
         }
     }
+
+    ShareSheetScreen(
+        sheet = state.shareSheet,
+        lang = lang,
+        onDismiss = { vm.closeShareSheet() },
+        onCopyCanonical = { vm.copyCanonicalLink(state.shareSheet.entityId) },
+        onBeginCreate = { vm.shareSheetBeginCreate() },
+        onCancelCreate = { vm.shareSheetCancelCreate() },
+        onNewLabelChange = { vm.shareSheetSetNewLabel(it) },
+        onExpiryChoice = { vm.shareSheetSetExpiryChoice(it) },
+        onCreateLink = { vm.shareSheetCreateLink() },
+        onCopyCreated = { vm.shareSheetCopyCreatedUrl() },
+        onDoneCreated = { vm.shareSheetDoneCreated() },
+        onCopyAndClose = { vm.shareSheetCopyAndClose() },
+        onCloseAnyway = { vm.shareSheetDoneCreated(force = true) },
+        onConfirmTurnOff = { vm.shareSheetConfirmTurnOff(it) },
+        onCancelTurnOff = { vm.shareSheetCancelTurnOff() },
+        onTurnOff = { vm.shareSheetTurnOff(it) },
+        onExtend = { id, days -> vm.shareSheetExtend(id, days) },
+        onToggleExtendMenu = { vm.shareSheetToggleExtendMenu(it) },
+        onStartEditLabel = { id, cur -> vm.shareSheetStartEditLabel(id, cur) },
+        onEditingLabelChange = { vm.shareSheetSetEditingLabel(it) },
+        onSaveLabel = { vm.shareSheetSaveLabel() },
+        onCancelEditLabel = { vm.shareSheetCancelEditLabel() },
+        onRemovePerson = { vm.shareSheetRemovePerson(it) },
+        onToggleInactive = { vm.shareSheetToggleInactive() },
+        onRetry = { vm.loadShareSheet() },
+        onBeginAddPeople = { vm.shareSheetBeginAddPeople() },
+        onCancelAddPeople = { vm.shareSheetCancelAddPeople() },
+        onContactSearchChange = { vm.shareSheetSetContactSearch(it) },
+        onToggleContact = { vm.shareSheetToggleContact(it) },
+        onPasteIdChange = { vm.shareSheetSetPasteId(it) },
+        onResolvePaste = { vm.shareSheetResolvePaste() },
+        onAddCanWriteChange = { vm.shareSheetSetAddCanWrite(it) },
+        onAddPeople = { vm.shareSheetAddPeople() },
+        onDismissAddedBanner = { vm.shareSheetDismissAddedBanner() }
+    )
 
     if (showCreateFolder) {
         AlertDialog(
@@ -879,6 +1130,31 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
             dismissButton = {
                 TextButton(onClick = { showCreateFolder = false }) { Text("Cancel") }
             }
+        )
+    }
+
+    val wizardUri = wizardLocalUri
+    val wizardLabel = remember(wizardUri, context) {
+        val u = wizardUri ?: return@remember ""
+        runCatching {
+            DocumentFile.fromTreeUri(context, Uri.parse(u))?.name
+        }.getOrNull()
+            ?: MapLocalFolderStrings.suggestedFolderNameFromUri(u)
+    }
+    if (state.mapWizardOpen && !wizardUri.isNullOrBlank()) {
+        MapLocalFolderWizardDialog(
+            lang = lang,
+            localUri = wizardUri,
+            localLabel = wizardLabel,
+            candidates = state.mapWizardCandidates,
+            suggestedName = MapLocalFolderStrings.suggestedFolderNameFromUri(wizardUri),
+            busy = state.mapWizardBusy,
+            onChangeLocal = {
+                wizardLocalUri = null
+                pickTreeForWizard.launch(null)
+            },
+            onDismiss = { vm.dismissMapLocalFolderWizard() },
+            onConfirm = { vm.completeAddLocalFolderWizard(it) }
         )
     }
 }
@@ -951,6 +1227,8 @@ fun MessengerScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = t
             )
         } else if (showChat) {
             MessengerChatPane(
+                vm = vm,
+                state = state,
                 contact = state.selectedContact,
                 chatRows = chatRows,
                 listState = listState,
@@ -958,12 +1236,14 @@ fun MessengerScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = t
                 draft = draft,
                 onDraftChange = { draft = it },
                 onSend = {
-                    if (draft.isNotBlank()) {
+                    if (draft.isNotBlank() || state.pendingAttachments.isNotEmpty()) {
                         vm.sendMessage(draft)
                     }
                 },
                 onBack = { vm.clearSelectedContact() },
                 showBack = true,
+                api = vm.protoLinkApi,
+                publicSiteBaseUrl = state.settings.publicSiteBaseUrl,
                 modifier = Modifier.fillMaxSize()
             )
         }
@@ -977,6 +1257,8 @@ fun MessengerScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = t
                 modifier = Modifier.weight(0.38f)
             )
             MessengerChatPane(
+                vm = vm,
+                state = state,
                 contact = state.selectedContact,
                 chatRows = chatRows,
                 listState = listState,
@@ -984,12 +1266,14 @@ fun MessengerScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = t
                 draft = draft,
                 onDraftChange = { draft = it },
                 onSend = {
-                    if (draft.isNotBlank()) {
+                    if (draft.isNotBlank() || state.pendingAttachments.isNotEmpty()) {
                         vm.sendMessage(draft)
                     }
                 },
                 onBack = { vm.clearSelectedContact() },
                 showBack = false,
+                api = vm.protoLinkApi,
+                publicSiteBaseUrl = state.settings.publicSiteBaseUrl,
                 modifier = Modifier.weight(0.62f)
             )
         }
@@ -1091,6 +1375,8 @@ private fun ContactAvatar(name: String, size: androidx.compose.ui.unit.Dp = 48.d
 
 @Composable
 private fun MessengerChatPane(
+    vm: MainViewModel,
+    state: UiState,
     contact: ContactItem?,
     chatRows: List<ChatRow>,
     listState: androidx.compose.foundation.lazy.LazyListState,
@@ -1100,8 +1386,94 @@ private fun MessengerChatPane(
     onSend: () -> Unit,
     onBack: () -> Unit,
     showBack: Boolean,
+    api: ru.protolink.communicator.data.api.ProtoLinkApi,
+    publicSiteBaseUrl: String,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    var attachMenuExpanded by remember { mutableStateOf(false) }
+    var showCloudPicker by remember { mutableStateOf(false) }
+    var pendingCameraFile by remember { mutableStateOf<File?>(null) }
+    val uiLang = remember { java.util.Locale.getDefault().toLanguageTag() }
+
+    fun ingestUri(uri: android.net.Uri, fallbackName: String) {
+        val cr = context.contentResolver
+        var name = fallbackName
+        var size = -1L
+        cr.query(uri, null, null, null, null)?.use { cursor ->
+            val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+            if (cursor.moveToFirst()) {
+                if (nameIdx >= 0) name = cursor.getString(nameIdx) ?: name
+                if (sizeIdx >= 0) size = cursor.getLong(sizeIdx)
+            }
+        }
+        if (size < 0) {
+            size = cr.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: 0L
+        }
+        val mime = cr.getType(uri) ?: vm.guessMime(name)
+        vm.tryAddPendingAttachment(
+            localUri = uri.toString(),
+            fileName = name,
+            mimeType = mime,
+            byteLength = size.coerceAtLeast(0L)
+        )
+    }
+
+    val galleryLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri ->
+        if (uri != null) ingestUri(uri, "image.jpg")
+    }
+
+    val takePictureLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.TakePicture()
+    ) { ok ->
+        val file = pendingCameraFile
+        pendingCameraFile = null
+        if (!ok || file == null || !file.exists() || file.length() <= 0L) return@rememberLauncherForActivityResult
+        val uri = FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            file
+        )
+        vm.tryAddPendingAttachment(
+            localUri = uri.toString(),
+            fileName = file.name,
+            mimeType = "image/jpeg",
+            byteLength = file.length(),
+            localFilePath = file.absolutePath
+        )
+    }
+
+    fun launchCamera() {
+        val file = vm.newCameraCaptureFile()
+        pendingCameraFile = file
+        val uri = FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            file
+        )
+        takePictureLauncher.launch(uri)
+    }
+
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            launchCamera()
+        } else {
+            vm.setCameraPermissionDenied()
+        }
+    }
+
+    fun onCameraClick() {
+        vm.clearAttachStatus()
+        val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+        if (granted) launchCamera() else cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+    }
+
     Column(modifier.fillMaxSize().background(TgChatBg)) {
         Row(
             Modifier
@@ -1158,7 +1530,13 @@ private fun MessengerChatPane(
                     items(chatRows.size) { index ->
                         when (val row = chatRows[index]) {
                             is ChatRow.DateHeader -> DateChip(row.label)
-                            is ChatRow.Bubble -> MessageBubble(row.message)
+                            is ChatRow.Bubble -> MessageBubble(
+                                m = row.message,
+                                api = api,
+                                publicSiteBaseUrl = publicSiteBaseUrl,
+                                onRetry = { vm.retryFailedSend(row.message.id) },
+                                onCancelFailed = { vm.cancelFailedSend(row.message.id) }
+                            )
                         }
                     }
                 }
@@ -1172,32 +1550,152 @@ private fun MessengerChatPane(
                 }
             }
 
-            Row(
+            Column(
                 Modifier
                     .fillMaxWidth()
                     .background(Color.White)
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically
             ) {
-                OutlinedTextField(
-                    value = draft,
-                    onValueChange = onDraftChange,
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("Message") },
-                    maxLines = 4,
-                    shape = RoundedCornerShape(20.dp)
-                )
-                Spacer(Modifier.width(8.dp))
-                Button(
-                    onClick = onSend,
-                    shape = RoundedCornerShape(50),
-                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = TgAccent)
+                if (state.pendingAttachments.isNotEmpty()) {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        state.pendingAttachments.forEachIndexed { index, draftItem ->
+                            Row(
+                                Modifier
+                                    .background(Color(0xFFF0F2F5), RoundedCornerShape(8.dp))
+                                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    if (draftItem.isCloudPick) Icons.Default.Cloud else Icons.Default.PhotoLibrary,
+                                    null,
+                                    tint = TgAccent,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Column {
+                                    Text(
+                                        draftItem.fileName,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.width(120.dp)
+                                    )
+                                    Text(
+                                        if (draftItem.isCloudPick) "Cloud" else formatBytes(draftItem.byteLength),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = Color(0xFF667781)
+                                    )
+                                }
+                                IconButton(onClick = { vm.removePendingAttachment(index) }, modifier = Modifier.size(28.dp)) {
+                                    Icon(Icons.Default.Close, contentDescription = "Remove", modifier = Modifier.size(16.dp))
+                                }
+                            }
+                        }
+                    }
+                }
+                state.attachStatusMessage?.let { msg ->
+                    Text(
+                        msg,
+                        color = Color(0xFFB00020),
+                        style = MaterialTheme.typography.labelMedium,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp)
+                    )
+                }
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 4.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Send")
+                    Box {
+                        IconButton(onClick = { attachMenuExpanded = true }) {
+                            Icon(Icons.Default.AttachFile, contentDescription = "Attach", tint = TgAccent)
+                        }
+                        DropdownMenu(
+                            expanded = attachMenuExpanded,
+                            onDismissRequest = { attachMenuExpanded = false }
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Camera") },
+                                onClick = {
+                                    attachMenuExpanded = false
+                                    onCameraClick()
+                                },
+                                leadingIcon = { Icon(Icons.Default.CameraAlt, null) }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Gallery") },
+                                onClick = {
+                                    attachMenuExpanded = false
+                                    vm.clearAttachStatus()
+                                    galleryLauncher.launch("image/*")
+                                },
+                                leadingIcon = { Icon(Icons.Default.PhotoLibrary, null) }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Choose from Cloud") },
+                                onClick = {
+                                    attachMenuExpanded = false
+                                    vm.clearAttachStatus()
+                                    showCloudPicker = true
+                                },
+                                leadingIcon = { Icon(Icons.Default.Cloud, null) }
+                            )
+                        }
+                    }
+                    OutlinedTextField(
+                        value = draft,
+                        onValueChange = onDraftChange,
+                        modifier = Modifier.weight(1f),
+                        placeholder = {
+                            Text(
+                                if (state.pendingAttachments.isNotEmpty()) "Add a caption…" else "Message"
+                            )
+                        },
+                        maxLines = 4,
+                        shape = RoundedCornerShape(20.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Button(
+                        onClick = onSend,
+                        enabled = draft.isNotBlank() || state.pendingAttachments.isNotEmpty(),
+                        shape = RoundedCornerShape(50),
+                        colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = TgAccent)
+                    ) {
+                        Text("Send")
+                    }
                 }
             }
         }
     }
+
+    val meForPicker = vm.currentUserId()
+    if (showCloudPicker && contact != null && !meForPicker.isNullOrBlank()) {
+        ru.protolink.communicator.ui.messenger.CloudPickerDialog(
+            api = api,
+            myUserId = meForPicker,
+            recipientUserId = contact.userId,
+            lang = uiLang,
+            onDismiss = { showCloudPicker = false },
+            onPick = { sel ->
+                showCloudPicker = false
+                vm.tryAddCloudPick(sel.entityId, sel.name, sel.mimeType)
+            }
+        )
+    }
+}
+
+private fun formatBytes(bytes: Long): String {
+    if (bytes < 1024) return "$bytes B"
+    val kb = bytes / 1024.0
+    if (kb < 1024) return String.format("%.0f KB", kb)
+    val mb = kb / 1024.0
+    return if (mb >= 10) String.format("%.1f MB", mb) else String.format("%.2f MB", mb)
 }
 private sealed class ChatRow {
     abstract val dayLabel: String?
@@ -1238,9 +1736,24 @@ private fun DateChip(label: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun MessageBubble(m: MessageItem) {
+private fun MessageBubble(
+    m: MessageItem,
+    api: ru.protolink.communicator.data.api.ProtoLinkApi,
+    publicSiteBaseUrl: String,
+    onRetry: () -> Unit = {},
+    onCancelFailed: () -> Unit = {}
+) {
     val bubbleColor = if (m.mine) TgMineBubble else TgPeerBubble
+    val failed = m.deliveryStatus == DeliveryStatus.Failed
+    val uploading = m.deliveryStatus == DeliveryStatus.Uploading
+    val sending = m.deliveryStatus == DeliveryStatus.Sending
     val align = if (m.mine) Alignment.CenterEnd else Alignment.CenterStart
+    val pendingLocal = m.pendingLocalAttachments.orEmpty()
+    val hasServerAttachments = m.attachmentIds.isNotEmpty()
+    val hasLocalPreview = pendingLocal.isNotEmpty() && (uploading || sending || failed)
+    val imageOnly = (hasServerAttachments || hasLocalPreview) && m.text.isBlank()
+    val bubblePadding = if (imageOnly) Modifier.padding(2.dp) else Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+    val bubbleAlpha = if (failed) 0.7f else 1f
     Box(Modifier.fillMaxWidth(), contentAlignment = align) {
         Column(
             modifier = Modifier
@@ -1257,15 +1770,77 @@ private fun MessageBubble(m: MessageItem) {
             ) {
                 Column(
                     modifier = Modifier
-                        .background(bubbleColor, shape = RoundedCornerShape(12.dp))
-                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                        .background(bubbleColor.copy(alpha = bubbleAlpha), shape = RoundedCornerShape(12.dp))
+                        .then(bubblePadding)
                 ) {
-                    Text(m.text, color = Color(0xFF111111))
-                    if (m.timeLabel.isNotBlank() || m.mine) {
+                    if (hasServerAttachments) {
+                        Box {
+                            ru.protolink.communicator.ui.messenger.MessageAttachmentsColumn(
+                                attachmentIds = m.attachmentIds,
+                                api = api,
+                                multiImageMaxHeight = m.attachmentIds.size > 1
+                            )
+                            if (uploading) {
+                                UploadProgressOverlay(m.uploadProgress)
+                            }
+                        }
+                    } else if (hasLocalPreview) {
+                        Box {
+                            Column {
+                                pendingLocal.forEach { d ->
+                                    Text(
+                                        d.fileName,
+                                        color = Color(0xFF111111),
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)
+                                    )
+                                }
+                            }
+                            if (uploading) {
+                                UploadProgressOverlay(m.uploadProgress)
+                            }
+                        }
+                    }
+                    if (m.text.isNotBlank()) {
+                        Text(m.text, color = Color(0xFF111111))
+                    }
+                    if (m.text.isNotBlank() && !failed && !uploading) {
+                        ru.protolink.communicator.ui.messenger.MessageUnfurlCards(
+                            bodyText = m.text,
+                            publicSiteBaseUrl = publicSiteBaseUrl,
+                            api = api
+                        )
+                    }
+                    if (failed) {
+                        Text(
+                            m.statusLine ?: "Couldn't send",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = Color(0xFF667781),
+                            modifier = Modifier.padding(top = 4.dp, start = 4.dp)
+                        )
+                        Row(
+                            Modifier.fillMaxWidth().padding(top = 2.dp),
+                            horizontalArrangement = Arrangement.End
+                        ) {
+                            TextButton(onClick = onRetry) {
+                                Text("Retry", color = TgAccent)
+                            }
+                            TextButton(onClick = onCancelFailed) {
+                                Text("Cancel", color = Color(0xFF667781))
+                            }
+                        }
+                    } else if (m.timeLabel.isNotBlank() || m.showTicks) {
                         Row(
                             modifier = Modifier.align(Alignment.End).padding(top = 2.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
+                            if (sending && !uploading) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(12.dp).padding(end = 4.dp),
+                                    strokeWidth = 1.5.dp,
+                                    color = TgAccent
+                                )
+                            }
                             if (m.timeLabel.isNotBlank()) {
                                 Text(
                                     m.timeLabel,
@@ -1273,7 +1848,7 @@ private fun MessageBubble(m: MessageItem) {
                                     color = Color(0xFF667781)
                                 )
                             }
-                            if (m.mine) {
+                            if (m.showTicks) {
                                 Spacer(Modifier.width(4.dp))
                                 Text(
                                     m.ticksText,
@@ -1285,6 +1860,31 @@ private fun MessageBubble(m: MessageItem) {
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun UploadProgressOverlay(progress: Float?) {
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 80.dp)
+            .background(Color(0x66000000)),
+        contentAlignment = Alignment.Center
+    ) {
+        if (progress != null && progress > 0f) {
+            CircularProgressIndicator(
+                progress = progress.coerceIn(0f, 1f),
+                color = TgAccent,
+                trackColor = Color(0x44FFFFFF),
+                modifier = Modifier.size(40.dp)
+            )
+        } else {
+            CircularProgressIndicator(
+                color = TgAccent,
+                modifier = Modifier.size(40.dp)
+            )
         }
     }
 }
@@ -1332,12 +1932,11 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
         )
     }
 
-    if (state.pendingCreateNote != null) {
-        NewNoteDialog(vm = vm, pending = state.pendingCreateNote!!)
+    state.pendingCreateNote?.let { pending ->
+        NewNoteDialog(vm = vm, pending = pending)
     }
 
-    if (state.pendingDeleteNote != null) {
-        val pending = state.pendingDeleteNote!!
+    state.pendingDeleteNote?.let { pending ->
         val body = if (pending.hasChildren) {
             "Delete “${pending.name}” and all notes inside? This cannot be undone."
         } else {
@@ -1364,12 +1963,23 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
     val showTree = !compactWidth || !editing
     val showEditor = editing
 
+    val notesLang = remember { java.util.Locale.getDefault().toLanguageTag() }
+    val showNotesNudge = MapLocalFolderUi.showNotesNudge(
+        state.settings.notesRootUri,
+        state.mappings.map { it.localPath }
+    )
+
     if (compactWidth) {
         if (showTree) {
             NotesTreePane(
                 rows = state.notesTreeRows,
                 selectedId = state.selectedNoteDocumentId,
                 hasRoot = !state.settings.notesRootUri.isNullOrBlank(),
+                showCloudNudge = showNotesNudge,
+                cloudNudgeText = MapLocalFolderStrings.notesNudgeText(notesLang),
+                onCloudNudge = {
+                    vm.requestAddLocalFolderWizard(state.settings.notesRootUri)
+                },
                 onPickRoot = { pickTree.launch(null) },
                 onRefresh = { vm.refreshNotesTree() },
                 onToggleExpand = { vm.toggleNotesExpand(it) },
@@ -1401,6 +2011,11 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
                 rows = state.notesTreeRows,
                 selectedId = state.selectedNoteDocumentId,
                 hasRoot = !state.settings.notesRootUri.isNullOrBlank(),
+                showCloudNudge = showNotesNudge,
+                cloudNudgeText = MapLocalFolderStrings.notesNudgeText(notesLang),
+                onCloudNudge = {
+                    vm.requestAddLocalFolderWizard(state.settings.notesRootUri)
+                },
                 onPickRoot = { pickTree.launch(null) },
                 onRefresh = { vm.refreshNotesTree() },
                 onToggleExpand = { vm.toggleNotesExpand(it) },
@@ -1512,14 +2127,15 @@ private fun NewNoteDialog(vm: MainViewModel, pending: PendingCreateNote) {
 }
 
 private val NotesHeaderBg = Color(0xFF527998)
-private val NotesFolderIcon = Color(0xFFFFC107)
-private val NotesFileIcon = Color(0xFF64B5F6)
 
 @Composable
 private fun NotesTreePane(
     rows: List<NoteTreeRow>,
     selectedId: String?,
     hasRoot: Boolean,
+    showCloudNudge: Boolean = false,
+    cloudNudgeText: String = "",
+    onCloudNudge: () -> Unit = {},
     onPickRoot: () -> Unit,
     onRefresh: () -> Unit,
     onToggleExpand: (String) -> Unit,
@@ -1545,6 +2161,23 @@ private fun NotesTreePane(
                 }
             }
             Divider()
+            if (hasRoot && showCloudNudge) {
+                TextButton(
+                    onClick = onCloudNudge,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        cloudNudgeText,
+                        color = Color(0xFF2AABEE),
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Start,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                Divider()
+            }
 
             if (!hasRoot) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -1569,7 +2202,7 @@ private fun NotesTreePane(
                             onDelete = { onDeleteNote(row) }
                         )
                         Divider(
-                            modifier = Modifier.padding(start = (12 + row.depth * 20 + 28 + 40).dp),
+                            modifier = Modifier.padding(start = (12 + row.depth * 20 + 28 + 8).dp),
                             color = Color(0x14000000)
                         )
                     }
@@ -1592,8 +2225,8 @@ private fun NotesTreePane(
 }
 
 /**
- * Telegram-style tree row: same-level icons share one vertical line.
- * [indent][chevron 28dp][type icon 40dp][title]
+ * Windows-style tree row: title text and an expand chevron only.
+ * [indent][chevron 28dp][title]
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -1619,7 +2252,6 @@ private fun NotesTreeItem(
             .padding(start = 12.dp + indent, end = 12.dp, top = 10.dp, bottom = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Fixed chevron column — keeps folder/file icons aligned at each depth.
         Box(
             modifier = Modifier
                 .size(28.dp)
@@ -1636,25 +2268,7 @@ private fun NotesTreeItem(
             }
         }
 
-        // Fixed type-icon column — folder and page icons share the same X at this depth.
-        Box(
-            modifier = Modifier
-                .size(40.dp)
-                .background(
-                    if (row.hasChildren) Color(0x1AFFC107) else Color(0x1A2AABEE),
-                    RoundedCornerShape(10.dp)
-                ),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(
-                imageVector = if (row.hasChildren) Icons.Default.Folder else Icons.Default.Description,
-                contentDescription = null,
-                tint = if (row.hasChildren) NotesFolderIcon else NotesFileIcon,
-                modifier = Modifier.size(22.dp)
-            )
-        }
-
-        Spacer(Modifier.width(12.dp))
+        Spacer(Modifier.width(8.dp))
 
         Column(Modifier.weight(1f)) {
             Text(

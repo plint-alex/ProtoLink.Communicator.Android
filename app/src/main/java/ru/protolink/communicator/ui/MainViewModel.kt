@@ -35,22 +35,66 @@ import ru.protolink.communicator.sync.ports.MetadataStore
 import ru.protolink.communicator.syncadapt.ApiRemoteCloud
 import ru.protolink.communicator.syncadapt.SafLocalFileSystem
 import ru.protolink.communicator.syncadapt.SyncFlight
+import ru.protolink.communicator.data.messenger.MessengerChatFolderResolver
+import ru.protolink.communicator.data.messenger.PendingAttachmentDraft
+import ru.protolink.communicator.data.messenger.ProgressRequestBody
 import ru.protolink.communicator.util.ChatTime
+import ru.protolink.communicator.util.CloudSharedScope
+import ru.protolink.communicator.util.CloudVirtualNodes
 import ru.protolink.communicator.util.JsonValues
+import ru.protolink.communicator.util.MapLocalFolderStrings
+import ru.protolink.communicator.util.MessageStringValues
+import ru.protolink.communicator.util.MessengerAttachmentRender
+import ru.protolink.communicator.util.MessengerConversationScope
+import ru.protolink.communicator.util.MessengerAtomicSend
+import ru.protolink.communicator.util.MessengerMediaLimits
+import ru.protolink.communicator.util.MessengerSendStateMachine
+import ru.protolink.communicator.util.ShareAccountStrings
+import ru.protolink.communicator.util.ShareAddPeople
+import ru.protolink.communicator.util.ShareSheetCloudStrings
+import ru.protolink.communicator.util.ShareSheetLogic
+import ru.protolink.communicator.util.ShareSheetStrings
+import ru.protolink.communicator.ui.share.ShareContactPickerItem
+import ru.protolink.communicator.ui.share.SharePersonUi
+import ru.protolink.communicator.ui.share.ShareSheetUiState
+import ru.protolink.communicator.data.api.CreateShareLinkRequest
+import ru.protolink.communicator.data.api.RemovePermissionRequest
+import ru.protolink.communicator.data.api.RevokeShareLinkRequest
+import ru.protolink.communicator.data.api.UpdateShareLinkRequest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.util.Log
+import android.webkit.MimeTypeMap
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.MultipartBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import java.io.File
 import java.time.Instant
+import java.util.Locale
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 
-data class CloudItem(val id: String, val name: String, val isFolder: Boolean)
+data class CloudItem(
+    val id: String,
+    val name: String,
+    val isFolder: Boolean,
+    val isVirtualEntry: Boolean = false,
+    val subtitle: String? = null
+)
 data class ContactItem(
     val userId: String,
     val displayName: String,
@@ -60,20 +104,34 @@ data class ContactItem(
     val unreadLabel: String get() = if (unreadCount > 99) "99+" else unreadCount.toString()
 }
 
-enum class DeliveryStatus { Sending, Sent, Read }
+enum class DeliveryStatus { Uploading, Sending, Sent, Read, Failed }
 
 data class MessageItem(
     val id: String,
     val text: String,
     val mine: Boolean,
     val timestampMillis: Long,
-    val deliveryStatus: DeliveryStatus = DeliveryStatus.Sent
+    val deliveryStatus: DeliveryStatus = DeliveryStatus.Sent,
+    val attachmentIds: List<String> = emptyList(),
+    /** 0..1 while Uploading; null when not applicable. */
+    val uploadProgress: Float? = null,
+    /** Failed footer / oversize / offline copy (UX §7). */
+    val statusLine: String? = null,
+    /** Partner for Retry when chat selection may have changed. */
+    val partnerUserId: String? = null,
+    /** In-flight local drafts so Retry reuses CloudFile ids (AT-M26). */
+    val pendingLocalAttachments: List<ru.protolink.communicator.data.messenger.PendingAttachmentDraft>? = null
 ) {
     val timeLabel: String get() = ru.protolink.communicator.util.ChatTime.formatTime(timestampMillis)
     val dayLabel: String get() = ru.protolink.communicator.util.ChatTime.formatDayLabel(timestampMillis)
+    val showFailedActions: Boolean get() = mine && deliveryStatus == DeliveryStatus.Failed
+    val showTicks: Boolean
+        get() = mine && deliveryStatus != DeliveryStatus.Uploading
+            && deliveryStatus != DeliveryStatus.Sending
+            && deliveryStatus != DeliveryStatus.Failed
     val ticksText: String
         get() = when (deliveryStatus) {
-            DeliveryStatus.Sending -> "◌"
+            DeliveryStatus.Uploading, DeliveryStatus.Sending, DeliveryStatus.Failed -> ""
             DeliveryStatus.Read -> "✓✓"
             DeliveryStatus.Sent -> "✓"
         }
@@ -132,9 +190,15 @@ data class UiState(
     val composerClearNonce: Int = 0,
     /** When set, MessengerScreen puts this text back into the draft field. */
     val composerDraftRestore: String? = null,
+    /** Pending camera/gallery chips before Send. */
+    val pendingAttachments: List<ru.protolink.communicator.data.messenger.PendingAttachmentDraft> = emptyList(),
+    /** Oversize / cap / camera-permission toast under composer. */
+    val attachStatusMessage: String? = null,
     val settings: AppSettings = AppSettings(),
     val cloudItems: List<CloudItem> = emptyList(),
     val breadcrumb: List<Pair<String, String>> = emptyList(),
+    /** Share-root id (lowercase) → CanWrite; retained while browsing Shared-with-me descendants. */
+    val shareRootCanWrite: Map<String, Boolean> = emptyMap(),
     val mappings: List<CloudSyncMappingDto> = emptyList(),
     val contacts: List<ContactItem> = emptyList(),
     val selectedContact: ContactItem? = null,
@@ -159,7 +223,14 @@ data class UiState(
     val userError: UserError? = null,
     val syncSuccess: String? = null,
     val appVersion: String = BuildConfig.VERSION_NAME,
-    val apiVersionText: String = ""
+    val apiVersionText: String = "",
+    val shareSheet: ShareSheetUiState = ShareSheetUiState(),
+    /** E6: bump to switch Main tab to Cloud before showing the add-local wizard. */
+    val preferCloudTabNonce: Int = 0,
+    val mapWizardOpen: Boolean = false,
+    val mapWizardPrefillUri: String? = null,
+    val mapWizardCandidates: List<MapLocalFolderCandidate> = emptyList(),
+    val mapWizardBusy: Boolean = false
 )
 
 @HiltViewModel
@@ -183,6 +254,8 @@ class MainViewModel @Inject constructor(
     private var chatPollJob: Job? = null
     private var loadMessagesJob: Job? = null
     private val readReceiptNotified = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val chatFolderResolver by lazy { MessengerChatFolderResolver(api, settingsStore) }
+    private val uploadGates = ConcurrentHashMap<String, Mutex>()
     @Volatile var appInForeground: Boolean = true
 
     init {
@@ -510,6 +583,11 @@ class MainViewModel @Inject constructor(
         return outcome
     }
 
+    /** Exposed for Compose messenger attachment / unfurl loads (reader's own token via Retrofit). */
+    val protoLinkApi: ProtoLinkApi get() = api
+
+    fun currentUserId(): String? = auth.current()?.userId
+
     fun logout() {
         stopAutoSyncInterval()
         chatPollJob?.cancel()
@@ -517,11 +595,20 @@ class MainViewModel @Inject constructor(
         loadMessagesJob?.cancel()
         signalR.stop()
         auth.logout()
+        ru.protolink.communicator.util.MessengerThumbMemoryCache.clear()
+        ru.protolink.communicator.util.MessengerUnfurlCache.clear()
         _state.update { it.copy(authenticated = false, login = "", contacts = emptyList(), messages = emptyList(), selectedContact = null) }
     }
 
     private var cloudRootId: String? = null
     private var currentFolderId: String? = null
+
+    private fun uiLang(): String = Locale.getDefault().toLanguageTag()
+
+    private fun entityDisplayName(e: EntityDto): String =
+        e.values?.firstOrNull()?.value?.asString?.trim()?.takeIf { it.isNotEmpty() }
+            ?: e.code?.takeIf { it.isNotBlank() }
+            ?: e.id.take(8)
 
     suspend fun ensureCloudRoot() {
         val userId = auth.current()?.userId ?: return
@@ -531,34 +618,120 @@ class MainViewModel @Inject constructor(
             AddEntityRequest(code = CloudCodes.CLOUD_ROOT, parentIds = listOf(userId))
         ).id ?: return
         cloudRootId = id
-        currentFolderId = id
-        _state.update { it.copy(breadcrumb = listOf(id to "Cloud")) }
-        loadCloudFolder(id)
+        openCloudHub()
+    }
+
+    /** AT-S17: Cloud hub with My Cloud + Shared with me siblings. */
+    fun openCloudHub() {
+        val lang = uiLang()
+        val hubName = ShareSheetCloudStrings.cloudHub(lang)
+        currentFolderId = CloudVirtualNodes.HUB_ID
+        _state.update { it.copy(breadcrumb = listOf(CloudVirtualNodes.HUB_ID to hubName)) }
+        loadCloudFolder(CloudVirtualNodes.HUB_ID)
     }
 
     fun loadCloudFolder(folderId: String) = viewModelScope.launch {
         currentFolderId = folderId
-        val children = api.getEntities(
-            GetEntitiesRequest(parentIds = listOf(folderId), includeValues = true, take = 500)
-        )
-        val items = children.mapNotNull { e ->
-            val name = e.values?.firstOrNull()?.value?.asString ?: return@mapNotNull null
-            when (e.code) {
-                CloudCodes.CLOUD_FOLDER -> CloudItem(e.id, name, true)
-                CloudCodes.CLOUD_FILE -> CloudItem(e.id, name, false)
-                else -> null
+        val lang = uiLang()
+        val items = when {
+            folderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true) -> buildHubListing(lang)
+            folderId.equals(CloudVirtualNodes.SHARED_WITH_ME_ID, ignoreCase = true) ->
+                loadSharedWithMeListing(lang)
+            else -> {
+                val children = api.getEntities(
+                    GetEntitiesRequest(parentIds = listOf(folderId), includeValues = true, take = 500)
+                )
+                children.mapNotNull { e ->
+                    val name = entityDisplayName(e)
+                    when (e.code) {
+                        CloudCodes.CLOUD_FOLDER, CloudCodes.CLOUD_ROOT -> CloudItem(e.id, name, true)
+                        CloudCodes.CLOUD_FILE -> CloudItem(e.id, name, false)
+                        else -> null
+                    }
+                }
             }
         }
         _state.update { it.copy(cloudItems = items, status = "Cloud loaded") }
     }
 
+    private fun buildHubListing(lang: String): List<CloudItem> {
+        val myCloudId = cloudRootId ?: return emptyList()
+        return listOf(
+            CloudItem(
+                id = myCloudId,
+                name = ShareSheetCloudStrings.myCloud(lang),
+                isFolder = true,
+                isVirtualEntry = false
+            ),
+            CloudItem(
+                id = CloudVirtualNodes.SHARED_WITH_ME_ID,
+                name = ShareSheetCloudStrings.sharedWithMe(lang),
+                isFolder = true,
+                isVirtualEntry = true
+            )
+        )
+    }
+
+    private suspend fun loadSharedWithMeListing(lang: String): List<CloudItem> {
+        val list = api.getEntities(
+            GetEntitiesRequest(sharedWithMe = true, includeValues = true, take = 500)
+        )
+        val creatorIds = list.mapNotNull { it.userWhoCreatedId?.takeIf { id -> id.isNotBlank() } }
+            .distinct()
+        val creatorNames = mutableMapOf<String, String>()
+        if (creatorIds.isNotEmpty()) {
+            val creators = api.getEntities(
+                GetEntitiesRequest(ids = creatorIds, includeValues = true, take = creatorIds.size)
+            )
+            for (c in creators) {
+                creatorNames[c.id.lowercase()] = entityDisplayName(c)
+            }
+        }
+        val canWriteByRoot = mutableMapOf<String, Boolean>()
+        val items = list
+            .sortedWith(
+                compareByDescending<EntityDto> {
+                    it.code == CloudCodes.CLOUD_FOLDER || it.code == CloudCodes.CLOUD_ROOT
+                }.thenByDescending { it.updateTime.orEmpty() }
+                    .thenBy { entityDisplayName(it).lowercase() }
+            )
+            .map { e ->
+                val canWrite = e.canWrite == true
+                canWriteByRoot[e.id.lowercase()] = canWrite
+                val creatorId = e.userWhoCreatedId?.takeIf { it.isNotBlank() }
+                val creatorKey = creatorId?.lowercase()
+                val creatorName = when {
+                    creatorKey != null && creatorNames[creatorKey]?.isNotBlank() == true ->
+                        creatorNames.getValue(creatorKey)
+                    creatorId != null -> creatorId.replace("-", "").take(8)
+                    else -> "—"
+                }
+                val isFolder =
+                    e.code == CloudCodes.CLOUD_FOLDER || e.code == CloudCodes.CLOUD_ROOT
+                CloudItem(
+                    id = e.id,
+                    name = entityDisplayName(e),
+                    isFolder = isFolder,
+                    subtitle = ShareSheetCloudStrings.sharedRowSubtitle(lang, creatorName, canWrite)
+                )
+            }
+        _state.update { it.copy(shareRootCanWrite = canWriteByRoot.toMap()) }
+        return items
+    }
+
     /** Jump to a mapped folder (stories strip) with a sensible breadcrumb. */
     fun openMappedFolder(folderId: String, name: String) {
-        val root = cloudRootId ?: _state.value.breadcrumb.firstOrNull()?.first
+        val lang = uiLang()
+        val root = cloudRootId
+        val hub = CloudVirtualNodes.HUB_ID to ShareSheetCloudStrings.cloudHub(lang)
+        val myCloud = root?.let { id -> id to ShareSheetCloudStrings.myCloud(lang) }
+        val leaf = folderId to name.ifBlank { "Folder" }
         val crumbs = when {
-            root != null && !root.equals(folderId, true) ->
-                listOf(root to "Cloud", folderId to name.ifBlank { "Folder" })
-            else -> listOf(folderId to name.ifBlank { "Folder" })
+            root != null && !root.equals(folderId, true) && myCloud != null ->
+                listOf(hub, myCloud, leaf)
+            root != null && root.equals(folderId, true) && myCloud != null ->
+                listOf(hub, myCloud)
+            else -> listOf(hub, leaf)
         }
         _state.update { it.copy(breadcrumb = crumbs) }
         loadCloudFolder(folderId)
@@ -576,20 +749,691 @@ class MainViewModel @Inject constructor(
         loadCloudFolder(crumb.first)
     }
 
+    fun copyCanonicalLink(entityId: String?) {
+        val id = entityId?.takeIf { it.isNotBlank() && !CloudVirtualNodes.isVirtual(it) } ?: return
+        val url = ShareSheetLogic.buildCanonicalLink(_state.value.settings.publicSiteBaseUrl, id)
+        copyTextToClipboard(url, ShareSheetStrings.copied(uiLang()))
+    }
+
+    fun copyMyUserId() {
+        val id = auth.current()?.userId ?: return
+        copyTextToClipboard(id, ShareAccountStrings.copiedLabel(uiLang()))
+    }
+
+    private fun copyTextToClipboard(text: String, status: String) {
+        val cm = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        cm?.setPrimaryClip(ClipData.newPlainText("ProtoLink", text))
+        _state.update { it.copy(status = status) }
+    }
+
+    fun openShareSheet(entityId: String?, entityName: String?, isFolder: Boolean, childCount: Int = 0) {
+        val id = entityId?.takeIf { it.isNotBlank() && !CloudVirtualNodes.isVirtual(it) } ?: return
+        val online = isNetworkAvailable()
+        val name = entityName?.takeIf { it.isNotBlank() } ?: id.take(8)
+        _state.update {
+            it.copy(
+                shareSheet = ShareSheetUiState(
+                    isOpen = true,
+                    entityId = id,
+                    entityName = name,
+                    isFolder = isFolder,
+                    childCount = if (isFolder) childCount else 0,
+                    canEdit = true,
+                    isOnline = online,
+                    isLoading = online
+                )
+            )
+        }
+        if (online) loadShareSheet() else {
+            _state.update { s -> s.copy(shareSheet = s.shareSheet.copy(isLoading = false)) }
+        }
+    }
+
+    fun openShareForCurrentFolder() {
+        val crumb = _state.value.breadcrumb.lastOrNull() ?: return
+        if (CloudVirtualNodes.isVirtual(crumb.first)) return
+        openShareSheet(
+            entityId = crumb.first,
+            entityName = crumb.second,
+            isFolder = true,
+            childCount = _state.value.cloudItems.size
+        )
+    }
+
+    fun closeShareSheet(force: Boolean = false) {
+        val sheet = _state.value.shareSheet
+        if (!sheet.isOpen) return
+        if (!force && sheet.showCreatedPanel && !sheet.createdUrlCopied && !sheet.showCloseWithoutCopy) {
+            _state.update { it.copy(shareSheet = it.shareSheet.copy(showCloseWithoutCopy = true)) }
+            return
+        }
+        _state.update { it.copy(shareSheet = ShareSheetUiState()) }
+    }
+
+    fun shareSheetBeginCreate() {
+        updateShareSheet {
+            it.copy(
+                showCreateForm = true,
+                showCreatedPanel = false,
+                showCloseWithoutCopy = false,
+                createdUrl = null,
+                createdUrlCopied = false,
+                newLabel = "",
+                expiryChoice = 30,
+                errorText = null,
+                showAddPeople = false
+            )
+        }
+    }
+
+    fun shareSheetCancelCreate() {
+        updateShareSheet { it.copy(showCreateForm = false, newLabel = "") }
+    }
+
+    fun shareSheetSetNewLabel(value: String) {
+        updateShareSheet { it.copy(newLabel = value) }
+    }
+
+    fun shareSheetSetExpiryChoice(days: Int) {
+        updateShareSheet { it.copy(expiryChoice = days) }
+    }
+
+    fun shareSheetCreateLink() = viewModelScope.launch {
+        val sheet = _state.value.shareSheet
+        if (!ShareSheetLogic.canMutate(sheet.isOnline, sheet.canEdit, sheet.showCreatedPanel) || sheet.busy) return@launch
+        updateShareSheet { it.copy(busy = true, errorText = null) }
+        val payload = ShareSheetLogic.expiryPayload(sheet.expiryChoice)
+        try {
+            val result = api.createShareLink(
+                CreateShareLinkRequest(
+                    entityId = sheet.entityId,
+                    label = sheet.newLabel.trim().takeIf { it.isNotEmpty() },
+                    expiresAt = payload.expiresAtIso,
+                    neverExpires = payload.neverExpires,
+                    includeSubtree = sheet.isFolder,
+                    canWrite = false
+                )
+            )
+            val url = result.url?.takeIf { it.isNotBlank() }
+            updateShareSheet {
+                it.copy(
+                    busy = false,
+                    showCreateForm = false,
+                    newLabel = "",
+                    createdUrl = url,
+                    createdUrlCopied = false,
+                    showCloseWithoutCopy = false,
+                    showCreatedPanel = !url.isNullOrBlank()
+                )
+            }
+            if (url.isNullOrBlank()) {
+                updateShareSheet { it.copy(errorText = ShareSheetStrings.createFailed(uiLang())) }
+            }
+        } catch (_: Exception) {
+            updateShareSheet {
+                it.copy(busy = false, errorText = ShareSheetStrings.createFailed(uiLang()))
+            }
+        }
+    }
+
+    fun shareSheetCopyCreatedUrl() {
+        val url = _state.value.shareSheet.createdUrl ?: return
+        copyTextToClipboard(url, ShareSheetStrings.copied(uiLang()))
+        updateShareSheet { it.copy(createdUrlCopied = true, showCloseWithoutCopy = false) }
+    }
+
+    fun shareSheetDoneCreated(force: Boolean = false) {
+        val sheet = _state.value.shareSheet
+        if (!force && !sheet.createdUrlCopied) {
+            updateShareSheet { it.copy(showCloseWithoutCopy = true) }
+            return
+        }
+        updateShareSheet {
+            it.copy(
+                showCreatedPanel = false,
+                showCloseWithoutCopy = false,
+                createdUrl = null,
+                createdUrlCopied = false
+            )
+        }
+        loadShareSheet()
+    }
+
+    fun shareSheetCopyAndClose() {
+        shareSheetCopyCreatedUrl()
+        shareSheetDoneCreated(force = true)
+    }
+
+    fun shareSheetConfirmTurnOff(linkId: String) {
+        updateShareSheet { it.copy(confirmTurnOffId = linkId) }
+    }
+
+    fun shareSheetCancelTurnOff() {
+        updateShareSheet { it.copy(confirmTurnOffId = null) }
+    }
+
+    fun shareSheetTurnOff(linkId: String) = viewModelScope.launch {
+        val sheet = _state.value.shareSheet
+        if (!ShareSheetLogic.canMutate(sheet.isOnline, sheet.canEdit, sheet.showCreatedPanel)) return@launch
+        try {
+            api.revokeShareLink(RevokeShareLinkRequest(shareLinkId = linkId))
+            _state.update { it.copy(status = ShareSheetStrings.guestLinkTurnedOff(uiLang())) }
+            updateShareSheet { it.copy(confirmTurnOffId = null) }
+            loadShareSheet()
+        } catch (_: Exception) {
+            updateShareSheet { it.copy(errorText = ShareSheetStrings.revokeFailed(uiLang())) }
+        }
+    }
+
+    fun shareSheetExtend(linkId: String, days: Int) = viewModelScope.launch {
+        val sheet = _state.value.shareSheet
+        if (!ShareSheetLogic.canMutate(sheet.isOnline, sheet.canEdit, sheet.showCreatedPanel)) return@launch
+        val payload = ShareSheetLogic.expiryPayload(days)
+        try {
+            api.updateShareLink(
+                UpdateShareLinkRequest(
+                    shareLinkId = linkId,
+                    expiresAt = payload.expiresAtIso,
+                    neverExpires = payload.neverExpires
+                )
+            )
+            updateShareSheet { it.copy(extendMenuId = null) }
+            loadShareSheet()
+        } catch (_: Exception) {
+            updateShareSheet { it.copy(errorText = ShareSheetStrings.updateFailed(uiLang())) }
+        }
+    }
+
+    fun shareSheetToggleExtendMenu(linkId: String?) {
+        updateShareSheet { it.copy(extendMenuId = linkId) }
+    }
+
+    fun shareSheetStartEditLabel(linkId: String, current: String) {
+        updateShareSheet { it.copy(editingLabelId = linkId, editingLabelDraft = current) }
+    }
+
+    fun shareSheetSetEditingLabel(value: String) {
+        updateShareSheet { it.copy(editingLabelDraft = value) }
+    }
+
+    fun shareSheetCancelEditLabel() {
+        updateShareSheet { it.copy(editingLabelId = null, editingLabelDraft = "") }
+    }
+
+    fun shareSheetSaveLabel() = viewModelScope.launch {
+        val sheet = _state.value.shareSheet
+        val linkId = sheet.editingLabelId ?: return@launch
+        if (!ShareSheetLogic.canMutate(sheet.isOnline, sheet.canEdit, sheet.showCreatedPanel)) return@launch
+        try {
+            api.updateShareLink(
+                UpdateShareLinkRequest(
+                    shareLinkId = linkId,
+                    label = sheet.editingLabelDraft.trim().takeIf { it.isNotEmpty() }
+                )
+            )
+            updateShareSheet { it.copy(editingLabelId = null, editingLabelDraft = "") }
+            loadShareSheet()
+        } catch (_: Exception) {
+            updateShareSheet { it.copy(errorText = ShareSheetStrings.updateFailed(uiLang())) }
+        }
+    }
+
+    fun shareSheetRemovePerson(permissionForId: String) = viewModelScope.launch {
+        val sheet = _state.value.shareSheet
+        if (!ShareSheetLogic.canMutate(sheet.isOnline, sheet.canEdit, sheet.showCreatedPanel)) return@launch
+        try {
+            api.removePermission(
+                RemovePermissionRequest(id = sheet.entityId, permissionForId = permissionForId)
+            )
+            loadShareSheet()
+        } catch (ex: Exception) {
+            updateShareSheet { it.copy(errorText = ex.message ?: ShareSheetStrings.loadFailed(uiLang())) }
+        }
+    }
+
+    fun shareSheetToggleInactive() {
+        updateShareSheet { it.copy(showInactiveExpanded = !it.showInactiveExpanded) }
+    }
+
+    fun shareSheetBeginAddPeople() {
+        val sheet = _state.value.shareSheet
+        if (!ShareSheetLogic.canMutate(sheet.isOnline, sheet.canEdit, sheet.showCreatedPanel)) return
+        if (sheet.showCreateForm || sheet.showCreatedPanel) return
+        if (_state.value.contacts.isEmpty()) loadContacts()
+        updateShareSheet {
+            it.copy(
+                showAddPeople = true,
+                showAddedBanner = false,
+                addedBannerText = null,
+                contactSearch = "",
+                pasteId = "",
+                pastePreviewName = null,
+                pastePreviewError = null,
+                pasteResolvedUserId = null,
+                addCanWrite = false,
+                errorText = null
+            )
+        }
+        rebuildShareContactPicker()
+    }
+
+    fun shareSheetCancelAddPeople() {
+        updateShareSheet {
+            it.copy(
+                showAddPeople = false,
+                contactSearch = "",
+                contactPicker = emptyList(),
+                pasteId = "",
+                pastePreviewName = null,
+                pastePreviewError = null,
+                pasteResolvedUserId = null,
+                addCanWrite = false
+            )
+        }
+    }
+
+    fun shareSheetSetContactSearch(query: String) {
+        updateShareSheet { it.copy(contactSearch = query) }
+        rebuildShareContactPicker()
+    }
+
+    fun shareSheetToggleContact(userId: String) {
+        updateShareSheet { sheet ->
+            sheet.copy(
+                contactPicker = sheet.contactPicker.map { row ->
+                    if (row.userId.equals(userId, true)) row.copy(isSelected = !row.isSelected)
+                    else row
+                }
+            )
+        }
+    }
+
+    fun shareSheetSetPasteId(value: String) {
+        updateShareSheet {
+            it.copy(
+                pasteId = value,
+                pastePreviewName = null,
+                pastePreviewError = null,
+                pasteResolvedUserId = null
+            )
+        }
+    }
+
+    fun shareSheetSetAddCanWrite(canWrite: Boolean) {
+        updateShareSheet { it.copy(addCanWrite = canWrite) }
+    }
+
+    fun shareSheetDismissAddedBanner() {
+        updateShareSheet { it.copy(showAddedBanner = false, addedBannerText = null) }
+    }
+
+    fun shareSheetResolvePaste() = viewModelScope.launch {
+        val sheet = _state.value.shareSheet
+        if (!ShareSheetLogic.canMutate(sheet.isOnline, sheet.canEdit, sheet.showCreatedPanel) ||
+            !sheet.showAddPeople || sheet.busy
+        ) return@launch
+        val parsed = ShareAddPeople.parseUserIdInput(sheet.pasteId)
+        if (parsed == null) {
+            updateShareSheet {
+                it.copy(
+                    pastePreviewName = null,
+                    pasteResolvedUserId = null,
+                    pastePreviewError = ShareSheetStrings.noUserWithId(uiLang())
+                )
+            }
+            return@launch
+        }
+        updateShareSheet { it.copy(busy = true, pastePreviewError = null, pastePreviewName = null) }
+        try {
+            val user = api.getUserById(parsed)
+            val name = ShareAddPeople.pickResolvedDisplayName(user.name, user.login)
+            if (name == null) {
+                updateShareSheet {
+                    it.copy(
+                        busy = false,
+                        pasteResolvedUserId = null,
+                        pastePreviewName = null,
+                        pastePreviewError = ShareSheetStrings.noUserWithId(uiLang())
+                    )
+                }
+            } else {
+                updateShareSheet {
+                    it.copy(
+                        busy = false,
+                        pasteResolvedUserId = parsed,
+                        pastePreviewName = name,
+                        pastePreviewError = null
+                    )
+                }
+            }
+        } catch (_: Exception) {
+            updateShareSheet {
+                it.copy(
+                    busy = false,
+                    pasteResolvedUserId = null,
+                    pastePreviewName = null,
+                    pastePreviewError = ShareSheetStrings.noUserWithId(uiLang())
+                )
+            }
+        }
+    }
+
+    fun shareSheetAddPeople() = viewModelScope.launch {
+        val sheet = _state.value.shareSheet
+        if (!ShareSheetLogic.canMutate(sheet.isOnline, sheet.canEdit, sheet.showCreatedPanel) ||
+            !sheet.showAddPeople || sheet.busy
+        ) return@launch
+        val selected = sheet.contactPicker.filter { it.isSelected }
+        val targets = linkedMapOf<String, String>()
+        for (c in selected) targets[c.userId.lowercase()] = c.name
+        val pasteId = sheet.pasteResolvedUserId
+        val pasteName = sheet.pastePreviewName
+        if (!pasteId.isNullOrBlank() && !pasteName.isNullOrBlank()) {
+            targets[pasteId.lowercase()] = pasteName
+        }
+        if (targets.isEmpty()) return@launch
+        updateShareSheet { it.copy(busy = true, errorText = null) }
+        val canWrite = sheet.addCanWrite
+        try {
+            for ((userId, _) in targets) {
+                api.addPermission(
+                    AddPermissionRequest(
+                        permissionForId = userId,
+                        canWrite = canWrite,
+                        id = sheet.entityId
+                    )
+                )
+            }
+            val toast = if (targets.size > 1) {
+                ShareSheetStrings.addedToastMany(uiLang(), targets.size)
+            } else {
+                ShareSheetStrings.addedToast(uiLang(), targets.values.first(), canWrite)
+            }
+            updateShareSheet {
+                it.copy(
+                    busy = false,
+                    showAddPeople = false,
+                    contactSearch = "",
+                    contactPicker = emptyList(),
+                    pasteId = "",
+                    pastePreviewName = null,
+                    pastePreviewError = null,
+                    pasteResolvedUserId = null,
+                    addCanWrite = false,
+                    showAddedBanner = true,
+                    addedBannerText = toast
+                )
+            }
+            _state.update { it.copy(status = toast) }
+            loadShareSheet()
+        } catch (_: Exception) {
+            updateShareSheet {
+                it.copy(busy = false, errorText = ShareSheetStrings.loadFailed(uiLang()))
+            }
+        }
+    }
+
+    private fun rebuildShareContactPicker() {
+        val sheet = _state.value.shareSheet
+        if (!sheet.showAddPeople) return
+        val me = auth.current()?.userId?.lowercase()
+        val already = sheet.people
+            .mapNotNull { it.grant.permissionForId?.lowercase() }
+            .toSet()
+        val base = _state.value.contacts
+            .filter { c ->
+                val id = c.userId.lowercase()
+                id != me && id !in already
+            }
+            .map { c ->
+                val name = ShareAddPeople.pickResolvedDisplayName(c.displayName, null)
+                    ?: c.displayName.takeIf { !ShareAddPeople.isGuidText(it) }
+                    ?: "…"
+                ShareContactPickerItem(userId = c.userId, name = name, isSelected = false)
+            }
+        val selected = sheet.contactPicker.filter { it.isSelected }.map { it.userId.lowercase() }.toSet()
+        val filtered = ShareAddPeople.filterContacts(base, { it.name }, sheet.contactSearch)
+            .map { row -> row.copy(isSelected = selected.contains(row.userId.lowercase())) }
+        updateShareSheet { it.copy(contactPicker = filtered) }
+    }
+
+    fun loadShareSheet() = viewModelScope.launch {
+        val sheet = _state.value.shareSheet
+        if (!sheet.isOpen) return@launch
+        val online = isNetworkAvailable()
+        if (!online) {
+            updateShareSheet { it.copy(isOnline = false, isLoading = false) }
+            return@launch
+        }
+        updateShareSheet { it.copy(isOnline = true, isLoading = true, errorText = null) }
+        try {
+            val entityId = sheet.entityId
+            val me = auth.current()?.userId
+            val entity = api.getEntities(
+                GetEntitiesRequest(ids = listOf(entityId), includeValues = false, take = 1)
+            ).firstOrNull()
+            val creatorId = entity?.userWhoCreatedId
+            val perms = runCatching { api.getPermissions(entityId) }.getOrDefault(emptyList())
+            val canEdit = when {
+                me != null && perms.any {
+                    it.permissionForId.equals(me, true) && it.canWrite
+                } -> true
+                me != null && creatorId.equals(me, true) -> true
+                CloudSharedScope.isInSharedWithMeScope(_state.value.breadcrumb.map { it.first }) -> {
+                    val root = CloudSharedScope.tryGetActiveShareRootId(
+                        _state.value.breadcrumb.map { it.first }
+                    )
+                    root != null && _state.value.shareRootCanWrite[root.lowercase()] == true
+                }
+                else -> true
+            }
+            val links = api.listShareLinks(entityId)
+            val grants = api.listShareGrants(entityId)
+            val parts = ShareSheetLogic.partitionLinks(links)
+            val people = ShareSheetLogic.peopleFromGrants(grants, creatorId, currentUserId = me).map {
+                SharePersonUi(it.grant, it.isCreator)
+            }
+            updateShareSheet {
+                it.copy(
+                    isLoading = false,
+                    canEdit = canEdit,
+                    creatorUserId = creatorId,
+                    liveLinks = parts.live,
+                    inactiveLinks = parts.inactive,
+                    people = people
+                )
+            }
+        } catch (_: Exception) {
+            updateShareSheet {
+                it.copy(isLoading = false, errorText = ShareSheetStrings.loadFailed(uiLang()))
+            }
+        }
+    }
+
+    private fun updateShareSheet(block: (ShareSheetUiState) -> ShareSheetUiState) {
+        _state.update { it.copy(shareSheet = block(it.shareSheet)) }
+    }
+
     fun mapCurrentFolder(treeUri: String) {
         val folderId = currentFolderId ?: run {
             _state.update { it.copy(status = "Open a cloud folder first, then map") }
             return
         }
+        val crumbIds = _state.value.breadcrumb.map { it.first }
+        val mappedIds = mappingStore.load().map { it.cloudFolderId }.toSet()
+        if (!CloudSharedScope.canMapCurrentFolder(
+                folderId,
+                crumbIds,
+                mappedIds,
+                _state.value.shareRootCanWrite
+            )
+        ) {
+            _state.update { it.copy(status = ShareSheetCloudStrings.browseOnlyHint(uiLang())) }
+            return
+        }
         val name = _state.value.breadcrumb.lastOrNull()?.second ?: "Folder"
+        mapFolder(folderId, treeUri, name)
+    }
+
+    /** Persist mapping + full reconcile into an existing Cloud folder id (never creates the mapped root). */
+    fun mapFolder(folderId: String, treeUri: String, folderName: String) {
+        if (treeUri.isBlank()) {
+            _state.update { it.copy(status = MapLocalFolderStrings.localMissing(uiLang())) }
+            return
+        }
         val list = mappingStore.load().toMutableList()
-        list.removeAll { it.cloudFolderId == folderId }
+        list.removeAll { it.cloudFolderId.equals(folderId, ignoreCase = true) }
+        val name = folderName.ifBlank { "Folder" }
         list.add(CloudSyncMappingDto(folderId, treeUri, name))
         mappingStore.save(list)
-        _state.update { it.copy(mappings = list, status = "Mapped “$name” → local folder. Syncing…") }
+        _state.update {
+            it.copy(
+                mappings = list,
+                status = "Mapped — syncing…",
+                mapWizardOpen = false,
+                mapWizardBusy = false,
+                mapWizardPrefillUri = null
+            )
+        }
         syncNow()
     }
 
+    /**
+     * E6 local-first wizard entry (Cloud hub CTA, Notes nudge, Settings deep-link).
+     * Prefill skips SAF when Notes already chose a tree URI.
+     */
+    fun requestAddLocalFolderWizard(prefilledLocalUri: String? = null) {
+        if (!auth.isAuthenticated) {
+            _state.update { it.copy(status = "Log in before mapping a folder", showSettings = true) }
+            return
+        }
+        viewModelScope.launch {
+            ensureCloudRootQuiet()
+            val parent = resolveWizardParentFolderId()
+            val candidates = if (parent != null) loadUnmappedChildFolders(parent) else emptyList()
+            _state.update {
+                it.copy(
+                    preferCloudTabNonce = it.preferCloudTabNonce + 1,
+                    showSettings = false,
+                    mapWizardOpen = true,
+                    mapWizardPrefillUri = prefilledLocalUri?.takeIf { u -> u.isNotBlank() },
+                    mapWizardCandidates = candidates,
+                    mapWizardBusy = false
+                )
+            }
+        }
+    }
+
+    fun dismissMapLocalFolderWizard() {
+        _state.update {
+            it.copy(
+                mapWizardOpen = false,
+                mapWizardBusy = false,
+                mapWizardPrefillUri = null,
+                mapWizardCandidates = emptyList()
+            )
+        }
+    }
+
+    fun refreshMapWizardCandidates() {
+        viewModelScope.launch {
+            ensureCloudRootQuiet()
+            val parent = resolveWizardParentFolderId()
+            val candidates = if (parent != null) loadUnmappedChildFolders(parent) else emptyList()
+            _state.update { it.copy(mapWizardCandidates = candidates) }
+        }
+    }
+
+    fun completeAddLocalFolderWizard(result: MapLocalFolderWizardResult) {
+        viewModelScope.launch {
+            _state.update { it.copy(mapWizardBusy = true) }
+            try {
+                ensureCloudRootQuiet()
+                val parent = resolveWizardParentFolderId()
+                    ?: run {
+                        _state.update {
+                            it.copy(
+                                mapWizardBusy = false,
+                                status = "Cloud root unavailable"
+                            )
+                        }
+                        return@launch
+                    }
+                val folderId: String
+                val folderName: String
+                if (result.createNew) {
+                    val name = result.newFolderName?.trim().orEmpty()
+                    if (name.isEmpty()) {
+                        _state.update { it.copy(mapWizardBusy = false) }
+                        return@launch
+                    }
+                    val createdId = createCloudFolderUnder(parent, name)
+                    if (createdId == null) {
+                        _state.update {
+                            it.copy(mapWizardBusy = false, status = "Could not create Cloud folder")
+                        }
+                        return@launch
+                    }
+                    folderId = createdId
+                    folderName = name
+                } else {
+                    folderId = result.existingFolderId ?: run {
+                        _state.update { it.copy(mapWizardBusy = false) }
+                        return@launch
+                    }
+                    folderName = result.existingFolderName.orEmpty()
+                }
+                mapFolder(folderId, result.localUri, folderName)
+                loadCloudFolder(parent)
+            } catch (e: Exception) {
+                _state.update {
+                    it.copy(
+                        mapWizardBusy = false,
+                        status = e.message ?: e.javaClass.simpleName
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun ensureCloudRootQuiet() {
+        if (cloudRootId != null) return
+        val userId = auth.current()?.userId ?: return
+        val list = api.getEntities(GetEntitiesRequest(parentIds = listOf(userId), includeValues = false, take = 200))
+        val root = list.firstOrNull { it.code == CloudCodes.CLOUD_ROOT }
+        cloudRootId = root?.id ?: api.addEntity(
+            AddEntityRequest(code = CloudCodes.CLOUD_ROOT, parentIds = listOf(userId))
+        ).id
+    }
+
+    private fun resolveWizardParentFolderId(): String? {
+        val current = currentFolderId
+        if (current != null && !CloudVirtualNodes.isVirtual(current)) return current
+        return cloudRootId
+    }
+
+    private suspend fun loadUnmappedChildFolders(parentId: String): List<MapLocalFolderCandidate> {
+        val children = api.getEntities(
+            GetEntitiesRequest(parentIds = listOf(parentId), includeValues = true, take = 500)
+        )
+        val mapped = mappingStore.load().map { it.cloudFolderId.lowercase() }.toSet()
+        return children.mapNotNull { e ->
+            if (e.code != CloudCodes.CLOUD_FOLDER && e.code != CloudCodes.CLOUD_ROOT) return@mapNotNull null
+            if (mapped.contains(e.id.lowercase())) return@mapNotNull null
+            MapLocalFolderCandidate(id = e.id, name = entityDisplayName(e))
+        }
+    }
+
+    private suspend fun createCloudFolderUnder(parentId: String, name: String): String? {
+        if (CloudVirtualNodes.isVirtual(parentId)) return null
+        return api.addEntity(
+            AddEntityRequest(
+                code = CloudCodes.CLOUD_FOLDER,
+                parentIds = listOf(parentId),
+                values = listOf(AddValueRequest(value = name, parentIds = listOf(CloudCodes.NAME_TYPE_ID)))
+            )
+        ).id
+    }
     fun unmapFolder(cloudFolderId: String) {
         val list = mappingStore.load().toMutableList()
         val removed = list.firstOrNull { it.cloudFolderId == cloudFolderId }
@@ -624,7 +1468,7 @@ class MainViewModel @Inject constructor(
             if (mappings.isEmpty()) {
                 _state.update {
                     it.copy(
-                        status = "No mapped folders. Cloud → open a folder → Map local folder",
+                        status = MapLocalFolderStrings.emptyMappingsHint(uiLang()),
                         syncing = false
                     )
                 }
@@ -997,13 +1841,7 @@ class MainViewModel @Inject constructor(
 
     fun createCloudFolder(name: String) = viewModelScope.launch {
         val parent = currentFolderId ?: return@launch
-        api.addEntity(
-            AddEntityRequest(
-                code = CloudCodes.CLOUD_FOLDER,
-                parentIds = listOf(parent),
-                values = listOf(AddValueRequest(value = name, parentIds = listOf(CloudCodes.NAME_TYPE_ID)))
-            )
-        )
+        createCloudFolderUnder(parent, name) ?: return@launch
         loadCloudFolder(parent)
     }
 
@@ -1081,6 +1919,7 @@ class MainViewModel @Inject constructor(
             }
             // Stay on chat list until the user opens a conversation (phones show list first).
             refreshUnreadBadges()
+            if (_state.value.shareSheet.showAddPeople) rebuildShareContactPicker()
 
             // Enrich display names without blocking list/chat
             launch {
@@ -1110,6 +1949,7 @@ class MainViewModel @Inject constructor(
                     )
                 }
                 refreshUnreadBadges()
+                if (_state.value.shareSheet.showAddPeople) rebuildShareContactPicker()
             }
         } catch (e: Exception) {
             Log.e("ProtoLinkContacts", "loadContacts failed", e)
@@ -1149,7 +1989,13 @@ class MainViewModel @Inject constructor(
         Log.i("ProtoLinkChat", "loadMessages start contact=$contactId")
         try {
             val all = api.getEntities(
-                GetEntitiesRequest(parentIds = listOf(SystemEntities.MESSAGE), includeValues = true, take = 5000)
+                GetEntitiesRequest(
+                    parentIds = listOf(SystemEntities.MESSAGE),
+                    includeValues = true,
+                    skip = 0,
+                    take = MessengerConversationScope.MESSAGE_PAGE_SIZE,
+                    conversationUserIds = MessengerConversationScope.conversationUserIds(me, contactId)
+                )
             )
             val selectedId = _state.value.selectedContact?.userId
             if (selectedId == null || !selectedId.equals(contactId, ignoreCase = true)) {
@@ -1157,38 +2003,33 @@ class MainViewModel @Inject constructor(
                 return@launch
             }
 
+            // Server already scoped to this conversation (newest-first); UI sorts oldest→newest.
             val msgs = all.mapNotNull { e ->
                 val vals = e.values ?: return@mapNotNull null
                 val texts = vals.mapNotNull { JsonValues.asText(it.value)?.trim()?.takeIf { t -> t.isNotEmpty() } }
                 val sender = texts.firstOrNull { it.startsWith("sender:", true) }?.substringAfter(":")
-                val receiver = texts.firstOrNull { it.startsWith("receiver:", true) }?.substringAfter(":")
-                if (sender.isNullOrBlank() || receiver.isNullOrBlank()) return@mapNotNull null
-                val participants = setOf(sender.lowercase(), receiver.lowercase())
-                val wanted = setOf(me.lowercase(), contactId.lowercase())
-                if (participants != wanted) return@mapNotNull null
-
-                val body = texts.firstOrNull { t ->
-                    !t.startsWith("sender:", true) &&
-                        !t.startsWith("receiver:", true) &&
-                        !t.equals("status:read", true) &&
-                        !t.startsWith("status:", true) &&
-                        !ChatTime.looksLikeIsoDate(t)
-                } ?: return@mapNotNull null
+                if (sender.isNullOrBlank()) return@mapNotNull null
 
                 val valueDateRaw = texts.firstOrNull { ChatTime.looksLikeIsoDate(it) }
+                val forBodyParse = texts.filter { !ChatTime.looksLikeIsoDate(it) }
+                val parsed = MessageStringValues.parse(forBodyParse)
+                // Attachment-only: keep when ids present so GUID never becomes body.
+                if (parsed.bodyText.isBlank() && parsed.attachmentIds.isEmpty()) return@mapNotNull null
+
                 val millis = ChatTime.resolveMessageMillis(e.creationTime, e.updateTime, valueDateRaw)
                 val isMine = sender.equals(me, ignoreCase = true)
                 val isRead = isMine && texts.any { it.equals("status:read", true) }
                 MessageItem(
                     id = e.id,
-                    text = body,
+                    text = parsed.bodyText,
                     mine = isMine,
                     timestampMillis = millis,
                     deliveryStatus = when {
                         !isMine -> DeliveryStatus.Sent
                         isRead -> DeliveryStatus.Read
                         else -> DeliveryStatus.Sent
-                    }
+                    },
+                    attachmentIds = parsed.attachmentIds
                 )
             }.sortedWith(compareBy({ it.timestampMillis }, { it.id }))
 
@@ -1216,7 +2057,9 @@ class MainViewModel @Inject constructor(
             val prev = _state.value.messages
             if (prev.size == merged.size &&
                 prev.zip(merged).all { (a, b) ->
-                    a.id == b.id && a.text == b.text && a.mine == b.mine && a.deliveryStatus == b.deliveryStatus
+                    a.id == b.id && a.text == b.text && a.mine == b.mine &&
+                        a.deliveryStatus == b.deliveryStatus && a.attachmentIds == b.attachmentIds &&
+                        a.statusLine == b.statusLine && a.uploadProgress == b.uploadProgress
                 }
             ) {
                 markOpenChatRead(contactId, merged)
@@ -1235,69 +2078,291 @@ class MainViewModel @Inject constructor(
         _state.update { it.copy(composerDraftRestore = null) }
     }
 
+    fun clearAttachStatus() {
+        _state.update { it.copy(attachStatusMessage = null) }
+    }
+
+    fun setCameraPermissionDenied() {
+        _state.update { it.copy(attachStatusMessage = MessengerMediaLimits.CameraPermissionDeniedEn) }
+    }
+
+    /** Returns false when refused (oversize / soft cap). */
+    fun tryAddPendingAttachment(
+        localUri: String,
+        fileName: String,
+        mimeType: String,
+        byteLength: Long,
+        localFilePath: String? = null
+    ): Boolean {
+        _state.update { it.copy(attachStatusMessage = null) }
+        if (localUri.isBlank()) return false
+        if (_state.value.pendingAttachments.size >= 50) {
+            _state.update { it.copy(attachStatusMessage = MessengerMediaLimits.CapRefuseEn) }
+            return false
+        }
+        if (MessengerMediaLimits.isOversize(byteLength)) {
+            _state.update { it.copy(attachStatusMessage = MessengerMediaLimits.OversizeMessageEn) }
+            return false
+        }
+        val draft = PendingAttachmentDraft(
+            localUri = localUri,
+            fileName = fileName.ifBlank { "photo.jpg" },
+            mimeType = mimeType.ifBlank { "image/jpeg" },
+            byteLength = byteLength,
+            localFilePath = localFilePath
+        )
+        _state.update { it.copy(pendingAttachments = it.pendingAttachments + draft) }
+        return true
+    }
+
+    /** M3 — queue an existing CloudFile by id (no local path, no copy / addFile). */
+    fun tryAddCloudPick(entityId: String, fileName: String, mimeType: String?): Boolean {
+        _state.update { it.copy(attachStatusMessage = null) }
+        val id = entityId.trim().lowercase()
+        if (id.isBlank()) return false
+        val maxPendingQueue = MessengerMediaLimits.MaxAttachmentsPerMessage * 3
+        if (_state.value.pendingAttachments.size >= maxPendingQueue) {
+            _state.update { it.copy(attachStatusMessage = MessengerMediaLimits.CapRefuseEn) }
+            return false
+        }
+        if (_state.value.pendingAttachments.any {
+                it.isCloudPick && it.cloudFileEntityId.equals(id, ignoreCase = true)
+            }
+        ) {
+            return false
+        }
+        val name = fileName.ifBlank { "file" }
+        val mime = mimeType?.takeIf { it.isNotBlank() } ?: guessMime(name, "application/octet-stream")
+        val draft = PendingAttachmentDraft(
+            localUri = "",
+            fileName = name,
+            mimeType = mime,
+            byteLength = 0L,
+            cloudFileEntityId = id,
+            uploadCompleted = true,
+            isCloudPick = true
+        )
+        _state.update { it.copy(pendingAttachments = it.pendingAttachments + draft) }
+        return true
+    }
+
+    fun removePendingAttachment(index: Int) {
+        _state.update { s ->
+            if (index !in s.pendingAttachments.indices) return@update s
+            s.copy(pendingAttachments = s.pendingAttachments.toMutableList().also { it.removeAt(index) })
+        }
+    }
+
     fun sendMessage(text: String) = viewModelScope.launch {
         val me = auth.current()?.userId?.trim()?.lowercase()
         if (me.isNullOrBlank()) {
             Log.e("ProtoLinkChat", "sendMessage aborted: no userId")
-            showError("Send failed", "Not logged in"); _state.update { it.copy(composerDraftRestore = text) }
+            showError("Send failed", "Not logged in")
+            _state.update { it.copy(composerDraftRestore = text) }
             return@launch
         }
-        val peer = _state.value.selectedContact?.userId?.trim()?.lowercase()
+        val contact = _state.value.selectedContact
+        val peer = contact?.userId?.trim()?.lowercase()
         if (peer.isNullOrBlank()) {
             Log.e("ProtoLinkChat", "sendMessage aborted: no selected contact")
-            showError("Send failed", "No contact selected"); _state.update { it.copy(composerDraftRestore = text) }
+            showError("Send failed", "No contact selected")
+            _state.update { it.copy(composerDraftRestore = text) }
             return@launch
         }
         val body = text.trim()
-        if (body.isEmpty()) return@launch
-        val sentAtMillis = System.currentTimeMillis()
+        val drafts = _state.value.pendingAttachments.toList()
+        if (body.isEmpty() && drafts.isEmpty()) return@launch
 
+        _state.update {
+            it.copy(
+                pendingAttachments = emptyList(),
+                attachStatusMessage = null,
+                composerClearNonce = it.composerClearNonce + 1
+            )
+        }
+
+        val batches = if (drafts.isEmpty()) {
+            listOf(emptyList())
+        } else {
+            MessengerAttachmentRender.splitBatches(drafts, MessengerMediaLimits.MaxAttachmentsPerMessage)
+        }
+
+        for ((i, batch) in batches.withIndex()) {
+            val batchText = if (i == 0) body else ""
+            sendOneOptimistic(me, peer, contact.displayName, batchText, batch)
+        }
+    }
+
+    fun retryFailedSend(messageId: String) = viewModelScope.launch {
+        val optimistic = _state.value.messages.firstOrNull { it.id == messageId } ?: return@launch
+        if (!optimistic.showFailedActions) return@launch
+        val me = auth.current()?.userId?.trim()?.lowercase() ?: return@launch
+        val peer = (optimistic.partnerUserId ?: _state.value.selectedContact?.userId)?.trim()?.lowercase()
+            ?: return@launch
+        if (!isNetworkAvailable()) {
+            markFailed(optimistic.id, MessengerMediaLimits.OfflineSendFailedEn)
+            return@launch
+        }
+        val partnerName = _state.value.contacts.firstOrNull { it.userId.equals(peer, true) }?.displayName
+            ?: _state.value.selectedContact?.displayName
+            ?: "Chat"
+        val drafts = MessengerAtomicSend.prepareDraftsForAtomicRetry(
+            optimistic.pendingLocalAttachments.orEmpty()
+        )
+        updatePendingMessage(optimistic.id) {
+            it.copy(
+                statusLine = null,
+                deliveryStatus = MessengerSendStateMachine.onRetry(),
+                pendingLocalAttachments = drafts
+            )
+        }
+        val gate = uploadGates.getOrPut(peer) { Mutex() }
+        gate.withLock {
+            executeSendPipeline(
+                optimisticId = optimistic.id,
+                me = me,
+                peer = peer,
+                partnerName = partnerName,
+                text = optimistic.text,
+                drafts = drafts.toMutableList(),
+                allowFolderReresolve = true
+            )
+        }
+    }
+
+    fun cancelFailedSend(messageId: String) = viewModelScope.launch {
+        val optimistic = _state.value.messages.firstOrNull { it.id == messageId } ?: return@launch
+        if (!optimistic.showFailedActions) return@launch
+        for (draft in optimistic.pendingLocalAttachments.orEmpty()) {
+            if (draft.isCloudPick) continue // M3 — never delete the original Cloud entity
+            val id = draft.cloudFileEntityId ?: continue
+            runCatching {
+                api.deleteEntity(ru.protolink.communicator.data.api.DeleteEntityRequest(id))
+            }
+        }
+        pendingChatSends.remove(messageId)
+        pendingChatSendContact.remove(messageId)
+        _state.update { s -> s.copy(messages = s.messages.filterNot { it.id == messageId }) }
+    }
+
+    private suspend fun sendOneOptimistic(
+        me: String,
+        peer: String,
+        partnerName: String,
+        text: String,
+        drafts: List<PendingAttachmentDraft>
+    ) {
+        val sentAtMillis = System.currentTimeMillis()
         val optimisticId = "local-${System.nanoTime()}"
+        val needsUpload = drafts.any { !it.isCloudPick }
         val optimistic = MessageItem(
-            optimisticId,
-            body,
+            id = optimisticId,
+            text = text,
             mine = true,
             timestampMillis = sentAtMillis,
-            deliveryStatus = DeliveryStatus.Sending
+            deliveryStatus = MessengerSendStateMachine.onBubbleCreated(needsUpload),
+            attachmentIds = emptyList(),
+            partnerUserId = peer,
+            pendingLocalAttachments = drafts
         )
         pendingChatSends[optimisticId] = optimistic
         pendingChatSendContact[optimisticId] = peer
         _state.update {
             it.copy(
                 messages = it.messages + optimistic,
-                status = "Sending.",
-                composerClearNonce = it.composerClearNonce + 1
+                status = if (needsUpload) "Uploading…" else "Sending…"
             )
         }
-        Log.i("ProtoLinkChat", "sendMessage start me=$me peer=$peer bodyLen=${body.length}")
+        Log.i("ProtoLinkChat", "sendMessage start me=$me peer=$peer bodyLen=${text.length} attachments=${drafts.size}")
 
+        if (!isNetworkAvailable()) {
+            markFailed(optimisticId, MessengerMediaLimits.OfflineSendFailedEn)
+            if (_state.value.composerDraftRestore == null && text.isNotBlank()) {
+                _state.update { it.copy(composerDraftRestore = text) }
+            }
+            if (drafts.isNotEmpty()) {
+                _state.update { s ->
+                    s.copy(pendingAttachments = s.pendingAttachments + drafts.map { cloneDraft(it) })
+                }
+            }
+            return
+        }
+
+        val gate = uploadGates.getOrPut(peer) { Mutex() }
+        gate.withLock {
+            executeSendPipeline(
+                optimisticId = optimisticId,
+                me = me,
+                peer = peer,
+                partnerName = partnerName,
+                text = text,
+                drafts = drafts.toMutableList(),
+                allowFolderReresolve = true
+            )
+        }
+    }
+
+    private suspend fun executeSendPipeline(
+        optimisticId: String,
+        me: String,
+        peer: String,
+        partnerName: String,
+        text: String,
+        drafts: MutableList<PendingAttachmentDraft>,
+        allowFolderReresolve: Boolean
+    ) {
         try {
-            runCatching { ensureMessengerContainer(SystemEntities.SENT, me, "Sent", grantWrite = false) }
-            runCatching { ensureMessengerContainer(SystemEntities.RECEIVED, peer, "Received", grantWrite = true) }
+            if (drafts.isNotEmpty()) {
+                executeAtomicMediaSend(
+                    optimisticId = optimisticId,
+                    me = me,
+                    peer = peer,
+                    partnerName = partnerName,
+                    text = text,
+                    drafts = drafts,
+                    allowFolderReresolve = allowFolderReresolve
+                )
+                return
+            }
 
-            // Omit DateTime value: Instant JSON has caused AddEntity failures; creationTime is enough for UI.
+            // Text-only: cycle-1 AddEntity Message + message_sent.
+            updatePendingMessage(optimisticId) {
+                it.copy(deliveryStatus = DeliveryStatus.Sending)
+            }
+
+            ensureMessengerContainer(SystemEntities.SENT, me, "Sent", grantWrite = false)
+            ensureMessengerContainer(SystemEntities.RECEIVED, peer, "Received", grantWrite = true)
+
+            val values = mutableListOf<AddValueRequest>()
+            if (text.isNotBlank()) {
+                values.add(
+                    AddValueRequest(
+                        type = AddValueRequest.TYPE_STRING,
+                        value = text,
+                        parentIds = listOf(SystemEntities.MESSAGE)
+                    )
+                )
+            }
+            values.add(
+                AddValueRequest(
+                    type = AddValueRequest.TYPE_STRING,
+                    value = "sender:$me",
+                    parentIds = listOf(SystemEntities.SENT)
+                )
+            )
+            values.add(
+                AddValueRequest(
+                    type = AddValueRequest.TYPE_STRING,
+                    value = "receiver:$peer",
+                    parentIds = listOf(SystemEntities.RECEIVED)
+                )
+            )
+
             val created = api.addEntity(
                 AddEntityRequest(
                     code = "Message",
                     parentIds = listOf(SystemEntities.MESSAGE),
-                    values = listOf(
-                        AddValueRequest(
-                            type = AddValueRequest.TYPE_STRING,
-                            value = body,
-                            parentIds = listOf(SystemEntities.MESSAGE)
-                        ),
-                        AddValueRequest(
-                            type = AddValueRequest.TYPE_STRING,
-                            value = "sender:$me",
-                            parentIds = listOf(SystemEntities.SENT)
-                        ),
-                        AddValueRequest(
-                            type = AddValueRequest.TYPE_STRING,
-                            value = "receiver:$peer",
-                            parentIds = listOf(SystemEntities.RECEIVED)
-                        )
-                    ),
-                    // Same as Windows: peer must get read permission or GetEntities hides the message.
+                    values = values,
                     permissions = if (peer != me) {
                         listOf(AddPermissionRequest(permissionForId = peer, canWrite = false))
                     } else {
@@ -1309,17 +2374,9 @@ class MainViewModel @Inject constructor(
             Log.i("ProtoLinkChat", "sendMessage AddEntity ok id=$id")
             if (id.isNullOrBlank()) error("AddEntity returned empty id")
 
-            if (peer != me) {
-                try {
-                    api.addPermission(AddPermissionRequest(permissionForId = peer, canWrite = false, id = id))
-                    Log.i("ProtoLinkChat", "sendMessage AddPermission ok peer=$peer")
-                } catch (ex: Exception) {
-                    val detail = (ex as? retrofit2.HttpException)?.response()?.errorBody()?.string()?.take(300)
-                    showError("Peer share failed", "Message id=$id" + "\n" + (detail ?: httpDetail(ex)), ex)
-                }
-            }
-
-            val sentAt = java.time.Instant.ofEpochMilli(sentAtMillis)
+            val optimistic = pendingChatSends[optimisticId] ?: _state.value.messages.firstOrNull { it.id == optimisticId }
+            val sentAtMillis = optimistic?.timestampMillis ?: System.currentTimeMillis()
+            val sentAt = Instant.ofEpochMilli(sentAtMillis)
                 .truncatedTo(java.time.temporal.ChronoUnit.MILLIS).toString()
             runCatching {
                 api.sendCommand(
@@ -1328,7 +2385,7 @@ class MainViewModel @Inject constructor(
                         targetUserId = peer,
                         parameters = mapOf(
                             "senderId" to me,
-                            "messageText" to body,
+                            "messageText" to text,
                             "timestamp" to sentAt
                         )
                     )
@@ -1342,7 +2399,7 @@ class MainViewModel @Inject constructor(
                             targetUserId = me,
                             parameters = mapOf(
                                 "senderId" to me,
-                                "messageText" to body,
+                                "messageText" to text,
                                 "timestamp" to sentAt
                             )
                         )
@@ -1352,10 +2409,12 @@ class MainViewModel @Inject constructor(
 
             val sentMsg = MessageItem(
                 id = id,
-                text = body,
+                text = text,
                 mine = true,
                 timestampMillis = sentAtMillis,
-                deliveryStatus = DeliveryStatus.Sent
+                deliveryStatus = MessengerSendStateMachine.onMessageCommitted(),
+                attachmentIds = emptyList(),
+                partnerUserId = peer
             )
             pendingChatSends.remove(optimisticId)
             pendingChatSendContact.remove(optimisticId)
@@ -1367,16 +2426,229 @@ class MainViewModel @Inject constructor(
             }
             _state.value.selectedContact?.let { loadMessages(it) }
         } catch (ex: Exception) {
+            Log.e("ProtoLinkChat", "send pipeline failed", ex)
+            markFailed(optimisticId, MessengerMediaLimits.UploadFailedEn)
+            if (drafts.isEmpty()) {
+                pendingChatSends.remove(optimisticId)
+                pendingChatSendContact.remove(optimisticId)
+                _state.update { s ->
+                    s.copy(
+                        messages = s.messages.filterNot { it.id == optimisticId },
+                        composerDraftRestore = text
+                    )
+                }
+                showError("Send failed", httpDetail(ex), ex)
+            }
+        }
+    }
+
+    /** Cycle-2: one `POST api/Messenger/sendWithAttachments` for new uploads and/or M3 picks. */
+    private suspend fun executeAtomicMediaSend(
+        optimisticId: String,
+        me: String,
+        peer: String,
+        partnerName: String,
+        text: String,
+        drafts: MutableList<PendingAttachmentDraft>,
+        allowFolderReresolve: Boolean
+    ) {
+        val newUploads = MessengerAtomicSend.collectNewUploads(drafts).toMutableList()
+        val existingIds = MessengerAtomicSend.collectExistingIds(drafts)
+        if (existingIds.size != drafts.count { it.isCloudPick }) {
+            markFailed(optimisticId, MessengerMediaLimits.UploadFailedEn)
+            return
+        }
+        for (draft in newUploads) {
+            if (MessengerMediaLimits.isOversize(draft.byteLength)) {
+                _state.update { it.copy(attachStatusMessage = MessengerMediaLimits.OversizeMessageEn) }
+                markFailed(optimisticId, MessengerMediaLimits.OversizeMessageEn)
+                return
+            }
+        }
+
+        val needsUpload = newUploads.isNotEmpty()
+        updatePendingMessage(optimisticId) {
+            it.copy(
+                deliveryStatus = if (needsUpload) DeliveryStatus.Uploading else DeliveryStatus.Sending,
+                statusLine = null
+            )
+        }
+
+        var chatFolderId: String? = null
+        if (needsUpload) {
+            try {
+                chatFolderId = chatFolderResolver.resolveOrCreate(me, peer, partnerName)
+            } catch (ex: Exception) {
+                Log.e("ProtoLinkChat", "chat folder resolve failed", ex)
+                markFailed(optimisticId, MessengerMediaLimits.UploadFailedEn)
+                return
+            }
+        }
+
+        try {
+            try {
+                postAtomicSend(optimisticId, peer, chatFolderId, text, existingIds, newUploads, drafts)
+            } catch (ex: Exception) {
+                if (allowFolderReresolve && needsUpload && MessengerChatFolderResolver.isStaleFolderFailure(ex)) {
+                    chatFolderId = chatFolderResolver.reResolveAndCreate(me, peer, partnerName)
+                    postAtomicSend(optimisticId, peer, chatFolderId, text, existingIds, newUploads, drafts)
+                } else {
+                    throw ex
+                }
+            }
+        } catch (ex: Exception) {
+            Log.e("ProtoLinkChat", "atomic media send failed", ex)
+            val line = if (MessengerAtomicSend.looksLikeFileTooLarge(ex.message)) {
+                _state.update { it.copy(attachStatusMessage = MessengerMediaLimits.OversizeMessageEn) }
+                MessengerMediaLimits.OversizeMessageEn
+            } else {
+                MessengerMediaLimits.UploadFailedEn
+            }
+            markFailed(optimisticId, line)
+        }
+    }
+
+    private suspend fun postAtomicSend(
+        optimisticId: String,
+        peer: String,
+        chatFolderId: String?,
+        text: String,
+        existingIds: List<String>,
+        newUploads: MutableList<PendingAttachmentDraft>,
+        allDrafts: MutableList<PendingAttachmentDraft>
+    ) {
+        val plain = "text/plain".toMediaTypeOrNull()
+        val partnerBody = peer.toRequestBody(plain)
+        val folderBody = chatFolderId?.takeIf { it.isNotBlank() }?.toRequestBody(plain)
+        val bodyTextPart = text.takeIf { it.isNotBlank() }?.toRequestBody(plain)
+        val existingBody = MessengerAtomicSend.formatExistingAttachmentIds(existingIds).toRequestBody(plain)
+
+        val grandTotal = newUploads.sumOf { it.byteLength.coerceAtLeast(0L) }.coerceAtLeast(1L)
+        var bytesBefore = 0L
+        val fileParts = mutableListOf<MultipartBody.Part>()
+        val openStreams = mutableListOf<java.io.InputStream>()
+        try {
+            for (draft in newUploads) {
+                val uri = Uri.parse(draft.localUri)
+                val input = appContext.contentResolver.openInputStream(uri)
+                    ?: draft.localFilePath?.let { File(it).inputStream() }
+                    ?: error("Cannot open attachment stream")
+                openStreams.add(input)
+                val offset = bytesBefore
+                val body = ProgressRequestBody(
+                    inputStream = input,
+                    contentLength = draft.byteLength.coerceAtLeast(0L),
+                    contentType = draft.mimeType,
+                    onProgress = { written, _ ->
+                        val fraction = ((offset + written).toFloat() / grandTotal.toFloat()).coerceIn(0f, 1f)
+                        updatePendingMessage(optimisticId) { it.copy(uploadProgress = fraction) }
+                    }
+                )
+                fileParts.add(MultipartBody.Part.createFormData("files", draft.fileName, body))
+                bytesBefore += draft.byteLength.coerceAtLeast(0L)
+            }
+
+            val result = api.sendWithAttachments(
+                partnerUserId = partnerBody,
+                chatFolderId = folderBody,
+                bodyText = bodyTextPart,
+                existingAttachmentIds = existingBody,
+                files = fileParts
+            )
+            val messageId = result.messageId?.takeIf { it.isNotBlank() }
+                ?: error("sendWithAttachments returned empty messageId")
+            val attachmentIds = result.attachmentIds.orEmpty()
+
+            for (i in newUploads.indices) {
+                if (i < attachmentIds.size) {
+                    newUploads[i] = newUploads[i].copy(
+                        cloudFileEntityId = attachmentIds[i],
+                        uploadCompleted = true
+                    )
+                }
+            }
+            for (i in allDrafts.indices) {
+                if (!allDrafts[i].isCloudPick) {
+                    val match = newUploads.firstOrNull {
+                        it.localUri == allDrafts[i].localUri && it.fileName == allDrafts[i].fileName
+                    }
+                    if (match != null) allDrafts[i] = match
+                } else {
+                    allDrafts[i] = allDrafts[i].copy(uploadCompleted = true)
+                }
+            }
+
+            val optimistic = pendingChatSends[optimisticId]
+                ?: _state.value.messages.firstOrNull { it.id == optimisticId }
+            val sentAtMillis = optimistic?.timestampMillis ?: System.currentTimeMillis()
+            val sentMsg = MessageItem(
+                id = messageId,
+                text = text,
+                mine = true,
+                timestampMillis = sentAtMillis,
+                deliveryStatus = MessengerSendStateMachine.onMessageCommitted(),
+                attachmentIds = attachmentIds,
+                partnerUserId = peer,
+                pendingLocalAttachments = allDrafts.toList()
+            )
             pendingChatSends.remove(optimisticId)
             pendingChatSendContact.remove(optimisticId)
             _state.update { s ->
                 s.copy(
-                    messages = s.messages.filterNot { it.id == optimisticId },
-                    composerDraftRestore = body
+                    messages = s.messages.map { if (it.id == optimisticId) sentMsg else it },
+                    status = "Sent $messageId"
                 )
             }
-            showError("Send failed", httpDetail(ex), ex)
+            _state.value.selectedContact?.let { loadMessages(it) }
+        } finally {
+            for (s in openStreams) runCatching { s.close() }
         }
+    }
+
+    private fun cloneDraft(d: PendingAttachmentDraft) =
+        if (d.isCloudPick) {
+            d.copy() // keep entity id + uploadCompleted for M3 re-queue
+        } else {
+            d.copy(cloudFileEntityId = null, uploadCompleted = false)
+        }
+
+    private fun markFailed(optimisticId: String, statusLine: String) {
+        updatePendingMessage(optimisticId) {
+            it.copy(
+                deliveryStatus = MessengerSendStateMachine.onFailure(),
+                statusLine = statusLine
+            )
+        }
+    }
+
+    private fun updatePendingMessage(optimisticId: String, transform: (MessageItem) -> MessageItem) {
+        _state.update { s ->
+            val base = pendingChatSends[optimisticId]
+                ?: s.messages.firstOrNull { it.id == optimisticId }
+                ?: return@update s
+            val next = transform(base)
+            pendingChatSends[optimisticId] = next
+            s.copy(messages = s.messages.map { if (it.id == optimisticId) next else it })
+        }
+    }
+
+    private fun isNetworkAvailable(): Boolean {
+        val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return true
+        val network = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    fun guessMime(fileName: String, fallback: String = "image/jpeg"): String {
+        val ext = fileName.substringAfterLast('.', "").lowercase()
+        if (ext.isBlank()) return fallback
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: fallback
+    }
+
+    fun newCameraCaptureFile(): File {
+        val dir = File(appContext.cacheDir, "messenger_capture").also { it.mkdirs() }
+        return File(dir, "camera-${UUID.randomUUID()}.jpg")
     }
 
     fun openContactById(contactId: String) {

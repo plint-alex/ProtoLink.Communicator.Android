@@ -10,6 +10,7 @@ import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeFormatterBuilder
 import java.time.temporal.ChronoField
+import java.time.temporal.ChronoUnit
 import java.util.Locale
 import kotlin.math.abs
 
@@ -114,6 +115,32 @@ object ChatTime {
             today.minusDays(1) -> "Yesterday"
             else -> day.format(dayFmt)
         }
+    }
+
+    /**
+     * Telegram chat-list style (Windows [ChatTime.FormatListMeta] parity):
+     * time today, weekday this week, "d MMM" same year, else dd.MM.yyyy.
+     */
+    fun formatListMeta(
+        millis: Long,
+        nowMillis: Long = System.currentTimeMillis(),
+        zoneId: ZoneId = zone
+    ): String {
+        if (millis <= 0L) return ""
+        val local = Instant.ofEpochMilli(millis).atZone(zoneId)
+        val nowZ = Instant.ofEpochMilli(nowMillis).atZone(zoneId)
+        val day = local.toLocalDate()
+        val today = nowZ.toLocalDate()
+        if (day == today) return local.format(timeFmt)
+        val daysAgo = ChronoUnit.DAYS.between(day, today)
+        val locale = Locale.getDefault()
+        if (daysAgo > 0 && daysAgo < 7) {
+            return local.format(DateTimeFormatter.ofPattern("EEE", locale))
+        }
+        if (day.year == today.year) {
+            return local.format(DateTimeFormatter.ofPattern("d MMM", locale))
+        }
+        return local.format(DateTimeFormatter.ofPattern("dd.MM.yyyy", locale))
     }
 
     fun dayKey(millis: Long): LocalDate? {
