@@ -9,6 +9,12 @@ object ShareSheetStrings {
 
     fun shareButton(lang: String?) = if (ru(lang)) "Поделиться" else "Share"
 
+    /** Notes/Cloud context menu (UX-NS-1). */
+    fun shareMenu(lang: String?) = if (ru(lang)) "Поделиться…" else "Share…"
+
+    fun notInCloudYet(lang: String?) =
+        if (ru(lang)) "Ещё не в облаке" else "Not in Cloud yet"
+
     fun sheetTitle(lang: String?, entityName: String) =
         if (ru(lang)) "Доступ · $entityName" else "Share “$entityName”"
 

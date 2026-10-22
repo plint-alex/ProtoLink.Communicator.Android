@@ -53,6 +53,8 @@ import ru.protolink.communicator.util.MessengerConversationScope
 import ru.protolink.communicator.util.MessengerAtomicSend
 import ru.protolink.communicator.util.MessengerMediaLimits
 import ru.protolink.communicator.util.MessengerSendStateMachine
+import ru.protolink.communicator.util.NoteRemoteIdResolver
+import ru.protolink.communicator.util.NotesTreeShare
 import ru.protolink.communicator.util.ShareAccountStrings
 import ru.protolink.communicator.util.ShareAddPeople
 import ru.protolink.communicator.util.ShareSheetCloudStrings
@@ -233,6 +235,8 @@ data class UiState(
     val appVersion: String = BuildConfig.VERSION_NAME,
     val apiVersionText: String = "",
     val shareSheet: ShareSheetUiState = ShareSheetUiState(),
+    /** Bumped when Notes lazy share-affordance cache changes (tree glyphs). */
+    val notesShareAffordanceEpoch: Int = 0,
     /** E6: bump to switch Main tab to Cloud before showing the add-local wizard. */
     val preferCloudTabNonce: Int = 0,
     val mapWizardOpen: Boolean = false,
@@ -265,6 +269,9 @@ class MainViewModel @Inject constructor(
     private val readReceiptNotified = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val chatFolderResolver by lazy { MessengerChatFolderResolver(api, settingsStore) }
     private val uploadGates = ConcurrentHashMap<String, Mutex>()
+    /** RemoteId (lowercase) → has external share (Notes tree lazy glyph). */
+    private val notesExternalShareByRemoteId = ConcurrentHashMap<String, Boolean>()
+    @Volatile private var notesSharePrefetchBusy = false
     @Volatile var appInForeground: Boolean = true
 
     init {
@@ -897,7 +904,13 @@ class MainViewModel @Inject constructor(
         _state.update { it.copy(status = status) }
     }
 
-    fun openShareSheet(entityId: String?, entityName: String?, isFolder: Boolean, childCount: Int = 0) {
+    fun openShareSheet(
+        entityId: String?,
+        entityName: String?,
+        isFolder: Boolean,
+        childCount: Int = 0,
+        isNote: Boolean = false
+    ) {
         val id = entityId?.takeIf { it.isNotBlank() && !CloudVirtualNodes.isVirtual(it) } ?: return
         val online = isNetworkAvailable()
         val name = entityName?.takeIf { it.isNotBlank() } ?: id.take(8)
@@ -908,6 +921,7 @@ class MainViewModel @Inject constructor(
                     entityId = id,
                     entityName = name,
                     isFolder = isFolder,
+                    isNote = isNote,
                     childCount = if (isFolder) childCount else 0,
                     canEdit = true,
                     isOnline = online,
@@ -918,6 +932,91 @@ class MainViewModel @Inject constructor(
         if (online) loadShareSheet() else {
             _state.update { s -> s.copy(shareSheet = s.shareSheet.copy(isLoading = false)) }
         }
+    }
+
+    /** Same E2 gate as Copy link (AC-NS-1 / AT-S47): Cloud-linked note folder RemoteId. */
+    fun tryResolveNotesRemoteId(relativePath: String?): String? {
+        val notesRoot = _state.value.settings.notesRootUri
+        val mappings = mappingStore.load()
+        return NoteRemoteIdResolver.resolve(
+            notesRootUri = notesRoot,
+            noteRelativePath = relativePath,
+            mappings = mappings
+        ) { mappingId ->
+            runCatching { metadataStore.getAll(mappingId) }.getOrDefault(emptyList())
+        }
+    }
+
+    fun canOpenShareForNotesRow(row: NoteTreeRow): Boolean =
+        tryResolveNotesRemoteId(row.relativePath) != null
+
+    fun showsExternalShareForNotesRow(row: NoteTreeRow): Boolean {
+        val id = tryResolveNotesRemoteId(row.relativePath)?.lowercase() ?: return false
+        return notesExternalShareByRemoteId[id] == true
+    }
+
+    fun openShareForNotesRow(row: NoteTreeRow) {
+        val id = tryResolveNotesRemoteId(row.relativePath)
+        if (id == null) {
+            _state.update {
+                it.copy(status = ShareSheetStrings.notInCloudYet(uiLang()))
+            }
+            return
+        }
+        openShareSheet(
+            entityId = id,
+            entityName = row.name,
+            isFolder = true,
+            childCount = 0,
+            isNote = true
+        )
+    }
+
+    /**
+     * Lazy prefetch for one Cloud-linked Notes node when the long-press menu opens (no full-tree scan).
+     */
+    fun prefetchNotesShareAffordance(row: NoteTreeRow) {
+        val id = tryResolveNotesRemoteId(row.relativePath) ?: return
+        val key = id.lowercase()
+        if (notesExternalShareByRemoteId.containsKey(key)) return
+        if (!isNetworkAvailable()) return
+        if (notesSharePrefetchBusy) return
+        notesSharePrefetchBusy = true
+        viewModelScope.launch {
+            try {
+                val links = api.listShareLinks(id)
+                val grants = api.listShareGrants(id)
+                val live = links.count { it.isLive }
+                val has = NotesTreeShare.hasExternalShare(
+                    grants,
+                    live,
+                    auth.current()?.userId
+                )
+                rememberNotesExternalShare(key, has)
+            } catch (_: Exception) {
+                // Offline / error: omit glyph rather than invent “shared”.
+            } finally {
+                notesSharePrefetchBusy = false
+            }
+        }
+    }
+
+    private fun rememberNotesExternalShare(remoteIdLower: String, hasExternal: Boolean) {
+        val prev = notesExternalShareByRemoteId.put(remoteIdLower, hasExternal)
+        if (prev == hasExternal) return
+        _state.update { it.copy(notesShareAffordanceEpoch = it.notesShareAffordanceEpoch + 1) }
+    }
+
+    private fun captureNotesShareAffordanceFromOpenSheet() {
+        val sheet = _state.value.shareSheet
+        if (!sheet.isOpen || sheet.entityId.isBlank()) return
+        val grants = sheet.people.map { it.grant }
+        val has = NotesTreeShare.hasExternalShare(
+            grants,
+            sheet.liveLinks.size,
+            auth.current()?.userId
+        )
+        rememberNotesExternalShare(sheet.entityId.lowercase(), has)
     }
 
     fun openShareForCurrentFolder() {
@@ -1374,6 +1473,7 @@ class MainViewModel @Inject constructor(
                     people = people
                 )
             }
+            if (sheet.isNote) captureNotesShareAffordanceFromOpenSheet()
         } catch (_: Exception) {
             updateShareSheet {
                 it.copy(isLoading = false, errorText = ShareSheetStrings.loadFailed(uiLang()))

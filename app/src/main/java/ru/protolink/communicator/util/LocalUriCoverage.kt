@@ -45,6 +45,29 @@ object LocalUriCoverage {
         return false
     }
 
+    /**
+     * Relative path of [folderRaw] under [rootRaw] (empty when equal). Null when not under root.
+     * File paths and SAF tree-document ids; for same SAF tree grant returns "" (use Notes relativePath).
+     */
+    fun relativeUnder(folderRaw: String?, rootRaw: String?): String? {
+        val folder = tryNormalize(folderRaw) ?: return null
+        val root = tryNormalize(rootRaw) ?: return null
+        if (!isUnderOrEqual(folder, root)) return null
+        if (folder.equals(root, ignoreCase = true)) return ""
+
+        if (!folder.contains("://") && !root.contains("://")) {
+            return folder.substring(root.length).trimStart('\\', '/').replace('\\', '/').lowercase()
+        }
+
+        val folderTree = decodeSegment(extractTreeDocumentId(folder) ?: return null)
+        val rootTree = decodeSegment(extractTreeDocumentId(root) ?: return null)
+        if (folderTree.equals(rootTree, ignoreCase = true)) return ""
+        if (!folderTree.startsWith(rootTree, ignoreCase = true)) return null
+        var rest = folderTree.substring(rootTree.length)
+        if (rest.startsWith("/") || rest.startsWith(":")) rest = rest.substring(1)
+        return rest.replace('\\', '/').trim('/').lowercase()
+    }
+
     private fun isSafDescendantOrEqual(folder: String, root: String): Boolean {
         if (folder.equals(root, ignoreCase = true)) return true
         val folderTree = decodeSegment(extractTreeDocumentId(folder) ?: return false)

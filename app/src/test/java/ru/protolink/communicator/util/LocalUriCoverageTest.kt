@@ -63,4 +63,24 @@ class LocalUriCoverageTest {
             "content://com.android.externalstorage.documents/tree/primary%3AOther"
         assertThat(LocalUriCoverage.isCoveredByAnyMappingRoot(notes, listOf(mapping))).isFalse()
     }
+
+    @Test
+    fun relativeUnder_equalFilePath_empty() {
+        val root = """C:\Notes"""
+        assertThat(LocalUriCoverage.relativeUnder(root, root)).isEqualTo("")
+    }
+
+    @Test
+    fun relativeUnder_nestedFilePath() {
+        val root = """C:\Maps\MyNotesFolder"""
+        val nested = """C:\Maps\MyNotesFolder\work"""
+        assertThat(LocalUriCoverage.relativeUnder(nested, root)).isEqualTo("work")
+    }
+
+    @Test
+    fun relativeUnder_equalSaf_empty() {
+        val uri =
+            "content://com.android.externalstorage.documents/tree/primary%3AMyNotesFolder"
+        assertThat(LocalUriCoverage.relativeUnder(uri, uri)).isEqualTo("")
+    }
 }

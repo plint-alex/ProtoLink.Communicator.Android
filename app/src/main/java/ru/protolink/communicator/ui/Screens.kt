@@ -110,6 +110,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.IosShare
 import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.People
 import androidx.compose.material3.AlertDialog
 import ru.protolink.communicator.ui.share.ShareSheetScreen
 import ru.protolink.communicator.util.MapLocalFolderStrings
@@ -1077,42 +1078,7 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
         }
     }
 
-    ShareSheetScreen(
-        sheet = state.shareSheet,
-        lang = lang,
-        onDismiss = { vm.closeShareSheet() },
-        onCopyCanonical = { vm.copyCanonicalLink(state.shareSheet.entityId) },
-        onBeginCreate = { vm.shareSheetBeginCreate() },
-        onCancelCreate = { vm.shareSheetCancelCreate() },
-        onNewLabelChange = { vm.shareSheetSetNewLabel(it) },
-        onExpiryChoice = { vm.shareSheetSetExpiryChoice(it) },
-        onCreateLink = { vm.shareSheetCreateLink() },
-        onCopyCreated = { vm.shareSheetCopyCreatedUrl() },
-        onDoneCreated = { vm.shareSheetDoneCreated() },
-        onCopyAndClose = { vm.shareSheetCopyAndClose() },
-        onCloseAnyway = { vm.shareSheetDoneCreated(force = true) },
-        onConfirmTurnOff = { vm.shareSheetConfirmTurnOff(it) },
-        onCancelTurnOff = { vm.shareSheetCancelTurnOff() },
-        onTurnOff = { vm.shareSheetTurnOff(it) },
-        onExtend = { id, days -> vm.shareSheetExtend(id, days) },
-        onToggleExtendMenu = { vm.shareSheetToggleExtendMenu(it) },
-        onStartEditLabel = { id, cur -> vm.shareSheetStartEditLabel(id, cur) },
-        onEditingLabelChange = { vm.shareSheetSetEditingLabel(it) },
-        onSaveLabel = { vm.shareSheetSaveLabel() },
-        onCancelEditLabel = { vm.shareSheetCancelEditLabel() },
-        onRemovePerson = { vm.shareSheetRemovePerson(it) },
-        onToggleInactive = { vm.shareSheetToggleInactive() },
-        onRetry = { vm.loadShareSheet() },
-        onBeginAddPeople = { vm.shareSheetBeginAddPeople() },
-        onCancelAddPeople = { vm.shareSheetCancelAddPeople() },
-        onContactSearchChange = { vm.shareSheetSetContactSearch(it) },
-        onToggleContact = { vm.shareSheetToggleContact(it) },
-        onPasteIdChange = { vm.shareSheetSetPasteId(it) },
-        onResolvePaste = { vm.shareSheetResolvePaste() },
-        onAddCanWriteChange = { vm.shareSheetSetAddCanWrite(it) },
-        onAddPeople = { vm.shareSheetAddPeople() },
-        onDismissAddedBanner = { vm.shareSheetDismissAddedBanner() }
-    )
+    ProtoLinkShareSheetHost(vm = vm, state = state, lang = lang)
 
     if (showCreateFolder) {
         AlertDialog(
@@ -1992,6 +1958,12 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
                 onCloudNudge = {
                     vm.requestAddLocalFolderWizard(state.settings.notesRootUri)
                 },
+                shareAffordanceEpoch = state.notesShareAffordanceEpoch,
+                lang = notesLang,
+                canShare = { vm.canOpenShareForNotesRow(it) },
+                showsShared = { vm.showsExternalShareForNotesRow(it) },
+                onShare = { vm.openShareForNotesRow(it) },
+                onPrefetchShare = { vm.prefetchNotesShareAffordance(it) },
                 onPickRoot = { pickTree.launch(null) },
                 onRefresh = { vm.refreshNotesTree() },
                 onToggleExpand = { vm.toggleNotesExpand(it) },
@@ -2031,6 +2003,12 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
                 onCloudNudge = {
                     vm.requestAddLocalFolderWizard(state.settings.notesRootUri)
                 },
+                shareAffordanceEpoch = state.notesShareAffordanceEpoch,
+                lang = notesLang,
+                canShare = { vm.canOpenShareForNotesRow(it) },
+                showsShared = { vm.showsExternalShareForNotesRow(it) },
+                onShare = { vm.openShareForNotesRow(it) },
+                onPrefetchShare = { vm.prefetchNotesShareAffordance(it) },
                 onPickRoot = { pickTree.launch(null) },
                 onRefresh = { vm.refreshNotesTree() },
                 onToggleExpand = { vm.toggleNotesExpand(it) },
@@ -2068,6 +2046,48 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
             }
         }
     }
+
+    ProtoLinkShareSheetHost(vm = vm, state = state, lang = notesLang)
+}
+
+@Composable
+private fun ProtoLinkShareSheetHost(vm: MainViewModel, state: UiState, lang: String) {
+    ShareSheetScreen(
+        sheet = state.shareSheet,
+        lang = lang,
+        onDismiss = { vm.closeShareSheet() },
+        onCopyCanonical = { vm.copyCanonicalLink(state.shareSheet.entityId) },
+        onBeginCreate = { vm.shareSheetBeginCreate() },
+        onCancelCreate = { vm.shareSheetCancelCreate() },
+        onNewLabelChange = { vm.shareSheetSetNewLabel(it) },
+        onExpiryChoice = { vm.shareSheetSetExpiryChoice(it) },
+        onCreateLink = { vm.shareSheetCreateLink() },
+        onCopyCreated = { vm.shareSheetCopyCreatedUrl() },
+        onDoneCreated = { vm.shareSheetDoneCreated() },
+        onCopyAndClose = { vm.shareSheetCopyAndClose() },
+        onCloseAnyway = { vm.shareSheetDoneCreated(force = true) },
+        onConfirmTurnOff = { vm.shareSheetConfirmTurnOff(it) },
+        onCancelTurnOff = { vm.shareSheetCancelTurnOff() },
+        onTurnOff = { vm.shareSheetTurnOff(it) },
+        onExtend = { id, days -> vm.shareSheetExtend(id, days) },
+        onToggleExtendMenu = { vm.shareSheetToggleExtendMenu(it) },
+        onStartEditLabel = { id, cur -> vm.shareSheetStartEditLabel(id, cur) },
+        onEditingLabelChange = { vm.shareSheetSetEditingLabel(it) },
+        onSaveLabel = { vm.shareSheetSaveLabel() },
+        onCancelEditLabel = { vm.shareSheetCancelEditLabel() },
+        onRemovePerson = { vm.shareSheetRemovePerson(it) },
+        onToggleInactive = { vm.shareSheetToggleInactive() },
+        onRetry = { vm.loadShareSheet() },
+        onBeginAddPeople = { vm.shareSheetBeginAddPeople() },
+        onCancelAddPeople = { vm.shareSheetCancelAddPeople() },
+        onContactSearchChange = { vm.shareSheetSetContactSearch(it) },
+        onToggleContact = { vm.shareSheetToggleContact(it) },
+        onPasteIdChange = { vm.shareSheetSetPasteId(it) },
+        onResolvePaste = { vm.shareSheetResolvePaste() },
+        onAddCanWriteChange = { vm.shareSheetSetAddCanWrite(it) },
+        onAddPeople = { vm.shareSheetAddPeople() },
+        onDismissAddedBanner = { vm.shareSheetDismissAddedBanner() }
+    )
 }
 
 @Composable
@@ -2154,6 +2174,12 @@ private fun NotesTreePane(
     showCloudNudge: Boolean = false,
     cloudNudgeText: String = "",
     onCloudNudge: () -> Unit = {},
+    shareAffordanceEpoch: Int = 0,
+    lang: String = "en",
+    canShare: (NoteTreeRow) -> Boolean = { false },
+    showsShared: (NoteTreeRow) -> Boolean = { false },
+    onShare: (NoteTreeRow) -> Unit = {},
+    onPrefetchShare: (NoteTreeRow) -> Unit = {},
     onPickRoot: () -> Unit,
     onRefresh: () -> Unit,
     onToggleExpand: (String) -> Unit,
@@ -2211,12 +2237,20 @@ private fun NotesTreePane(
                     contentPadding = PaddingValues(bottom = 88.dp)
                 ) {
                     items(rows, key = { it.documentId }) { row ->
+                        // Epoch read so lazy share glyphs recompose after prefetch / sheet load.
+                        @Suppress("UNUSED_EXPRESSION")
+                        shareAffordanceEpoch
                         NotesTreeItem(
                             row = row,
                             selected = row.documentId == selectedId,
+                            lang = lang,
+                            canShare = canShare(row),
+                            showsShared = showsShared(row),
                             onToggleExpand = { onToggleExpand(row.documentId) },
                             onOpen = { onOpen(row) },
                             onLongCreateHere = { onCreateNoteHere(row) },
+                            onShare = { onShare(row) },
+                            onPrefetchShare = { onPrefetchShare(row) },
                             onDelete = { onDeleteNote(row) }
                         )
                         Divider(
@@ -2251,13 +2285,21 @@ private fun NotesTreePane(
 private fun NotesTreeItem(
     row: NoteTreeRow,
     selected: Boolean,
+    lang: String,
+    canShare: Boolean,
+    showsShared: Boolean,
     onToggleExpand: () -> Unit,
     onOpen: () -> Unit,
     onLongCreateHere: () -> Unit,
+    onShare: () -> Unit,
+    onPrefetchShare: () -> Unit,
     onDelete: () -> Unit
 ) {
     val indent = (row.depth * 20).dp
     var showMenu by remember { mutableStateOf(false) }
+    LaunchedEffect(showMenu) {
+        if (showMenu) onPrefetchShare()
+    }
     Box {
     Row(
         modifier = Modifier
@@ -2306,6 +2348,15 @@ private fun NotesTreeItem(
                 maxLines = 1
             )
         }
+
+        if (showsShared) {
+            Icon(
+                imageVector = Icons.Default.People,
+                contentDescription = ShareSheetStrings.shareMenu(lang),
+                tint = Color(0xFF8E8E93),
+                modifier = Modifier.size(18.dp)
+            )
+        }
     }
         DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
             DropdownMenuItem(
@@ -2313,6 +2364,25 @@ private fun NotesTreeItem(
                 onClick = {
                     showMenu = false
                     onLongCreateHere()
+                }
+            )
+            DropdownMenuItem(
+                text = {
+                    Column {
+                        Text(ShareSheetStrings.shareMenu(lang))
+                        if (!canShare) {
+                            Text(
+                                ShareSheetStrings.notInCloudYet(lang),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFF8E8E93)
+                            )
+                        }
+                    }
+                },
+                enabled = canShare,
+                onClick = {
+                    showMenu = false
+                    onShare()
                 }
             )
             if (row.relativePath.replace('\\', '/').trim('/').isNotEmpty()) {
