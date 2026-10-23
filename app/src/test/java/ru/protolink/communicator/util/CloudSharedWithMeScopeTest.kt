@@ -181,6 +181,18 @@ class CloudSharedWithMeScopeTest {
         assertThat(ShareSheetCloudStrings.leaveSuccess("ru")).isEqualTo("Убрано из «Доступные мне»")
         assertThat(ShareSheetCloudStrings.leaveFailed("en")).isEqualTo("Couldn't leave. Try again.")
         assertThat(ShareSheetCloudStrings.leaveFailed("ru")).isEqualTo("Не удалось покинуть. Повторите.")
+
+        // UX-LS-3: post-leave listing reload must not clobber §7b success with "Cloud loaded".
+        val leaveEn = ShareSheetCloudStrings.leaveSuccess("en")
+        val leaveRu = ShareSheetCloudStrings.leaveSuccess("ru")
+        assertThat(CloudListingStatus.afterReload(leaveEn)).isEqualTo(leaveEn)
+        assertThat(CloudListingStatus.afterReload(leaveRu)).isEqualTo(leaveRu)
+        assertThat(CloudListingStatus.afterReload(null))
+            .isEqualTo(CloudListingStatus.DEFAULT_LOADED)
+        assertThat(CloudListingStatus.afterReload("   "))
+            .isEqualTo(CloudListingStatus.DEFAULT_LOADED)
+        assertThat(CloudListingStatus.afterReload(leaveEn))
+            .isNotEqualTo(CloudListingStatus.DEFAULT_LOADED)
     }
 
     @Test

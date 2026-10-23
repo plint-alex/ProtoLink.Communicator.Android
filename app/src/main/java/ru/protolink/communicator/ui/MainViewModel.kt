@@ -42,6 +42,7 @@ import ru.protolink.communicator.data.messenger.MessengerChatFolderResolver
 import ru.protolink.communicator.data.messenger.PendingAttachmentDraft
 import ru.protolink.communicator.data.messenger.ProgressRequestBody
 import ru.protolink.communicator.util.ChatTime
+import ru.protolink.communicator.util.CloudListingStatus
 import ru.protolink.communicator.util.CloudRecentList
 import ru.protolink.communicator.util.CloudSharedScope
 import ru.protolink.communicator.util.CloudVirtualNodes
@@ -649,7 +650,7 @@ class MainViewModel @Inject constructor(
         loadCloudFolder(CloudVirtualNodes.HUB_ID)
     }
 
-    fun loadCloudFolder(folderId: String) = viewModelScope.launch {
+    fun loadCloudFolder(folderId: String, statusAfterLoad: String? = null) = viewModelScope.launch {
         currentFolderId = folderId
         val lang = uiLang()
         val items = when {
@@ -672,7 +673,9 @@ class MainViewModel @Inject constructor(
                 }
             }
         }
-        _state.update { it.copy(cloudItems = items, status = "Cloud loaded") }
+        _state.update {
+            it.copy(cloudItems = items, status = CloudListingStatus.afterReload(statusAfterLoad))
+        }
     }
 
     private fun buildHubListing(lang: String): List<CloudItem> {
@@ -822,6 +825,7 @@ class MainViewModel @Inject constructor(
         val id = entityId.takeIf { it.isNotBlank() && !CloudVirtualNodes.isVirtual(it) } ?: return@launch
         val lang = uiLang()
         val wasOpenRoot = currentFolderId.equals(id, ignoreCase = true)
+        val leaveSuccess = ShareSheetCloudStrings.leaveSuccess(lang)
         try {
             api.leaveSharedWithMe(LeaveSharedWithMeRequest(entityId = id))
             val nextCanWrite = _state.value.shareRootCanWrite.toMutableMap().apply {
@@ -832,24 +836,24 @@ class MainViewModel @Inject constructor(
                 it.copy(
                     shareRootCanWrite = nextCanWrite,
                     cloudItems = nextItems,
-                    status = ShareSheetCloudStrings.leaveSuccess(lang)
+                    status = leaveSuccess
                 )
             }
             if (wasOpenRoot) {
-                navigateToSharedWithMeListing(lang)
+                navigateToSharedWithMeListing(lang, statusAfterLoad = leaveSuccess)
             } else if (currentFolderId.equals(CloudVirtualNodes.SHARED_WITH_ME_ID, ignoreCase = true)) {
-                loadCloudFolder(CloudVirtualNodes.SHARED_WITH_ME_ID)
+                loadCloudFolder(CloudVirtualNodes.SHARED_WITH_ME_ID, statusAfterLoad = leaveSuccess)
             }
         } catch (_: Exception) {
             _state.update { it.copy(status = ShareSheetCloudStrings.leaveFailed(lang)) }
         }
     }
 
-    private fun navigateToSharedWithMeListing(lang: String) {
+    private fun navigateToSharedWithMeListing(lang: String, statusAfterLoad: String? = null) {
         val hub = CloudVirtualNodes.HUB_ID to ShareSheetCloudStrings.cloudHub(lang)
         val shared = CloudVirtualNodes.SHARED_WITH_ME_ID to ShareSheetCloudStrings.sharedWithMe(lang)
         _state.update { it.copy(breadcrumb = listOf(hub, shared)) }
-        loadCloudFolder(CloudVirtualNodes.SHARED_WITH_ME_ID)
+        loadCloudFolder(CloudVirtualNodes.SHARED_WITH_ME_ID, statusAfterLoad = statusAfterLoad)
     }
 
     /** Jump to a mapped folder (stories strip) with a sensible breadcrumb. */
