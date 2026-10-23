@@ -792,15 +792,9 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                     Icon(Icons.Default.IosShare, contentDescription = ShareSheetStrings.shareButton(lang), tint = igAccent)
                 }
             }
+            // Listing reload only — full mapped sync stays on the app TopAppBar (no duplicate Sync chrome).
             IconButton(onClick = { state.breadcrumb.lastOrNull()?.first?.let { vm.loadCloudFolder(it) } }) {
                 Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = igAccent)
-            }
-            IconButton(onClick = { vm.syncNow() }, enabled = !state.syncing) {
-                Icon(
-                    Icons.Default.Sync,
-                    contentDescription = "Sync",
-                    tint = if (state.syncing) Color(0xFF8E8E8E) else igAccent
-                )
             }
             if (canMutate) {
                 IconButton(onClick = { showCreateFolder = true }) {
@@ -1538,19 +1532,13 @@ private fun MessengerChatPane(
             if (contact != null) {
                 ContactAvatar(contact.displayName, size = 40.dp)
                 Spacer(Modifier.width(10.dp))
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        contact.displayName,
-                        color = Color.White,
-                        style = MaterialTheme.typography.titleMedium,
-                        maxLines = 1
-                    )
-                    Text(
-                        if (showBack) "back to chats" else "online",
-                        color = Color(0xCCFFFFFF),
-                        style = MaterialTheme.typography.labelSmall
-                    )
-                }
+                Text(
+                    contact.displayName,
+                    color = Color.White,
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 1,
+                    modifier = Modifier.weight(1f)
+                )
             } else {
                 Text(
                     "Select a chat",
