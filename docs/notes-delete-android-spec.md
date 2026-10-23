@@ -77,11 +77,12 @@ IME не нужен. Dismiss по outside/back = Cancel.
 ## 6. Поведение после Confirm → Delete
 
 1. Отменить pending autosave текущей заметки (`cancelNotesPendingSave`), если удаляем её или предка открытой (см. §6.1).
-2. Recursive SAF delete каталога цели.
-3. Если удалили **открытую** заметку **или предка** открытой — `clearSelectedNote()` (редактор пустой / возврат к дереву на phone layout).
+2. **До** FS-delete вычислить next path через `NotesDeleteNavigate.resolveNextRelativePath` (siblings из tree cache ещё содержат удаляемый узел) — правило owner: previous sibling → parent → Notes root (см. Agents `docs/features/entity-navigation/notes-delete-navigate`).
+3. Recursive SAF delete каталога цели.
 4. `refreshNotesTreeSuspend()` — узел исчезает из списка.
-5. `requestLocalPush()` — sync удалит remote counterparts по meta (как после create).
-6. Status (кратко): `Deleted “{name}”` или ошибка.
+5. Если удалили **открытую** заметку **или предка** открытой — открыть next (не `clearSelectedNote()` / blank-only): prev sibling → parent → notes root (`""` = root, показать `index.html` корня если есть).
+6. `requestLocalPush()` — sync удалит remote counterparts по meta (как после create).
+7. Status (кратко): `Deleted “{name}”` или ошибка.
 
 ### 6.1. Открытая заметка и предки
 
@@ -89,11 +90,11 @@ IME не нужен. Dismiss по outside/back = Cancel.
 
 | Цель | Редактор |
 |------|----------|
-| `A/B/C` | clear |
-| `A/B` или `A` | clear (открытый файл исчез вместе с предком) |
+| `A/B/C` | prev sibling of `C`, else parent `A/B`, else … → root |
+| `A/B` или `A` | prev sibling of удалённого предка → parent → root (открытый файл исчез с предком) |
 | сосед / другая ветка | оставить открытой |
 
-Проверка: `openRel == target \|\| openRel.startsWith(target + "/")` (нормализованные `/`).
+Проверка affected: `NotesDeleteNavigate.isOpenPageAffected` = `openRel == target \|\| openRel.startsWith(target + "/")` (нормализованные `/`).
 
 ### 6.2. Dirty editor
 
@@ -148,10 +149,9 @@ suspend/fun deleteNote(relativePath: String)
 
 ### 9.3. После FS
 
-- `clearSelectedNote()` при необходимости (§6.1)
-- `refreshNotesTreeSuspend()`
+- Resolve next **до** delete; после refresh — `openNoteByRelativePath(next)` при affected (§6 / AT-ND-1…4)
 - `requestLocalPush()`
-- Не вызывать `selectNotesNode` на удалённый путь
+- Не вызывать `selectNotesNode` / open на удалённый путь
 
 ### 9.4. UI wiring
 
@@ -181,9 +181,10 @@ suspend/fun deleteNote(relativePath: String)
 - [x] Long-press → Delete → Delete на leaf — папка и `index.html` исчезают с диска и из дерева. (adb: `force_delete_note` → `OK delete=…`, папка исчезла)
 - [ ] Delete узла с детьми — удаляются все вложенные; confirm текст про «all notes inside». — ручная проверка
 - [x] Нельзя удалить notes root.
-- [x] Delete открытой заметки — редактор очищается, selected сброшен. (код §6.1 + leaf self-test)
-- [ ] Delete предка открытой — редактор очищается. — ручная проверка
-- [ ] Delete другой ветки — текущая открытая остаётся. — ручная проверка
+- [x] Delete открытой заметки — nav prev sibling → parent → root (не blank-only). (`NotesDeleteNavigate` + unit AT-ND)
+- [x] Delete предка открытой — тот же nav rule. (unit + код §6.1)
+- [x] Delete другой ветки — текущая открытая остаётся. (AT-ND-4 unit)
+- [ ] Installed verify AT-ND-1…4 на устройстве (NFR-DELIV-1) — tester after devops install
 - [x] После delete: local push запрошен; Notes не зовёт Cloud API напрямую.
 - [x] Editor overflow «Delete note» работает для текущей страницы. (UI wiring)
 - [x] Ошибка SAF показывается пользователю; приложение не падает.
@@ -202,8 +203,10 @@ suspend/fun deleteNote(relativePath: String)
 - 2026-10-09 — confirm усиливает Win: явное предупреждение при `hasChildren`.  
 - 2026-10-09 — entry points: long-press + editor overflow; один `pendingDeleteNote` pipeline.  
 - 2026-10-09 — sync только через диск + `requestLocalPush()`.
+- 2026-10-24 — post-delete: prev sibling → parent → Notes root (owner rule; replace clearSelectedNote-only). `NotesDeleteNavigate` + AT-ND unit tests; versionName 1.0.16.
 
 ## 14. Статус реализации
 
 - 2026-10-09 — ТЗ зафиксировано.
 - 2026-10-09 — v1: `PendingDeleteNote`, long-press Delete + editor «Delete note», recursive SAF delete в `SafLocalFileSystem`, `requestLocalPush`. Self-test: `files/force_delete_note` → `files/delete_note_last.txt`.
+- 2026-10-24 — §6 nav: `NotesDeleteNavigate` (AT-ND-1…4); no clear-only happy path.

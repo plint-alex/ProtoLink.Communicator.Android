@@ -55,6 +55,7 @@ import ru.protolink.communicator.util.MessengerAtomicSend
 import ru.protolink.communicator.util.MessengerMediaLimits
 import ru.protolink.communicator.util.MessengerSendStateMachine
 import ru.protolink.communicator.util.NoteRemoteIdResolver
+import ru.protolink.communicator.util.NotesDeleteNavigate
 import ru.protolink.communicator.util.NotesTreeShare
 import ru.protolink.communicator.util.ShareAccountStrings
 import ru.protolink.communicator.util.ShareAddPeople
@@ -3175,6 +3176,7 @@ fun setNotesRoot(uri: String) {
     /**
      * Recursive delete of page folder under notes root (Windows parity).
      * Empty [relativePath] = root — refused.
+     * After delete of open page or ancestor: prev sibling → parent → notes root (never blank-only).
      */
     fun deleteNote(relativePath: String, displayName: String? = null) {
         viewModelScope.launch {
@@ -3183,16 +3185,20 @@ fun setNotesRoot(uri: String) {
                 _state.update { it.copy(syncError = "Choose a notes folder first") }
                 return@launch
             }
-            val target = relativePath.replace('\\', '/').trim('/')
+            val target = NotesDeleteNavigate.normalize(relativePath)
             if (target.isEmpty()) {
                 _state.update { it.copy(status = "Cannot delete the notes root") }
                 return@launch
             }
             val name = displayName?.ifBlank { null } ?: target.substringAfterLast('/')
-            val openRel = _state.value.selectedNoteRelativePath?.replace('\\', '/')?.trim('/').orEmpty()
-            val affectsOpen = openRel.isNotEmpty() &&
-                (openRel.equals(target, ignoreCase = true) ||
-                    openRel.startsWith("$target/", ignoreCase = true))
+            val openRel = NotesDeleteNavigate.normalize(_state.value.selectedNoteRelativePath)
+            val affectsOpen = NotesDeleteNavigate.isOpenPageAffected(openRel, target)
+            // Resolve before delete so sibling order still includes the removed folder (AT-ND-1…3).
+            val nextRel = NotesDeleteNavigate.resolveNextRelativePath(
+                deletedRelativePath = target,
+                openRelativePath = openRel,
+                siblingFolderNamesUnderParent = siblingFolderNamesUnderParent(target)
+            )
             if (affectsOpen) {
                 cancelNotesPendingSave()
             }
@@ -3208,14 +3214,68 @@ fun setNotesRoot(uri: String) {
                 runCatching { refreshNotesTreeSuspend() }
                 return@launch
             }
-            if (affectsOpen) {
-                clearSelectedNote()
-            }
             refreshNotesTreeSuspend()
+            if (affectsOpen) {
+                expandPathAncestors(nextRel)
+                refreshNotesTreeSuspend()
+                openNoteByRelativePath(nextRel)
+            }
             _state.update { it.copy(status = "Deleted “$name”") }
-            writeDeleteNoteDebugResult("OK delete=$target")
+            writeDeleteNoteDebugResult(
+                if (affectsOpen) "OK delete=$target next=${nextRel.ifEmpty { "(root)" }}"
+                else "OK delete=$target"
+            )
             requestLocalPush()
         }
+    }
+
+    /** Direct child folder names of [deletedRelativePath]'s parent (from tree cache, pre-delete). */
+    private fun siblingFolderNamesUnderParent(deletedRelativePath: String): List<String> {
+        val root = notesRootCache ?: return emptyList()
+        val parentRel = NotesDeleteNavigate.parentRelativePath(deletedRelativePath)
+        val parent = findNotesNodeByRelativePath(root, parentRel) ?: return emptyList()
+        return parent.children.map { it.name }
+    }
+
+    private fun findNotesNodeByRelativePath(
+        root: NotesTreeBuilder.Node,
+        relativePath: String
+    ): NotesTreeBuilder.Node? {
+        val rel = NotesDeleteNavigate.normalize(relativePath)
+        if (rel.isEmpty()) return root
+        var cur = root
+        for (part in rel.split('/').filter { it.isNotEmpty() }) {
+            cur = cur.children.firstOrNull { it.name.equals(part, ignoreCase = true) } ?: return null
+        }
+        return cur
+    }
+
+    private fun notesNodeToRow(node: NotesTreeBuilder.Node): NoteTreeRow {
+        val rel = NotesDeleteNavigate.normalize(node.relativePath)
+        val depth = if (rel.isEmpty()) 0 else rel.count { it == '/' } + 1
+        return NoteTreeRow(
+            documentId = node.documentId,
+            safDocumentId = node.safDocumentId,
+            name = node.name,
+            relativePath = node.relativePath,
+            depth = depth,
+            hasChildren = node.children.isNotEmpty(),
+            expanded = _state.value.notesExpandedIds.contains(node.documentId),
+            folderUri = node.folderUri.toString(),
+            indexUri = node.indexUri?.toString()
+        )
+    }
+
+    /** Open note by relative path after tree refresh; empty = notes root (not blank editor). */
+    private suspend fun openNoteByRelativePath(relativePath: String) {
+        val root = notesRootCache
+        if (root == null) {
+            clearSelectedNote()
+            return
+        }
+        val rel = NotesDeleteNavigate.normalize(relativePath)
+        val node = findNotesNodeByRelativePath(root, rel) ?: root
+        openNotesNode(notesNodeToRow(node))
     }
 
     private fun writeDeleteNoteDebugResult(line: String) {
