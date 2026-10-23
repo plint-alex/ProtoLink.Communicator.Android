@@ -32,22 +32,23 @@ android {
         buildConfigField("String", "API_BASE_URL", "\"${project.findProperty("PROTOLINK_API_BASE_URL") ?: "http://protolink.ru/"}\"")
     }
 
+    // Release signingConfig only when keystore.properties exists so Debug CI
+    // (assembleDebug / testDebugUnitTest) configures without secrets.
     signingConfigs {
-        create("release") {
-            check(keystorePropertiesFile.isFile) {
-                "Release signing requires gitignored keystore.properties (see README). Keystore must live outside git."
+        if (keystorePropertiesFile.isFile) {
+            create("release") {
+                storeFile = file(keystoreProperties.getProperty("storeFile")
+                    ?: error("keystore.properties missing storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                    ?: error("keystore.properties missing storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                    ?: error("keystore.properties missing keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+                    ?: error("keystore.properties missing keyPassword")
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
             }
-            storeFile = file(keystoreProperties.getProperty("storeFile")
-                ?: error("keystore.properties missing storeFile"))
-            storePassword = keystoreProperties.getProperty("storePassword")
-                ?: error("keystore.properties missing storePassword")
-            keyAlias = keystoreProperties.getProperty("keyAlias")
-                ?: error("keystore.properties missing keyAlias")
-            keyPassword = keystoreProperties.getProperty("keyPassword")
-                ?: error("keystore.properties missing keyPassword")
-            enableV1Signing = true
-            enableV2Signing = true
-            enableV3Signing = true
         }
     }
 
@@ -55,7 +56,9 @@ android {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = signingConfigs.getByName("release")
+            if (keystorePropertiesFile.isFile) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
         debug {
             applicationIdSuffix = ".debug"
@@ -153,6 +156,11 @@ appExt.applicationVariants.configureEach {
 // afterEvaluate: assembleRelease is a lifecycle task created by AGP; configureEach-before-creation can miss doLast.
 afterEvaluate {
     tasks.named("assembleRelease").configure {
+        doFirst {
+            check(keystorePropertiesFile.isFile) {
+                "Release signing requires gitignored keystore.properties (see README). Keystore must live outside git."
+            }
+        }
         doLast {
             val builtApk = layout.buildDirectory.file("outputs/apk/release/$versionedApkName").get().asFile
             if (!builtApk.isFile) {

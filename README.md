@@ -38,7 +38,7 @@ export JAVA_HOME=/path/to/jdk-17
 
 Version source of truth: `app/build.gradle.kts` (`versionName` + `versionCode` only). Do not duplicate those numbers elsewhere.
 
-Release builds are signed with **v1 + v2 + v3**: `signingConfigs.release` in `app/build.gradle.kts`, then `assembleRelease` re-signs with `apksigner` (`--min-sdk-version 19`) so OEM scanners see a JAR cert under `META-INF` (AGP alone can omit usable v1 when `minSdk` ≥ 24). Credentials come from a gitignored `keystore.properties` at the repo root (never commit it). The keystore file itself lives **outside** the repo.
+Release builds are signed with **v1 + v2 + v3**: `signingConfigs.release` in `app/build.gradle.kts`, then `assembleRelease` re-signs with `apksigner` (`--min-sdk-version 19`) so OEM scanners see a JAR cert under `META-INF` (AGP alone can omit usable v1 when `minSdk` ≥ 24). Credentials come from a gitignored `keystore.properties` at the repo root (never commit it). The keystore file itself lives **outside** the repo. Debug CI (`assembleDebug` / `testDebugUnitTest`) does not need that file — release signing is registered only when it is present; `assembleRelease` fails at task start if it is missing.
 
 On this Agents machine the release keystore path is:
 
