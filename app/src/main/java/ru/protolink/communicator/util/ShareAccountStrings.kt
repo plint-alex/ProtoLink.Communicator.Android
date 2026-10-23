@@ -20,7 +20,11 @@ object ShareAccountStrings {
     fun copyContactIdLabel(lang: String?): String =
         if (ShareSheetCloudStrings.isRussian(lang)) "Скопировать ID контакта" else "Copy contact id"
 
-    /** D-format Guid for Add contact / Share paste; null when unresolved. */
+    /** Cloud / Notes: copy entity Guid (raw D), not the canonical URL. */
+    fun copyIdLabel(lang: String?): String =
+        if (ShareSheetCloudStrings.isRussian(lang)) "Копировать id" else "Copy id"
+
+    /** D-format Guid for Add contact / Share paste / Cloud Copy id; null when unresolved. */
     fun formatUserIdForClipboard(userId: String?): String? {
         val raw = userId?.trim()?.takeIf { it.isNotEmpty() } ?: return null
         return try {
@@ -31,4 +35,7 @@ object ShareAccountStrings {
             null
         }
     }
+
+    /** Entity Guid D for Cloud Copy id; same gate as [formatUserIdForClipboard]. */
+    fun formatEntityIdForClipboard(entityId: String?): String? = formatUserIdForClipboard(entityId)
 }

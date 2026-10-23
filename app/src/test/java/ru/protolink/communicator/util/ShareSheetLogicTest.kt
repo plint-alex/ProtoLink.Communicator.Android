@@ -27,14 +27,20 @@ class ShareSheetLogicTest {
         assertThat(ShareAccountStrings.copyMyIdLabel("ru-RU")).isEqualTo("Скопировать мой ID")
         assertThat(ShareAccountStrings.copyContactIdLabel("en")).isEqualTo("Copy contact id")
         assertThat(ShareAccountStrings.copyContactIdLabel("ru-RU")).isEqualTo("Скопировать ID контакта")
+        assertThat(ShareAccountStrings.copyIdLabel("en")).isEqualTo("Copy id")
+        assertThat(ShareAccountStrings.copyIdLabel("ru-RU")).isEqualTo("Копировать id")
         assertThat(
             ShareAccountStrings.formatUserIdForClipboard("8F3A1111-2222-3333-4444-555555555555")
+        ).isEqualTo("8f3a1111-2222-3333-4444-555555555555")
+        assertThat(
+            ShareAccountStrings.formatEntityIdForClipboard("8F3A1111-2222-3333-4444-555555555555")
         ).isEqualTo("8f3a1111-2222-3333-4444-555555555555")
         assertThat(ShareAccountStrings.formatUserIdForClipboard("")).isNull()
         assertThat(ShareAccountStrings.formatUserIdForClipboard("not-a-guid")).isNull()
         assertThat(
             ShareAccountStrings.formatUserIdForClipboard("00000000-0000-0000-0000-000000000000")
         ).isNull()
+        assertThat(ShareAccountStrings.formatEntityIdForClipboard("")).isNull()
     }
 
     @Test

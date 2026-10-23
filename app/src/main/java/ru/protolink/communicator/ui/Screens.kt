@@ -1091,6 +1091,13 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                             }
                         )
                         DropdownMenuItem(
+                            text = { Text(ShareAccountStrings.copyIdLabel(lang)) },
+                            onClick = {
+                                itemMenuId = null
+                                vm.copyEntityId(item.id)
+                            }
+                        )
+                        DropdownMenuItem(
                             text = { Text(ShareSheetStrings.shareButton(lang)) },
                             onClick = {
                                 itemMenuId = null

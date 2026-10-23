@@ -940,6 +940,13 @@ class MainViewModel @Inject constructor(
         copyTextToClipboard(url, ShareSheetStrings.copied(uiLang()))
     }
 
+    /** Cloud row: copy entity Guid D (not URL). No-op for virtual hub rows / invalid ids. */
+    fun copyEntityId(entityId: String?) {
+        if (entityId.isNullOrBlank() || CloudVirtualNodes.isVirtual(entityId)) return
+        val text = ShareAccountStrings.formatEntityIdForClipboard(entityId) ?: return
+        copyTextToClipboard(text, ShareAccountStrings.copiedLabel(uiLang()))
+    }
+
     fun copyMyUserId() {
         val id = auth.current()?.userId ?: return
         copyTextToClipboard(id, ShareAccountStrings.copiedLabel(uiLang()))
