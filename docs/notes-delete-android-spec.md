@@ -184,7 +184,7 @@ suspend/fun deleteNote(relativePath: String)
 - [x] Delete открытой заметки — nav prev sibling → parent → root (не blank-only). (`NotesDeleteNavigate` + unit AT-ND)
 - [x] Delete предка открытой — тот же nav rule. (unit + код §6.1)
 - [x] Delete другой ветки — текущая открытая остаётся. (AT-ND-4 unit)
-- [ ] Installed verify AT-ND-1…4 на устройстве (NFR-DELIV-1) — tester after devops install
+- [x] Installed verify AT-ND-1…4 на устройстве (NFR-DELIV-1) — tester PASS 2026-10-24 on emulator-5554 1.0.16/vCode17 (`roles/tester/done/P1-20261024-verify-notes-delete-nav-android`)
 - [x] После delete: local push запрошен; Notes не зовёт Cloud API напрямую.
 - [x] Editor overflow «Delete note» работает для текущей страницы. (UI wiring)
 - [x] Ошибка SAF показывается пользователю; приложение не падает.
