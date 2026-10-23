@@ -27,6 +27,8 @@ class ShareSheetLogicTest {
         assertThat(ShareAccountStrings.copyMyIdLabel("ru-RU")).isEqualTo("Скопировать мой ID")
         assertThat(ShareAccountStrings.copyContactIdLabel("en")).isEqualTo("Copy contact id")
         assertThat(ShareAccountStrings.copyContactIdLabel("ru-RU")).isEqualTo("Скопировать ID контакта")
+        assertThat(ShareAccountStrings.contactInformationLabel("en")).isEqualTo("Contact information")
+        assertThat(ShareAccountStrings.contactInformationLabel("ru-RU")).isEqualTo("Информация о контакте")
         assertThat(ShareAccountStrings.copyIdLabel("en")).isEqualTo("Copy id")
         assertThat(ShareAccountStrings.copyIdLabel("ru-RU")).isEqualTo("Копировать id")
         assertThat(
@@ -41,6 +43,17 @@ class ShareSheetLogicTest {
             ShareAccountStrings.formatUserIdForClipboard("00000000-0000-0000-0000-000000000000")
         ).isNull()
         assertThat(ShareAccountStrings.formatEntityIdForClipboard("")).isNull()
+    }
+
+    @Test
+    fun contactInformationUrl_matchesEntityLinksFormat() {
+        val id = "8F3A1111-2222-3333-4444-555555555555"
+        val resolved = ShareAccountStrings.formatUserIdForClipboard(id)
+        assertThat(resolved).isEqualTo("8f3a1111-2222-3333-4444-555555555555")
+        assertThat(ShareSheetLogic.buildCanonicalLink("https://protolink.ru/", resolved!!))
+            .isEqualTo("https://protolink.ru/8f3a1111-2222-3333-4444-555555555555")
+        assertThat(ShareAccountStrings.formatUserIdForClipboard(null)).isNull()
+        assertThat(ShareAccountStrings.formatUserIdForClipboard("")).isNull()
     }
 
     @Test

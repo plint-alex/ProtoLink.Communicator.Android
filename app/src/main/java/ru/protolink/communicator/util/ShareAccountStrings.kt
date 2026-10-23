@@ -20,6 +20,10 @@ object ShareAccountStrings {
     fun copyContactIdLabel(lang: String?): String =
         if (ShareSheetCloudStrings.isRussian(lang)) "Скопировать ID контакта" else "Copy contact id"
 
+    /** Messenger: open contact’s public user home in the browser. */
+    fun contactInformationLabel(lang: String?): String =
+        if (ShareSheetCloudStrings.isRussian(lang)) "Информация о контакте" else "Contact information"
+
     /** Cloud / Notes: copy entity Guid (raw D), not the canonical URL. */
     fun copyIdLabel(lang: String?): String =
         if (ShareSheetCloudStrings.isRussian(lang)) "Копировать id" else "Copy id"

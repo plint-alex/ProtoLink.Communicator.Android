@@ -1280,6 +1280,7 @@ fun MessengerScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = t
                 onRefresh = { vm.loadContacts() },
                 onSelect = { vm.selectContact(it) },
                 onCopyContactId = { vm.copyContactUserId(it.userId) },
+                onOpenContactInformation = { vm.openContactInformation(it.userId) },
                 uiLang = messengerUiLang,
                 modifier = Modifier.fillMaxSize()
             )
@@ -1313,6 +1314,7 @@ fun MessengerScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = t
                 onRefresh = { vm.loadContacts() },
                 onSelect = { vm.selectContact(it) },
                 onCopyContactId = { vm.copyContactUserId(it.userId) },
+                onOpenContactInformation = { vm.openContactInformation(it.userId) },
                 uiLang = messengerUiLang,
                 modifier = Modifier.weight(0.38f)
             )
@@ -1356,6 +1358,7 @@ private fun MessengerContactsPane(
     onRefresh: () -> Unit,
     onSelect: (ContactItem) -> Unit,
     onCopyContactId: (ContactItem) -> Unit,
+    onOpenContactInformation: (ContactItem) -> Unit,
     uiLang: String,
     modifier: Modifier = Modifier
 ) {
@@ -1411,13 +1414,22 @@ private fun MessengerContactsPane(
                         }
                     }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        val idResolved = ShareAccountStrings.formatUserIdForClipboard(c.userId) != null
+                        DropdownMenuItem(
+                            text = { Text(ShareAccountStrings.contactInformationLabel(uiLang)) },
+                            onClick = {
+                                menuOpen = false
+                                onOpenContactInformation(c)
+                            },
+                            enabled = idResolved
+                        )
                         DropdownMenuItem(
                             text = { Text(ShareAccountStrings.copyContactIdLabel(uiLang)) },
                             onClick = {
                                 menuOpen = false
                                 onCopyContactId(c)
                             },
-                            enabled = ShareAccountStrings.formatUserIdForClipboard(c.userId) != null
+                            enabled = idResolved
                         )
                     }
                 }
@@ -1580,13 +1592,23 @@ private fun MessengerChatPane(
                         expanded = headerMenuOpen,
                         onDismissRequest = { headerMenuOpen = false }
                     ) {
+                        val idResolved =
+                            ShareAccountStrings.formatUserIdForClipboard(contact.userId) != null
+                        DropdownMenuItem(
+                            text = { Text(ShareAccountStrings.contactInformationLabel(uiLang)) },
+                            onClick = {
+                                headerMenuOpen = false
+                                vm.openContactInformation(contact.userId)
+                            },
+                            enabled = idResolved
+                        )
                         DropdownMenuItem(
                             text = { Text(ShareAccountStrings.copyContactIdLabel(uiLang)) },
                             onClick = {
                                 headerMenuOpen = false
                                 vm.copyContactUserId(contact.userId)
                             },
-                            enabled = ShareAccountStrings.formatUserIdForClipboard(contact.userId) != null
+                            enabled = idResolved
                         )
                     }
                 }

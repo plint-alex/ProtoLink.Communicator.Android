@@ -962,6 +962,21 @@ class MainViewModel @Inject constructor(
         copyTextToClipboard(text, ShareAccountStrings.copiedLabel(uiLang()))
     }
 
+    /** Messenger: open contact public user home in browser. No-op when Guid unresolved. */
+    fun openContactInformation(userId: String?) {
+        val id = ShareAccountStrings.formatUserIdForClipboard(userId) ?: return
+        val url = ShareSheetLogic.buildCanonicalLink(_state.value.settings.publicSiteBaseUrl, id)
+        try {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            appContext.startActivity(intent)
+        } catch (e: Exception) {
+            Log.w("ProtoLinkMessenger", "open contact information failed", e)
+            _state.update { it.copy(status = "Could not open browser") }
+        }
+    }
+
     private fun copyTextToClipboard(text: String, status: String) {
         val cm = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
         cm?.setPrimaryClip(ClipData.newPlainText("ProtoLink", text))
