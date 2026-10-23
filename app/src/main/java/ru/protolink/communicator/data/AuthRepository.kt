@@ -1,5 +1,8 @@
 package ru.protolink.communicator.data
 
+import com.google.gson.Gson
+import ru.protolink.communicator.data.api.ChangePasswordRequest
+import ru.protolink.communicator.data.api.ChangePasswordResponse
 import ru.protolink.communicator.data.api.LoginRequest
 import ru.protolink.communicator.data.api.ProtoLinkApi
 import ru.protolink.communicator.data.api.RegisterRequest
@@ -12,11 +15,18 @@ data class RegisterOutcome(
     val error: String? = null
 )
 
+data class ChangePasswordOutcome(
+    val success: Boolean,
+    val error: String? = null
+)
+
 @Singleton
 class AuthRepository @Inject constructor(
     private val api: ProtoLinkApi,
     private val tokenStore: TokenStore
 ) {
+    private val gson = Gson()
+
     val isAuthenticated: Boolean get() = tokenStore.load() != null
     fun current(): TokenData? = tokenStore.load()
 
@@ -43,6 +53,35 @@ class AuthRepository @Inject constructor(
             emailError = res.emailError,
             error = res.error
         )
+    }
+
+    /** Authenticated POST changePassword; Bearer via OkHttp interceptor. */
+    suspend fun changePassword(currentPassword: String, newPassword: String): ChangePasswordOutcome {
+        if (tokenStore.load() == null) {
+            return ChangePasswordOutcome(success = false, error = "Not signed in.")
+        }
+        return try {
+            val res = api.changePassword(ChangePasswordRequest(currentPassword, newPassword))
+            val errorRaw = if (!res.isSuccessful) res.errorBody()?.string() else null
+            val body = res.body() ?: parseChangePasswordBody(errorRaw)
+            if (res.isSuccessful && body?.success == true) {
+                ChangePasswordOutcome(success = true)
+            } else {
+                ChangePasswordOutcome(
+                    success = false,
+                    error = body?.error?.takeIf { it.isNotBlank() }
+                        ?: errorRaw?.takeIf { it.isNotBlank() }
+                        ?: "Unknown error"
+                )
+            }
+        } catch (e: Exception) {
+            ChangePasswordOutcome(success = false, error = e.message ?: "Unknown error")
+        }
+    }
+
+    private fun parseChangePasswordBody(raw: String?): ChangePasswordResponse? {
+        if (raw.isNullOrBlank()) return null
+        return runCatching { gson.fromJson(raw, ChangePasswordResponse::class.java) }.getOrNull()
     }
 
     fun logout() = tokenStore.clear()

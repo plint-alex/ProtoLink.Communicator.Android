@@ -35,6 +35,16 @@ data class RegisterResponse(
     @SerializedName("error") val error: String? = null
 )
 
+data class ChangePasswordRequest(
+    val currentPassword: String,
+    val newPassword: String
+)
+
+data class ChangePasswordResponse(
+    @SerializedName("success") val success: Boolean? = null,
+    @SerializedName("error") val error: String? = null
+)
+
 data class GetEntitiesRequest(
     val ids: List<String>? = null,
     val parentIds: List<String>? = null,
@@ -140,6 +150,9 @@ interface ProtoLinkApi {
         @Body body: RegisterRequest,
         @Query("lang") lang: String
     ): RegisterResponse
+
+    @POST("api/Authentication/changePassword")
+    suspend fun changePassword(@Body body: ChangePasswordRequest): Response<ChangePasswordResponse>
 
     @GET("api/Version")
     suspend fun getVersion(): ServerVersionResponseDto

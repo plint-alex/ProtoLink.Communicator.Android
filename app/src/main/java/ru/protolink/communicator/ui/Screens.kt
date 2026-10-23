@@ -115,6 +115,7 @@ import androidx.compose.material3.AlertDialog
 import ru.protolink.communicator.ui.share.ShareSheetScreen
 import ru.protolink.communicator.util.MapLocalFolderStrings
 import ru.protolink.communicator.util.MapLocalFolderUi
+import ru.protolink.communicator.util.ChangePasswordStrings
 import ru.protolink.communicator.util.ShareAccountStrings
 import ru.protolink.communicator.util.ShareSheetStrings
 import androidx.documentfile.provider.DocumentFile
@@ -425,11 +426,21 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
 @Composable
 fun SettingsScreen(vm: MainViewModel, state: UiState, onClose: () -> Unit) {
     var api by remember { mutableStateOf(state.settings.apiBaseAddress) }
+    var showChangePassword by remember { mutableStateOf(false) }
     val tgBg = Color(0xFFEFEFF4)
     val tgBlue = Color(0xFF2AABEE)
     val tgCell = Color.White
     val tgDivider = Color(0xFFD1D1D6)
     val tgMuted = Color(0xFF8E8E93)
+    val accountLang = remember { java.util.Locale.getDefault().toLanguageTag() }
+
+    if (showChangePassword && state.authenticated) {
+        ChangePasswordDialog(
+            vm = vm,
+            lang = accountLang,
+            onDismiss = { showChangePassword = false }
+        )
+    }
 
     Column(Modifier.fillMaxSize().background(tgBg)) {
         Row(
@@ -482,7 +493,16 @@ fun SettingsScreen(vm: MainViewModel, state: UiState, onClose: () -> Unit) {
                             }
                         )
                         Divider(Modifier.padding(start = 16.dp), color = tgDivider, thickness = 0.5.dp)
-                        val accountLang = remember { java.util.Locale.getDefault().toLanguageTag() }
+                        TgSettingsRow(
+                            title = ChangePasswordStrings.menuLabel(accountLang),
+                            subtitle = ChangePasswordStrings.menuHint(accountLang),
+                            trailing = {
+                                TextButton(onClick = { showChangePassword = true }) {
+                                    Text(ChangePasswordStrings.menuLabel(accountLang), color = tgBlue)
+                                }
+                            }
+                        )
+                        Divider(Modifier.padding(start = 16.dp), color = tgDivider, thickness = 0.5.dp)
                         TgSettingsRow(
                             title = ShareAccountStrings.copyMyIdLabel(accountLang),
                             subtitle = ShareAccountStrings.copyMyIdHint(accountLang),

@@ -621,6 +621,13 @@ class MainViewModel @Inject constructor(
         _state.update { it.copy(authenticated = false, login = "", contacts = emptyList(), messages = emptyList(), selectedContact = null) }
     }
 
+    /** Settings → Account Change password (Bearer POST changePassword). */
+    suspend fun changePasswordAsync(
+        currentPassword: String,
+        newPassword: String
+    ): ru.protolink.communicator.data.ChangePasswordOutcome =
+        auth.changePassword(currentPassword, newPassword)
+
     private var cloudRootId: String? = null
     private var currentFolderId: String? = null
 
