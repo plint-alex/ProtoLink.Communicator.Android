@@ -1,5 +1,7 @@
 package ru.protolink.communicator.util
 
+import java.util.UUID
+
 /** Account / share chrome (share-sheet-ux §4 Copy my ID). Parity with Windows ShareAccountStrings. */
 object ShareAccountStrings {
     fun copyMyIdLabel(lang: String?): String =
@@ -13,4 +15,20 @@ object ShareAccountStrings {
 
     fun copiedLabel(lang: String?): String =
         if (ShareSheetCloudStrings.isRussian(lang)) "Скопировано" else "Copied"
+
+    /** Messenger: copy another contact’s user Guid (not own Copy my ID). */
+    fun copyContactIdLabel(lang: String?): String =
+        if (ShareSheetCloudStrings.isRussian(lang)) "Скопировать ID контакта" else "Copy contact id"
+
+    /** D-format Guid for Add contact / Share paste; null when unresolved. */
+    fun formatUserIdForClipboard(userId: String?): String? {
+        val raw = userId?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return try {
+            val uuid = UUID.fromString(raw)
+            if (uuid.mostSignificantBits == 0L && uuid.leastSignificantBits == 0L) null
+            else uuid.toString()
+        } catch (_: IllegalArgumentException) {
+            null
+        }
+    }
 }

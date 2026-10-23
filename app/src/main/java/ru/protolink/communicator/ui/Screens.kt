@@ -1206,6 +1206,7 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun MessengerScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true) {
     var draft by remember { mutableStateOf("") }
@@ -1262,6 +1263,7 @@ fun MessengerScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = t
     // Compact (Telegram): contacts XOR chat. Wide: side-by-side.
     val showContacts = !compactWidth || !inChat
     val showChat = !compactWidth || inChat
+    val messengerUiLang = remember { java.util.Locale.getDefault().toLanguageTag() }
 
     if (compactWidth) {
         if (showContacts) {
@@ -1270,6 +1272,8 @@ fun MessengerScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = t
                 selectedId = null,
                 onRefresh = { vm.loadContacts() },
                 onSelect = { vm.selectContact(it) },
+                onCopyContactId = { vm.copyContactUserId(it.userId) },
+                uiLang = messengerUiLang,
                 modifier = Modifier.fillMaxSize()
             )
         } else if (showChat) {
@@ -1301,6 +1305,8 @@ fun MessengerScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = t
                 selectedId = state.selectedContact?.userId,
                 onRefresh = { vm.loadContacts() },
                 onSelect = { vm.selectContact(it) },
+                onCopyContactId = { vm.copyContactUserId(it.userId) },
+                uiLang = messengerUiLang,
                 modifier = Modifier.weight(0.38f)
             )
             MessengerChatPane(
@@ -1335,12 +1341,15 @@ private val TgAccent = Color(0xFF2AABEE)
 private val TgTickRead = Color(0xFF53BDEB)
 private val TgTickSent = Color(0xFF667781)
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MessengerContactsPane(
     contacts: List<ContactItem>,
     selectedId: String?,
     onRefresh: () -> Unit,
     onSelect: (ContactItem) -> Unit,
+    onCopyContactId: (ContactItem) -> Unit,
+    uiLang: String,
     modifier: Modifier = Modifier
 ) {
     Column(modifier.background(MaterialTheme.colorScheme.surface)) {
@@ -1356,37 +1365,53 @@ private fun MessengerContactsPane(
         Divider()
         LazyColumn(Modifier.fillMaxSize()) {
             items(contacts, key = { it.userId }) { c ->
+                var menuOpen by remember(c.userId) { mutableStateOf(false) }
                 val selected = selectedId != null && selectedId.equals(c.userId, true)
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(if (selected) Color(0x142AABEE) else Color.Transparent)
-                        .clickable { onSelect(c) }
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    ContactAvatar(c.displayName)
-                    Spacer(Modifier.width(12.dp))
-                    Text(
-                        c.displayName,
-                        style = MaterialTheme.typography.titleMedium,
-                        maxLines = 1,
-                        modifier = Modifier.weight(1f)
-                    )
-                    if (c.hasUnread) {
-                        Box(
-                            modifier = Modifier
-                                .background(TgAccent, RoundedCornerShape(percent = 50))
-                                .padding(horizontal = 8.dp, vertical = 3.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                c.unreadLabel,
-                                color = Color.White,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.SemiBold
+                Box {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(if (selected) Color(0x142AABEE) else Color.Transparent)
+                            .combinedClickable(
+                                onClick = { onSelect(c) },
+                                onLongClick = { menuOpen = true }
                             )
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        ContactAvatar(c.displayName)
+                        Spacer(Modifier.width(12.dp))
+                        Text(
+                            c.displayName,
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (c.hasUnread) {
+                            Box(
+                                modifier = Modifier
+                                    .background(TgAccent, RoundedCornerShape(percent = 50))
+                                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    c.unreadLabel,
+                                    color = Color.White,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
                         }
+                    }
+                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        DropdownMenuItem(
+                            text = { Text(ShareAccountStrings.copyContactIdLabel(uiLang)) },
+                            onClick = {
+                                menuOpen = false
+                                onCopyContactId(c)
+                            },
+                            enabled = ShareAccountStrings.formatUserIdForClipboard(c.userId) != null
+                        )
                     }
                 }
                 Divider(modifier = Modifier.padding(start = 68.dp), color = Color(0x14000000))
@@ -1539,6 +1564,25 @@ private fun MessengerChatPane(
                     maxLines = 1,
                     modifier = Modifier.weight(1f)
                 )
+                var headerMenuOpen by remember(contact.userId) { mutableStateOf(false) }
+                Box {
+                    IconButton(onClick = { headerMenuOpen = true }) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "More", tint = Color.White)
+                    }
+                    DropdownMenu(
+                        expanded = headerMenuOpen,
+                        onDismissRequest = { headerMenuOpen = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text(ShareAccountStrings.copyContactIdLabel(uiLang)) },
+                            onClick = {
+                                headerMenuOpen = false
+                                vm.copyContactUserId(contact.userId)
+                            },
+                            enabled = ShareAccountStrings.formatUserIdForClipboard(contact.userId) != null
+                        )
+                    }
+                }
             } else {
                 Text(
                     "Select a chat",

@@ -944,6 +944,16 @@ class MainViewModel @Inject constructor(
         copyTextToClipboard(id, ShareAccountStrings.copiedLabel(uiLang()))
     }
 
+    /** Messenger: copy contact user id (D format). No-op / clear status when unresolved. */
+    fun copyContactUserId(userId: String?) {
+        val text = ShareAccountStrings.formatUserIdForClipboard(userId)
+        if (text == null) {
+            _state.update { it.copy(status = "") }
+            return
+        }
+        copyTextToClipboard(text, ShareAccountStrings.copiedLabel(uiLang()))
+    }
+
     private fun copyTextToClipboard(text: String, status: String) {
         val cm = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
         cm?.setPrimaryClip(ClipData.newPlainText("ProtoLink", text))
