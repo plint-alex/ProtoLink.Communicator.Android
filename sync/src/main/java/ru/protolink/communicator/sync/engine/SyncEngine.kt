@@ -149,13 +149,11 @@ class SyncEngine(
 
             // Always download remote bytes and compare hashes. Never forge remoteHash from
             // meta or upload when remote content is unknown.
+            // null = failed/not-found → soft-fail this item; isEmpty() is legitimate empty content.
             val remoteBytes = remote.downloadFile(meta.remoteId)
-            if (remoteBytes == null || remoteBytes.isEmpty()) {
-                throw SyncException(
-                    "Remote download failed or returned empty; cannot reconcile file.",
-                    relativePath = path,
-                    localHash = localHash
-                )
+            if (remoteBytes == null) {
+                SyncRemoteDownload.logFailed("ApplyComparePhase", path, meta.remoteId)
+                continue
             }
 
             val remoteHash = ContentHashUtil.sha256Hex(remoteBytes)
@@ -369,16 +367,13 @@ class SyncEngine(
                         continue
                     }
                     // Adopt existing remote id: converge by content hash (never upload because size unknown).
+                    // null = failed/not-found → soft-fail this item; isEmpty() is legitimate empty content.
                     val cloud = remote.downloadFile(existingRemote.entry.id)
-                        ?: throw SyncException(
-                            "Remote download failed while adopting local add.",
-                            relativePath = path
+                    if (cloud == null) {
+                        SyncRemoteDownload.logFailed(
+                            "ApplyLocalPhase.Added", path, existingRemote.entry.id
                         )
-                    if (cloud.isEmpty()) {
-                        throw SyncException(
-                            "Remote download returned empty while adopting local add.",
-                            relativePath = path
-                        )
+                        continue
                     }
                     val localHash = ContentHashUtil.sha256Hex(bytes)
                     val remoteHash = ContentHashUtil.sha256Hex(cloud)

@@ -184,27 +184,161 @@ class SyncEngineTest {
     }
 
     @Test
-    fun noRemoteBytes_throwsAndDoesNotOverwriteCloud() = runTest {
+    fun comparePhase_nullDownload_softFailsAndContinuesSibling() = runTest {
+        val (store, fs, inner) = harness()
+        fs.writeFile(root, "keep.html", "keep-local-v2-body".toByteArray())
+        fs.writeFile(root, "fail.html", "fail-local-body-xx".toByteArray())
+        SyncEngine(store, fs, inner).reconcileAll(listOf(mapping))
+        val keepId = store.getAll("m1").first { it.relativePath == "keep.html" }.remoteId
+        val failId = store.getAll("m1").first { it.relativePath == "fail.html" }.remoteId
+        val keepRemoteOld = "keep-remote-old"
+        inner.uploadFile(keepId, "keep.html", keepRemoteOld.toByteArray(), "text/html")
+        store.upsert(
+            store.getAll("m1").first { it.relativePath == "keep.html" }.copy(
+                contentHash = ContentHashUtil.sha256Hex(keepRemoteOld.toByteArray()),
+                remoteUpdateTime = Instant.EPOCH
+            )
+        )
+        store.upsert(
+            store.getAll("m1").first { it.relativePath == "fail.html" }.copy(
+                contentHash = "bb",
+                remoteUpdateTime = Instant.EPOCH
+            )
+        )
+        fs.writeFile(root, "keep.html", "keep-local-v2-body".toByteArray())
+        fs.writeFile(root, "fail.html", "fail-local-body-xx".toByteArray())
+
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun downloadFile(entityId: String): ByteArray? =
+                if (entityId == failId) null else inner.downloadFile(entityId)
+        }
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        assertThat(String(inner.get(keepId)!!.bytes!!)).isEqualTo("keep-local-v2-body")
+        assertThat(String(inner.get(failId)!!.bytes!!)).isEqualTo("fail-local-body-xx")
+        assertThat(store.getAll("m1").first { it.relativePath == "fail.html" }.contentHash)
+            .isEqualTo("bb")
+        assertThat(store.getAll("m1").first { it.relativePath == "keep.html" }.contentHash)
+            .isEqualTo(ContentHashUtil.sha256Hex("keep-local-v2-body".toByteArray()))
+    }
+
+    @Test
+    fun comparePhase_nullDownload_doesNotOverwriteCloud() = runTest {
         val (store, fs, inner) = harness()
         fs.writeFile(root, "note.html", "local".toByteArray())
         SyncEngine(store, fs, inner).reconcileAll(listOf(mapping))
         val id = store.getAll("m1").first { it.relativePath == "note.html" }.remoteId
-        // Cloud still has "local"; device edits offline.
         fs.writeFile(root, "note.html", "NEWER".toByteArray())
 
         val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
             override suspend fun downloadFile(entityId: String): ByteArray? = null
             override suspend fun fileSize(entityId: String): Long? = null
         }
-        try {
-            SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
-            throw AssertionError("expected SyncException")
-        } catch (e: SyncException) {
-            assertThat(e.relativePath).isEqualTo("note.html")
-        }
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
 
-        // Without remote bytes we must not push local over unknown cloud content.
+        // Soft-fail: pass completes; without remote bytes we must not push local over unknown cloud.
         assertThat(String(inner.get(id)!!.bytes!!)).isEqualTo("local")
+        assertThat(String(fs.readFile(root, "note.html"))).isEqualTo("NEWER")
+    }
+
+    @Test
+    fun adoptLocalAdd_nullDownload_softFailsAndContinuesSibling() = runTest {
+        val (store, fs, inner) = harness()
+        val keepRemoteOld = "keep-remote-old"
+        val keepBody = "keep-sibling-upload-body"
+        // Long enough that localLooksStub is false.
+        val adoptBody = "adopt-local-add-body-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        val keepFolder = inner.addFolder("cloud-root", "keep")
+        val adoptFolder = inner.addFolder("cloud-root", "adopt")
+        val keepRemote = inner.addFile(keepFolder, "index.html", keepRemoteOld.toByteArray(), "text/html")
+        val adoptRemote = inner.addFile(adoptFolder, "index.html", "adopt-cloud".toByteArray(), "text/html")
+        // keep has meta (compare → Write); adopt has no meta → local Added adopt path.
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = keepRemote,
+                parentRemoteId = keepFolder,
+                relativePath = "keep/index.html",
+                isFolder = false,
+                sizeBytes = 1,
+                contentHash = ContentHashUtil.sha256Hex(keepRemoteOld.toByteArray()),
+                remoteUpdateTime = Instant.EPOCH
+            )
+        )
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = keepFolder,
+                parentRemoteId = "cloud-root",
+                relativePath = "keep",
+                isFolder = true,
+                sizeBytes = 0
+            )
+        )
+        fs.writeFile(root, "keep/index.html", keepBody.toByteArray())
+        fs.writeFile(root, "adopt/index.html", adoptBody.toByteArray())
+
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun downloadFile(entityId: String): ByteArray? =
+                if (entityId == adoptRemote) null else inner.downloadFile(entityId)
+        }
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        assertThat(String(inner.get(keepRemote)!!.bytes!!)).isEqualTo(keepBody)
+        assertThat(String(inner.get(adoptRemote)!!.bytes!!)).isEqualTo("adopt-cloud")
+        assertThat(store.getAll("m1").none { it.remoteId == adoptRemote }).isTrue()
+    }
+
+    @Test
+    fun comparePhase_emptyRemoteBytes_reachesHashDecideNotDownloadFailure() = runTest {
+        val (store, fs, inner) = harness()
+        // Non-stub local (len >= 64) so compare reaches hash decide with empty remote bytes.
+        val localBody = "x".repeat(64)
+        fs.writeFile(root, "note/index.html", localBody.toByteArray())
+        SyncEngine(store, fs, inner).reconcileAll(listOf(mapping))
+        val id = store.getAll("m1").first { it.relativePath == "note/index.html" }.remoteId
+        inner.uploadFile(id, "index.html", ByteArray(0), "text/html")
+        store.upsert(
+            store.getAll("m1").first { it.relativePath == "note/index.html" }.copy(
+                contentHash = "aa",
+                remoteUpdateTime = Instant.EPOCH
+            )
+        )
+        fs.writeFile(root, "note/index.html", localBody.toByteArray())
+
+        var threw: Throwable? = null
+        try {
+            SyncEngine(store, fs, inner).reconcileAll(listOf(mapping))
+        } catch (t: Throwable) {
+            threw = t
+        }
+        assertThat(threw).isInstanceOf(SyncConflictException::class.java)
+        assertThat(threw!!.message).doesNotContain("returned empty")
+        assertThat(threw.message!!.lowercase()).doesNotContain("download failed")
+    }
+
+    @Test
+    fun comparePhase_emptyRemoteMatchingEmptyLocal_completesWithoutThrow() = runTest {
+        val (store, fs, inner) = harness()
+        // Seed non-empty first so bootstrap/meta exists, then both sides empty.
+        fs.writeFile(root, "note/index.html", "seed".toByteArray())
+        SyncEngine(store, fs, inner).reconcileAll(listOf(mapping))
+        val id = store.getAll("m1").first { it.relativePath == "note/index.html" }.remoteId
+        val emptyHash = ContentHashUtil.sha256Hex(ByteArray(0))
+        inner.uploadFile(id, "index.html", ByteArray(0), "text/html")
+        fs.writeFile(root, "note/index.html", ByteArray(0))
+        store.upsert(
+            store.getAll("m1").first { it.relativePath == "note/index.html" }.copy(
+                sizeBytes = 0,
+                contentHash = emptyHash,
+                remoteUpdateTime = Instant.now()
+            )
+        )
+
+        SyncEngine(store, fs, inner).reconcileAll(listOf(mapping))
+
+        assertThat(fs.readFile(root, "note/index.html")).isEmpty()
+        assertThat(inner.get(id)!!.bytes!!).isEmpty()
     }
 
     @Test
