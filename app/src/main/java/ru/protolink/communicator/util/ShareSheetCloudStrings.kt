@@ -20,6 +20,14 @@ object ShareSheetCloudStrings {
     fun cloudHub(lang: String?): String =
         if (isRussian(lang)) "Облако" else "Cloud"
 
+    /** Cloud hub row → Photos library folder (E7 / AT-PC). */
+    fun photos(lang: String?): String =
+        if (isRussian(lang)) "Фото" else "Photos"
+
+    /** Persistent folder tree heading (AT-PC1 / AT-PC8). */
+    fun foldersTree(lang: String?): String =
+        if (isRussian(lang)) "Папки" else "Folders"
+
     /** C6 Recent hub row (EN/RU). */
     fun recent(lang: String?): String =
         if (isRussian(lang)) "Недавние" else "Recent"

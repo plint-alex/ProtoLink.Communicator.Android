@@ -42,10 +42,13 @@ import ru.protolink.communicator.data.messenger.MessengerChatFolderResolver
 import ru.protolink.communicator.data.messenger.PendingAttachmentDraft
 import ru.protolink.communicator.data.messenger.ProgressRequestBody
 import ru.protolink.communicator.util.ChatTime
+import ru.protolink.communicator.util.CloudFolderTree
 import ru.protolink.communicator.util.CloudListingStatus
+import ru.protolink.communicator.util.CloudMainParent
 import ru.protolink.communicator.util.CloudRecentList
 import ru.protolink.communicator.util.CloudSharedScope
 import ru.protolink.communicator.util.CloudVirtualNodes
+import ru.protolink.communicator.util.EntityMeta
 import ru.protolink.communicator.util.JsonValues
 import ru.protolink.communicator.util.MapLocalFolderStrings
 import ru.protolink.communicator.util.MessageStringValues
@@ -57,6 +60,7 @@ import ru.protolink.communicator.util.MessengerSendStateMachine
 import ru.protolink.communicator.util.NoteRemoteIdResolver
 import ru.protolink.communicator.util.NotesDeleteNavigate
 import ru.protolink.communicator.util.NotesTreeShare
+import ru.protolink.communicator.util.PhotosLibrary
 import ru.protolink.communicator.util.ShareAccountStrings
 import ru.protolink.communicator.util.ShareAddPeople
 import ru.protolink.communicator.util.ShareSheetCloudStrings
@@ -105,7 +109,26 @@ data class CloudItem(
     val isVirtualEntry: Boolean = false,
     /** True for Shared-with-me listing rows (share roots from S6). */
     val isShareRoot: Boolean = false,
-    val subtitle: String? = null
+    val subtitle: String? = null,
+    /** MIME when known (CloudFile open / preview). */
+    val mimeType: String? = null
+)
+
+/** Persistent Folders tree row (AT-PC1 / AT-PC8). */
+data class CloudFolderTreeRow(
+    val id: String,
+    val name: String,
+    val depth: Int,
+    val selected: Boolean
+)
+
+/** Open CloudFile preview (AT-PC2 / AT-PC4). */
+data class CloudOpenFile(
+    val id: String,
+    val name: String,
+    val mimeType: String?,
+    /** Parent folder id used for Up / tree highlight (MainParent). */
+    val parentFolderId: String?
 )
 data class ContactItem(
     val userId: String,
@@ -209,6 +232,13 @@ data class UiState(
     val settings: AppSettings = AppSettings(),
     val cloudItems: List<CloudItem> = emptyList(),
     val breadcrumb: List<Pair<String, String>> = emptyList(),
+    /** Persistent Folders tree (AT-PC1 / AT-PC8); empty on hub / virtual listings. */
+    val cloudFolderTree: List<CloudFolderTreeRow> = emptyList(),
+    /** When set, Cloud shows file preview instead of (or above) folder grid — AT-PC2/PC4. */
+    val cloudOpenFile: CloudOpenFile? = null,
+    /** Decoded preview bytes for [cloudOpenFile] when an image; null while loading or non-image. */
+    val cloudPreviewBytes: ByteArray? = null,
+    val cloudPreviewError: String? = null,
     /** Share-root id (lowercase) → CanWrite; retained while browsing Shared-with-me descendants. */
     val shareRootCanWrite: Map<String, Boolean> = emptyMap(),
     val mappings: List<CloudSyncMappingDto> = emptyList(),
@@ -278,6 +308,12 @@ class MainViewModel @Inject constructor(
     private val notesExternalShareByRemoteId = ConcurrentHashMap<String, Boolean>()
     @Volatile private var notesSharePrefetchBusy = false
     @Volatile var appInForeground: Boolean = true
+    /** Photos library CloudFolder id from photosfolder: (E7). */
+    private var photosLibraryId: String? = null
+    /** Code by folder id for tree root pick (CloudRoot vs CloudFolder). */
+    private val folderTreeCodes = mutableMapOf<String, String>()
+    private var folderTreeRefreshJob: Job? = null
+    private var previewLoadJob: Job? = null
 
     init {
         refreshAuth()
@@ -649,18 +685,28 @@ class MainViewModel @Inject constructor(
         openCloudHub()
     }
 
-    /** AT-S17: Cloud hub with My Cloud + Shared with me siblings. */
+    /** AT-S17: Cloud hub with My Cloud + Photos + Shared with me + Recent siblings. */
     fun openCloudHub() {
         val lang = uiLang()
         val hubName = ShareSheetCloudStrings.cloudHub(lang)
         currentFolderId = CloudVirtualNodes.HUB_ID
-        _state.update { it.copy(breadcrumb = listOf(CloudVirtualNodes.HUB_ID to hubName)) }
+        clearCloudFileOpen()
+        _state.update {
+            it.copy(
+                breadcrumb = listOf(CloudVirtualNodes.HUB_ID to hubName),
+                cloudFolderTree = emptyList()
+            )
+        }
         loadCloudFolder(CloudVirtualNodes.HUB_ID)
     }
 
     fun loadCloudFolder(folderId: String, statusAfterLoad: String? = null) = viewModelScope.launch {
         currentFolderId = folderId
+        clearCloudFileOpen()
         val lang = uiLang()
+        if (folderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true)) {
+            ensurePhotosLibraryId()
+        }
         val items = when {
             folderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true) -> buildHubListing(lang)
             folderId.equals(CloudVirtualNodes.SHARED_WITH_ME_ID, ignoreCase = true) ->
@@ -674,8 +720,16 @@ class MainViewModel @Inject constructor(
                 children.mapNotNull { e ->
                     val name = entityDisplayName(e)
                     when (e.code) {
-                        CloudCodes.CLOUD_FOLDER, CloudCodes.CLOUD_ROOT -> CloudItem(e.id, name, true)
-                        CloudCodes.CLOUD_FILE -> CloudItem(e.id, name, false)
+                        CloudCodes.CLOUD_FOLDER, CloudCodes.CLOUD_ROOT -> {
+                            folderTreeCodes[e.id.lowercase()] = e.code ?: CloudCodes.CLOUD_FOLDER
+                            CloudItem(e.id, name, true)
+                        }
+                        CloudCodes.CLOUD_FILE -> CloudItem(
+                            id = e.id,
+                            name = name,
+                            isFolder = false,
+                            mimeType = EntityMeta.mimeType(e)
+                        )
                         else -> null
                     }
                 }
@@ -684,23 +738,52 @@ class MainViewModel @Inject constructor(
         _state.update {
             it.copy(cloudItems = items, status = CloudListingStatus.afterReload(statusAfterLoad))
         }
+        refreshFolderTree()
+    }
+
+    private suspend fun ensurePhotosLibraryId() {
+        if (photosLibraryId != null || auth.current()?.userId == null) return
+        try {
+            val userId = auth.current()?.userId ?: return
+            val kids = api.getEntities(
+                GetEntitiesRequest(parentIds = listOf(userId), includeValues = true, take = 200)
+            )
+            photosLibraryId = PhotosLibrary.resolveLibraryIdFromUserChildren(kids)
+        } catch (_: Exception) {
+            // Best-effort; hub Photos row omitted when unresolved.
+        }
     }
 
     private fun buildHubListing(lang: String): List<CloudItem> {
         val myCloudId = cloudRootId ?: return emptyList()
-        return listOf(
+        val rows = mutableListOf(
             CloudItem(
                 id = myCloudId,
                 name = ShareSheetCloudStrings.myCloud(lang),
                 isFolder = true,
                 isVirtualEntry = false
-            ),
+            )
+        )
+        val photosLib = photosLibraryId
+        if (!photosLib.isNullOrBlank()) {
+            rows.add(
+                CloudItem(
+                    id = photosLib,
+                    name = ShareSheetCloudStrings.photos(lang),
+                    isFolder = true,
+                    isVirtualEntry = false
+                )
+            )
+        }
+        rows.add(
             CloudItem(
                 id = CloudVirtualNodes.SHARED_WITH_ME_ID,
                 name = ShareSheetCloudStrings.sharedWithMe(lang),
                 isFolder = true,
                 isVirtualEntry = true
-            ),
+            )
+        )
+        rows.add(
             CloudItem(
                 id = CloudVirtualNodes.RECENT_ID,
                 name = ShareSheetCloudStrings.recent(lang),
@@ -708,6 +791,7 @@ class MainViewModel @Inject constructor(
                 isVirtualEntry = true
             )
         )
+        return rows
     }
 
     /**
@@ -883,11 +967,30 @@ class MainViewModel @Inject constructor(
         recordRecentOpen(folderId, name.ifBlank { "Folder" }, isFolder = true)
     }
 
+    /** Open Cloud folder or file row (AT-PC3/PC4 entity open; anti-SAP). */
     fun openCloudFolder(item: CloudItem) {
-        if (!item.isFolder) return
-        // Recent rows are not children of the virtual folder — open via real Cloud path (silent skip if gone).
+        // Recent rows are not children of the virtual folder — open via real Cloud path.
         if (currentFolderId.equals(CloudVirtualNodes.RECENT_ID, ignoreCase = true)) {
             openRecentItem(item)
+            return
+        }
+        if (!item.isFolder) {
+            openCloudFileInCurrentFolder(item)
+            return
+        }
+        // Hub Photos row → library folder entity (anti-SAP AT-PC6).
+        val photosLib = photosLibraryId
+        if (currentFolderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true) &&
+            photosLib != null &&
+            item.id.equals(photosLib, ignoreCase = true)
+        ) {
+            val lang = uiLang()
+            val hub = CloudVirtualNodes.HUB_ID to ShareSheetCloudStrings.cloudHub(lang)
+            _state.update {
+                it.copy(breadcrumb = listOf(hub, item.id to ShareSheetCloudStrings.photos(lang)))
+            }
+            loadCloudFolder(item.id)
+            recordRecentOpen(item.id, ShareSheetCloudStrings.photos(lang), isFolder = true)
             return
         }
         _state.update { it.copy(breadcrumb = it.breadcrumb + (item.id to item.name)) }
@@ -895,8 +998,18 @@ class MainViewModel @Inject constructor(
         recordRecentOpen(item.id, item.name, isFolder = true)
     }
 
+    /** Tree row click → open that folder entity (AT-PC1/PC8). */
+    fun openCloudFolderTreeRow(folderId: String) {
+        if (folderId.isBlank() || CloudVirtualNodes.isVirtual(folderId)) return
+        if (currentFolderId.equals(folderId, ignoreCase = true) && _state.value.cloudOpenFile == null) {
+            return
+        }
+        viewModelScope.launch { tryOpenCloudEntity(folderId) }
+    }
+
     /**
      * Open a Recent row like normal browse; missing/forbidden skipped silently and pruned.
+     * Files open with MainParent crumbs + preview (AT-PC2/PC4).
      */
     private fun openRecentItem(item: CloudItem) = viewModelScope.launch {
         val userId = auth.current()?.userId ?: return@launch
@@ -910,26 +1023,7 @@ class MainViewModel @Inject constructor(
                 loadCloudFolder(CloudVirtualNodes.RECENT_ID)
                 return@launch
             }
-            val name = entityDisplayName(entity)
-            val isFolder =
-                entity.code == CloudCodes.CLOUD_FOLDER || entity.code == CloudCodes.CLOUD_ROOT
-            // Files: same as normal Cloud browse (no file viewer yet) — silent no-op.
-            if (!isFolder) return@launch
-
-            val lang = uiLang()
-            val hub = CloudVirtualNodes.HUB_ID to ShareSheetCloudStrings.cloudHub(lang)
-            val isRoot = entity.code == CloudCodes.CLOUD_ROOT ||
-                entity.id.equals(cloudRootId, ignoreCase = true)
-            val crumbs = if (isRoot) {
-                listOf(hub, entity.id to ShareSheetCloudStrings.myCloud(lang))
-            } else {
-                val myCloud = cloudRootId?.let { id -> id to ShareSheetCloudStrings.myCloud(lang) }
-                if (myCloud != null) listOf(hub, myCloud, entity.id to name)
-                else listOf(hub, entity.id to name)
-            }
-            _state.update { it.copy(breadcrumb = crumbs) }
-            loadCloudFolder(entity.id)
-            recordRecentOpen(entity.id, name, isFolder = true)
+            tryOpenCloudEntity(entity.id)
         } catch (_: Exception) {
             // Silent skip — keep listing; no raw errors in chrome.
         }
@@ -937,8 +1031,327 @@ class MainViewModel @Inject constructor(
 
     fun cloudNavigateTo(index: Int) {
         val crumb = _state.value.breadcrumb.getOrNull(index) ?: return
+        // AT-PC5: from a file, Up / crumb to last folder clears file preview first.
+        if (_state.value.cloudOpenFile != null && index == _state.value.breadcrumb.lastIndex) {
+            clearCloudFileOpen()
+            refreshFolderTree()
+            return
+        }
         _state.update { it.copy(breadcrumb = it.breadcrumb.take(index + 1)) }
         loadCloudFolder(crumb.first)
+    }
+
+    /** Header Up: from file → containing folder; else parent crumb (AT-PC5). */
+    fun cloudNavigateUp() {
+        val open = _state.value.cloudOpenFile
+        if (open != null) {
+            clearCloudFileOpen()
+            refreshFolderTree()
+            return
+        }
+        val last = _state.value.breadcrumb.lastIndex
+        if (last < 1) return
+        cloudNavigateTo(last - 1)
+    }
+
+    private fun openCloudFileInCurrentFolder(item: CloudItem) {
+        val parentId = currentFolderId?.takeIf { !CloudVirtualNodes.isVirtual(it) }
+        setCloudFileOpen(
+            CloudOpenFile(
+                id = item.id,
+                name = item.name,
+                mimeType = item.mimeType,
+                parentFolderId = parentId
+            )
+        )
+        recordRecentOpen(item.id, item.name, isFolder = false)
+        refreshFolderTree()
+        loadCloudFilePreview(item.id, item.mimeType, item.name)
+    }
+
+    private fun setCloudFileOpen(file: CloudOpenFile?) {
+        previewLoadJob?.cancel()
+        _state.update {
+            it.copy(
+                cloudOpenFile = file,
+                cloudPreviewBytes = null,
+                cloudPreviewError = null
+            )
+        }
+    }
+
+    private fun clearCloudFileOpen() {
+        previewLoadJob?.cancel()
+        previewLoadJob = null
+        _state.update {
+            it.copy(cloudOpenFile = null, cloudPreviewBytes = null, cloudPreviewError = null)
+        }
+    }
+
+    private fun loadCloudFilePreview(fileId: String, mimeType: String?, fileName: String?) {
+        previewLoadJob?.cancel()
+        val isImage = mimeType?.startsWith("image/", ignoreCase = true) == true ||
+            guessImageFromName(fileName)
+        if (!isImage) {
+            // Still try getImage for Photos library files without mime — server may resize.
+            previewLoadJob = viewModelScope.launch {
+                tryLoadImagePreview(fileId)
+            }
+            return
+        }
+        previewLoadJob = viewModelScope.launch {
+            tryLoadImagePreview(fileId)
+        }
+    }
+
+    private suspend fun tryLoadImagePreview(fileId: String) {
+        try {
+            val resp = api.getImage(fileId, width = 1280, height = 1280)
+            if (!resp.isSuccessful) {
+                _state.update { it.copy(cloudPreviewError = "Preview unavailable") }
+                return
+            }
+            val bytes = withContext(Dispatchers.IO) {
+                resp.body()?.bytes()
+            }
+            if (_state.value.cloudOpenFile?.id.equals(fileId, ignoreCase = true) != true) return
+            if (bytes == null || bytes.isEmpty()) {
+                _state.update { it.copy(cloudPreviewError = "Preview unavailable") }
+            } else {
+                _state.update { it.copy(cloudPreviewBytes = bytes, cloudPreviewError = null) }
+            }
+        } catch (_: Exception) {
+            if (_state.value.cloudOpenFile?.id.equals(fileId, ignoreCase = true) == true) {
+                _state.update { it.copy(cloudPreviewError = "Preview unavailable") }
+            }
+        }
+    }
+
+    private fun guessImageFromName(name: String?): Boolean {
+        if (name.isNullOrBlank()) return false
+        val lower = name.lowercase()
+        return lower.endsWith(".jpg") || lower.endsWith(".jpeg") ||
+            lower.endsWith(".png") || lower.endsWith(".gif") ||
+            lower.endsWith(".webp") || lower.endsWith(".heic")
+    }
+
+    private suspend fun tryOpenCloudEntity(entityId: String): Boolean {
+        ensurePhotosLibraryId()
+        return try {
+            val found = api.getEntities(
+                GetEntitiesRequest(ids = listOf(entityId), includeValues = true, take = 1)
+            )
+            val entity = found.firstOrNull() ?: return false
+            if (entity.code.equals(PhotosLibrary.HOST_CODE, ignoreCase = false)) {
+                val lib = photosLibraryId
+                if (lib != null && !lib.equals(entityId, ignoreCase = true)) {
+                    return tryOpenCloudEntity(lib)
+                }
+                return false
+            }
+            if (!isNavigableCloudCode(entity.code)) return false
+            val isFolder =
+                entity.code == CloudCodes.CLOUD_FOLDER || entity.code == CloudCodes.CLOUD_ROOT
+            val chain = ArrayList<Pair<EntityDto, String>>()
+            var current = entity
+            var currentMainParentId: String? = null
+            try {
+                currentMainParentId = api.getEntity(entityId).mainParentId
+            } catch (_: Exception) {
+            }
+            for (guard in 0 until 64) {
+                val onPhotosLib = photosLibraryId != null &&
+                    current.id.equals(photosLibraryId, ignoreCase = true)
+                val display = if (current.code == CloudCodes.CLOUD_ROOT) {
+                    ShareSheetCloudStrings.myCloud(uiLang())
+                } else if (onPhotosLib) {
+                    ShareSheetCloudStrings.photos(uiLang())
+                } else {
+                    entityDisplayName(current)
+                }
+                chain.add(0, current to display)
+                folderTreeCodes[current.id.lowercase()] = current.code ?: ""
+                if (current.code == CloudCodes.CLOUD_ROOT) break
+                val parents = api.getEntities(
+                    GetEntitiesRequest(
+                        idsToFindParents = listOf(current.id),
+                        includeValues = true,
+                        take = 50
+                    )
+                )
+                val parent = CloudMainParent.pickParent(currentMainParentId, parents)
+                if (parent == null || !CloudMainParent.isCloudFolderOrRoot(parent.code)) break
+                var nextMain: String? = null
+                try {
+                    nextMain = api.getEntity(parent.id).mainParentId
+                } catch (_: Exception) {
+                }
+                current = parent
+                currentMainParentId = nextMain
+            }
+            if (chain.isEmpty()) return false
+            if (chain[0].first.code == CloudCodes.CLOUD_ROOT) {
+                cloudRootId = chain[0].first.id
+            }
+            val lang = uiLang()
+            val hub = CloudVirtualNodes.HUB_ID to ShareSheetCloudStrings.cloudHub(lang)
+            val folderCrumbs = if (isFolder) {
+                chain.map { pair -> pair.first.id to pair.second }
+            } else {
+                chain.dropLast(1).map { pair -> pair.first.id to pair.second }
+            }
+            val crumbs = listOf(hub) + folderCrumbs
+            if (isFolder) {
+                _state.update { s -> s.copy(breadcrumb = crumbs) }
+                loadCloudFolder(entity.id)
+                recordRecentOpen(entity.id, entityDisplayName(entity), isFolder = true)
+            } else {
+                val parentFolder = folderCrumbs.lastOrNull()?.first
+                _state.update { s -> s.copy(breadcrumb = crumbs) }
+                if (parentFolder == null) {
+                    loadCloudFolder(CloudVirtualNodes.HUB_ID)
+                } else {
+                    currentFolderId = parentFolder
+                    val children = api.getEntities(
+                        GetEntitiesRequest(
+                            parentIds = listOf(parentFolder),
+                            includeValues = true,
+                            take = 500
+                        )
+                    )
+                    val items = children.mapNotNull { e ->
+                        val name = entityDisplayName(e)
+                        when (e.code) {
+                            CloudCodes.CLOUD_FOLDER, CloudCodes.CLOUD_ROOT -> {
+                                folderTreeCodes[e.id.lowercase()] =
+                                    e.code ?: CloudCodes.CLOUD_FOLDER
+                                CloudItem(e.id, name, true)
+                            }
+                            CloudCodes.CLOUD_FILE -> CloudItem(
+                                id = e.id,
+                                name = name,
+                                isFolder = false,
+                                mimeType = EntityMeta.mimeType(e)
+                            )
+                            else -> null
+                        }
+                    }
+                    val mime = EntityMeta.mimeType(entity)
+                    _state.update { s -> s.copy(cloudItems = items) }
+                    setCloudFileOpen(
+                        CloudOpenFile(
+                            id = entity.id,
+                            name = entityDisplayName(entity),
+                            mimeType = mime,
+                            parentFolderId = parentFolder
+                        )
+                    )
+                    recordRecentOpen(entity.id, entityDisplayName(entity), isFolder = false)
+                    refreshFolderTree()
+                    loadCloudFilePreview(entity.id, mime, entityDisplayName(entity))
+                }
+            }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun refreshFolderTree() {
+        folderTreeRefreshJob?.cancel()
+        folderTreeRefreshJob = viewModelScope.launch {
+            val listed = currentFolderId
+            if (listed.isNullOrBlank() || CloudVirtualNodes.isVirtual(listed)) {
+                _state.update { s -> s.copy(cloudFolderTree = emptyList()) }
+                return@launch
+            }
+            ensurePhotosLibraryId()
+            val crumbMeta = _state.value.breadcrumb.map { pair ->
+                val id = pair.first
+                val code = if (id.equals(cloudRootId, ignoreCase = true)) {
+                    CloudCodes.CLOUD_ROOT
+                } else {
+                    folderTreeCodes[id.lowercase()]
+                }
+                id to code
+            }
+            val rootId = CloudFolderTree.pickTreeRootId(
+                crumbMeta,
+                photosLibraryId,
+                CloudVirtualNodes::isVirtual
+            )
+            if (rootId.isNullOrBlank()) {
+                _state.update { s -> s.copy(cloudFolderTree = emptyList()) }
+                return@launch
+            }
+            try {
+                val childrenByParent = linkedMapOf<String, List<CloudFolderTree.Node>>()
+                val names = mutableMapOf<String, String>()
+                val queue = ArrayDeque<String>()
+                queue.add(rootId)
+                val crumbName = _state.value.breadcrumb.firstOrNull { pair ->
+                    pair.first.equals(rootId, ignoreCase = true)
+                }?.second
+                names[rootId] = crumbName
+                    ?: if (
+                        photosLibraryId != null &&
+                        rootId.equals(photosLibraryId, ignoreCase = true)
+                    ) {
+                        ShareSheetCloudStrings.photos(uiLang())
+                    } else {
+                        "Cloud"
+                    }
+                var folderCount = 0
+                while (queue.isNotEmpty() && folderCount < CloudFolderTree.DEFAULT_MAX_FOLDERS) {
+                    val parentId = queue.removeFirst()
+                    val still = currentFolderId
+                    if (still == null || CloudVirtualNodes.isVirtual(still)) {
+                        _state.update { s -> s.copy(cloudFolderTree = emptyList()) }
+                        return@launch
+                    }
+                    val list = api.getEntities(
+                        GetEntitiesRequest(
+                            parentIds = listOf(parentId),
+                            includeValues = false,
+                            take = 200
+                        )
+                    )
+                    val folderKids = ArrayList<CloudFolderTree.Node>()
+                    for (e in list.filter { CloudFolderTree.isFolderTreeCode(it.code) }
+                        .sortedBy { entityDisplayName(it).lowercase() }) {
+                        folderTreeCodes[e.id.lowercase()] = e.code ?: CloudCodes.CLOUD_FOLDER
+                        val name = entityDisplayName(e)
+                        names[e.id] = name
+                        if (folderCount < CloudFolderTree.DEFAULT_MAX_FOLDERS) {
+                            queue.add(e.id)
+                            folderCount++
+                        }
+                        folderKids.add(CloudFolderTree.Node(e.id, name))
+                    }
+                    childrenByParent[parentId] = folderKids
+                }
+                val openFile = _state.value.cloudOpenFile
+                val selected = CloudFolderTree.selectedFolderId(
+                    isFileOpen = openFile != null,
+                    openEntityId = if (openFile != null) openFile.id else currentFolderId,
+                    parentFolderId = openFile?.parentFolderId ?: currentFolderId
+                )
+                val flat = CloudFolderTree.flatten(
+                    CloudFolderTree.Node(rootId, names[rootId] ?: "Cloud"),
+                    childrenByParent,
+                    selected
+                )
+                _state.update { s ->
+                    s.copy(
+                        cloudFolderTree = flat.map { row ->
+                            CloudFolderTreeRow(row.id, row.name, row.depth, row.selected)
+                        }
+                    )
+                }
+            } catch (_: Exception) {
+                _state.update { s -> s.copy(cloudFolderTree = emptyList()) }
+            }
+        }
     }
 
     fun copyCanonicalLink(entityId: String?) {

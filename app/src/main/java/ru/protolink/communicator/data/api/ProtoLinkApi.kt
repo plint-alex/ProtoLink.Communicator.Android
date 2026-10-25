@@ -48,6 +48,8 @@ data class ChangePasswordResponse(
 data class GetEntitiesRequest(
     val ids: List<String>? = null,
     val parentIds: List<String>? = null,
+    /** Immediate parents of these ids (API IdsToFindParents). */
+    val idsToFindParents: List<String>? = null,
     val skip: Int = 0,
     val take: Int? = 200,
     val includeValues: Boolean = true,
@@ -68,6 +70,14 @@ data class EntityDto(
     val userWhoCreatedId: String? = null,
     /** Populated for Shared with me rows — effective CanWrite from the caller's direct grant(s). */
     val canWrite: Boolean? = null
+)
+
+/** Minimal GetEntity payload (share paste + MainParent axis AT-PC5). */
+data class GetEntityCardDto(
+    val id: String?,
+    val name: String? = null,
+    val code: String? = null,
+    val mainParentId: String? = null
 )
 
 data class EntityValueDto(
@@ -162,6 +172,13 @@ interface ProtoLinkApi {
 
     @POST("api/Entities/GetEntities")
     suspend fun getEntities(@Body body: GetEntitiesRequest): List<EntityDto>
+
+    /** GetEntity card — name + mainParentId (AT-PC5). */
+    @GET("api/Entities/GetEntity/{id}")
+    suspend fun getEntity(
+        @Path("id") id: String,
+        @Query("fromCache") fromCache: Boolean = true
+    ): GetEntityCardDto
 
     @POST("api/Entities/AddEntity")
     suspend fun addEntity(@Body body: AddEntityRequest): IdResponse

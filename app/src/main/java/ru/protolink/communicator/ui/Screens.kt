@@ -78,18 +78,24 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
 import android.provider.OpenableColumns
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import java.io.File
@@ -712,13 +718,15 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
     var headerOverflowOpen by remember { mutableStateOf(false) }
     var leaveConfirmEntityId by remember { mutableStateOf<String?>(null) }
     val lang = remember { java.util.Locale.getDefault().toLanguageTag() }
-    val folderName = state.breadcrumb.lastOrNull()?.second
+    val openFile = state.cloudOpenFile
+    val folderName = openFile?.name
+        ?: state.breadcrumb.lastOrNull()?.second
         ?: ru.protolink.communicator.util.ShareSheetCloudStrings.cloudHub(lang)
     val igSurface = Color(0xFFFAFAFA)
     val igBorder = Color(0xFFDBDBDB)
     val igAccent = Color(0xFF262626)
     val mappedIds = remember(state.mappings) { state.mappings.map { it.cloudFolderId }.toSet() }
-    val canGoUp = state.breadcrumb.size > 1
+    val canGoUp = openFile != null || state.breadcrumb.size > 1
     val currentId = state.breadcrumb.lastOrNull()?.first
     val crumbIds = remember(state.breadcrumb) { state.breadcrumb.map { it.first } }
     val isSharedListing = currentId.equals(
@@ -769,7 +777,7 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             if (canGoUp) {
-                IconButton(onClick = { vm.cloudNavigateTo(state.breadcrumb.lastIndex - 1) }) {
+                IconButton(onClick = { vm.cloudNavigateUp() }) {
                     Icon(Icons.Default.ArrowBack, contentDescription = "Up", tint = igAccent)
                 }
             }
@@ -937,18 +945,102 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
             ) {
                 items(state.breadcrumb.size) { i ->
                     val crumb = state.breadcrumb[i]
+                    val isLastFolder = i == state.breadcrumb.lastIndex && openFile == null
                     Text(
                         crumb.second,
                         fontSize = 13.sp,
-                        fontWeight = if (i == state.breadcrumb.lastIndex) FontWeight.SemiBold else FontWeight.Normal,
-                        color = if (i == state.breadcrumb.lastIndex) igAccent else Color(0xFF8E8E8E),
+                        fontWeight = if (isLastFolder) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (isLastFolder) igAccent else Color(0xFF8E8E8E),
                         modifier = Modifier.clickable { vm.cloudNavigateTo(i) }
                     )
                     if (i < state.breadcrumb.lastIndex) {
                         Text("  ›  ", fontSize = 13.sp, color = Color(0xFF8E8E8E))
                     }
                 }
+                if (openFile != null) {
+                    item {
+                        Text("  ›  ", fontSize = 13.sp, color = Color(0xFF8E8E8E))
+                        Text(
+                            openFile.name,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = igAccent
+                        )
+                    }
+                }
             }
+        }
+
+        // AT-PC1 / AT-PC8: persistent Folders tree; click opens entity (anti-SAP).
+        if (state.cloudFolderTree.isNotEmpty()) {
+            Text(
+                ru.protolink.communicator.util.ShareSheetCloudStrings.foldersTree(lang),
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color(0xFF8E8E8E)
+            )
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 180.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                state.cloudFolderTree.forEach { row ->
+                    Text(
+                        text = row.name,
+                        fontSize = 13.sp,
+                        fontWeight = if (row.selected) FontWeight.SemiBold else FontWeight.Normal,
+                        color = igAccent,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(
+                                if (row.selected) Color(0xFFEFEFEF) else Color.Transparent
+                            )
+                            .clickable { vm.openCloudFolderTreeRow(row.id) }
+                            .padding(start = (12 + row.depth * 14).dp, end = 12.dp, top = 8.dp, bottom = 8.dp)
+                    )
+                    Divider(color = igBorder, thickness = 0.5.dp)
+                }
+            }
+            Divider(color = igBorder, thickness = 0.5.dp)
+        }
+
+        // AT-PC2: file preview when a CloudFile entity is open.
+        if (openFile != null) {
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 180.dp, max = 320.dp)
+                    .background(igSurface)
+                    .padding(12.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                val bytes = state.cloudPreviewBytes
+                val err = state.cloudPreviewError
+                when {
+                    bytes != null -> {
+                        val bmp = remember(bytes) {
+                            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        }
+                        if (bmp != null) {
+                            Image(
+                                bitmap = bmp.asImageBitmap(),
+                                contentDescription = openFile.name,
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Fit
+                            )
+                        } else {
+                            Text(openFile.name, color = igAccent)
+                        }
+                    }
+                    err != null -> Text(err, color = Color(0xFF8E8E8E), fontSize = 13.sp)
+                    else -> CircularProgressIndicator(Modifier.size(28.dp), color = igAccent)
+                }
+            }
+            Divider(color = igBorder, thickness = 0.5.dp)
         }
 
         if (canMap || (currentId != null && mappedIds.contains(currentId))) {
