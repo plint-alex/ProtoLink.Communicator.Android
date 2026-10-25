@@ -122,6 +122,8 @@ import ru.protolink.communicator.ui.share.ShareSheetScreen
 import ru.protolink.communicator.util.MapLocalFolderStrings
 import ru.protolink.communicator.util.MapLocalFolderUi
 import ru.protolink.communicator.util.ChangePasswordStrings
+import ru.protolink.communicator.util.MessengerAttachMenuStrings
+import ru.protolink.communicator.util.MessengerAttachmentRender
 import ru.protolink.communicator.util.ShareAccountStrings
 import ru.protolink.communicator.util.ShareSheetStrings
 import androidx.documentfile.provider.DocumentFile
@@ -1592,7 +1594,11 @@ private fun MessengerChatPane(
     var pendingCameraFile by remember { mutableStateOf<File?>(null) }
     val uiLang = remember { java.util.Locale.getDefault().toLanguageTag() }
 
-    fun ingestUri(uri: android.net.Uri, fallbackName: String) {
+    fun ingestUri(
+        uri: android.net.Uri,
+        fallbackName: String,
+        mimeFallback: String = "image/jpeg"
+    ) {
         val cr = context.contentResolver
         var name = fallbackName
         var size = -1L
@@ -1607,7 +1613,7 @@ private fun MessengerChatPane(
         if (size < 0) {
             size = cr.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: 0L
         }
-        val mime = cr.getType(uri) ?: vm.guessMime(name)
+        val mime = cr.getType(uri) ?: vm.guessMime(name, mimeFallback)
         vm.tryAddPendingAttachment(
             localUri = uri.toString(),
             fileName = name,
@@ -1620,6 +1626,12 @@ private fun MessengerChatPane(
         ActivityResultContracts.GetContent()
     ) { uri ->
         if (uri != null) ingestUri(uri, "image.jpg")
+    }
+
+    val documentLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) ingestUri(uri, "file", mimeFallback = "application/octet-stream")
     }
 
     val takePictureLauncher = rememberLauncherForActivityResult(
@@ -1790,7 +1802,12 @@ private fun MessengerChatPane(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Icon(
-                                    if (draftItem.isCloudPick) Icons.Default.Cloud else Icons.Default.PhotoLibrary,
+                                    when {
+                                        draftItem.isCloudPick -> Icons.Default.Cloud
+                                        MessengerAttachmentRender.looksLikeImageMime(draftItem.mimeType) ->
+                                            Icons.Default.PhotoLibrary
+                                        else -> Icons.Default.InsertDriveFile
+                                    },
                                     null,
                                     tint = TgAccent,
                                     modifier = Modifier.size(20.dp)
@@ -1840,7 +1857,7 @@ private fun MessengerChatPane(
                             onDismissRequest = { attachMenuExpanded = false }
                         ) {
                             DropdownMenuItem(
-                                text = { Text("Camera") },
+                                text = { Text(MessengerAttachMenuStrings.camera(uiLang)) },
                                 onClick = {
                                     attachMenuExpanded = false
                                     onCameraClick()
@@ -1848,7 +1865,7 @@ private fun MessengerChatPane(
                                 leadingIcon = { Icon(Icons.Default.CameraAlt, null) }
                             )
                             DropdownMenuItem(
-                                text = { Text("Gallery") },
+                                text = { Text(MessengerAttachMenuStrings.gallery(uiLang)) },
                                 onClick = {
                                     attachMenuExpanded = false
                                     vm.clearAttachStatus()
@@ -1857,7 +1874,16 @@ private fun MessengerChatPane(
                                 leadingIcon = { Icon(Icons.Default.PhotoLibrary, null) }
                             )
                             DropdownMenuItem(
-                                text = { Text("Choose from Cloud") },
+                                text = { Text(MessengerAttachMenuStrings.file(uiLang)) },
+                                onClick = {
+                                    attachMenuExpanded = false
+                                    vm.clearAttachStatus()
+                                    documentLauncher.launch(arrayOf("*/*"))
+                                },
+                                leadingIcon = { Icon(Icons.Default.InsertDriveFile, null) }
+                            )
+                            DropdownMenuItem(
+                                text = { Text(MessengerAttachMenuStrings.chooseFromCloud(uiLang)) },
                                 onClick = {
                                     attachMenuExpanded = false
                                     vm.clearAttachStatus()

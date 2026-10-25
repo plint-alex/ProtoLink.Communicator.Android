@@ -1,7 +1,7 @@
 package ru.protolink.communicator.data.messenger
 
 /**
- * Local compose draft for one attachment (camera / gallery / M3 Cloud pick).
+ * Local compose draft for one attachment (camera / gallery / File… SAF / M3 Cloud pick).
  * [localUri] is a content:// or file:// the app can read until send completes
  * (empty for [isCloudPick] — entity already in Cloud).
  */

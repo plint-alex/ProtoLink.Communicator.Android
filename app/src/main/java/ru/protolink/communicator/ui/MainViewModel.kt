@@ -2836,8 +2836,8 @@ class MainViewModel @Inject constructor(
         }
         val draft = PendingAttachmentDraft(
             localUri = localUri,
-            fileName = fileName.ifBlank { "photo.jpg" },
-            mimeType = mimeType.ifBlank { "image/jpeg" },
+            fileName = fileName.ifBlank { "file" },
+            mimeType = mimeType.ifBlank { "application/octet-stream" },
             byteLength = byteLength,
             localFilePath = localFilePath
         )
