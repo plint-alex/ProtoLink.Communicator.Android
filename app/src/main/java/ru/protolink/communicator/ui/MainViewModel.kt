@@ -1712,13 +1712,14 @@ class MainViewModel @Inject constructor(
     fun shareSheetRemovePerson(permissionForId: String) = viewModelScope.launch {
         val sheet = _state.value.shareSheet
         if (!ShareSheetLogic.canMutate(sheet.isOnline, sheet.canEdit, sheet.showCreatedPanel)) return@launch
+        updateShareSheet { it.copy(peopleErrorText = null) }
         try {
             api.removePermission(
-                RemovePermissionRequest(id = sheet.entityId, permissionForId = permissionForId)
+                RemovePermissionRequest(entityId = sheet.entityId, permissionForId = permissionForId)
             )
             loadShareSheet()
-        } catch (ex: Exception) {
-            updateShareSheet { it.copy(errorText = ex.message ?: ShareSheetStrings.loadFailed(uiLang())) }
+        } catch (_: Exception) {
+            updateShareSheet { it.copy(peopleErrorText = ShareSheetStrings.removeFailed(uiLang())) }
         }
     }
 

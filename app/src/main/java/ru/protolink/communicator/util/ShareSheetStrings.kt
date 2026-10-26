@@ -147,6 +147,9 @@ object ShareSheetStrings {
     fun updateFailed(lang: String?) =
         if (ru(lang)) "Не удалось обновить ссылку. Повторите." else "Couldn't update the link. Try again."
 
+    fun removeFailed(lang: String?) =
+        if (ru(lang)) "Не удалось убрать доступ. Повторите." else "Couldn't remove access. Try again."
+
     fun loadFailed(lang: String?) =
         if (ru(lang)) "Не удалось загрузить доступ. Повторите." else "Couldn't load sharing. Try again."
 

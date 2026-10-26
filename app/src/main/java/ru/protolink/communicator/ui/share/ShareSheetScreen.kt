@@ -303,6 +303,9 @@ fun ShareSheetScreen(
                         }
                     }
                 }
+                if (!sheet.peopleErrorText.isNullOrBlank()) {
+                    Text(sheet.peopleErrorText, color = Color(0xFFFF3B30), fontSize = 13.sp)
+                }
                 if (canMutate && !sheet.showCreateForm && !sheet.showCreatedPanel) {
                     TextButton(onClick = onBeginAddPeople, enabled = canMutate && !sheet.busy) {
                         Text(ShareSheetStrings.addPeopleButton(lang))

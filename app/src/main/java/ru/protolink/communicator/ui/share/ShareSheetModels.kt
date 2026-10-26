@@ -20,6 +20,8 @@ data class ShareSheetUiState(
     val liveLinks: List<ShareLinkListItemDto> = emptyList(),
     val inactiveLinks: List<ShareLinkListItemDto> = emptyList(),
     val people: List<SharePersonUi> = emptyList(),
+    /** Shown inline under People: the sheet-level errorText is scrolled out of view there. */
+    val peopleErrorText: String? = null,
     val showCreateForm: Boolean = false,
     val showCreatedPanel: Boolean = false,
     val showCloseWithoutCopy: Boolean = false,

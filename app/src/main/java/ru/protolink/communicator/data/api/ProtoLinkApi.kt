@@ -326,7 +326,7 @@ data class ShareGrantDto(
 )
 
 data class RemovePermissionRequest(
-    val id: String,
+    val entityId: String,
     val permissionForId: String
 )
 
