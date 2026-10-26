@@ -19,12 +19,17 @@ pre{padding:8px 12px;overflow:auto;}
 code{padding:1px 4px;}
 """
 
-    fun wrap(context: Context, noteHtml: String): String {
+    /** Body / #editor inner HTML suitable for in-place refresh (same as wrap embeds). */
+    fun editorInnerHtml(noteHtml: String): String {
         val healed = healJsEscapedHtml(noteHtml.trim())
-        val inner = when {
+        return when {
             healed.isBlank() -> "<p><br></p>"
             else -> extractBodyInner(healed)
         }
+    }
+
+    fun wrap(context: Context, noteHtml: String): String {
+        val inner = editorInnerHtml(noteHtml)
         val base64 = Base64.encodeToString(inner.toByteArray(StandardCharsets.UTF_8), Base64.NO_WRAP)
         val script = context.assets.open("notes-editor.js").bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
         return """

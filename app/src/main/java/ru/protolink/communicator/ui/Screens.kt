@@ -2855,6 +2855,12 @@ private fun NotesEditorPane(
 
         key(documentId) {
             var loadedSig by remember(documentId) { mutableStateOf<Int?>(null) }
+            // Holder (not Compose state): WebViewClient / JS callbacks must see latest restore.
+            val pendingViewport = remember(documentId) {
+                object {
+                    @JvmField var value: NotesEditorViewport.State? = null
+                }
+            }
             val scheduleState = rememberUpdatedState(onScheduleSave)
             val contentState = rememberUpdatedState(content)
             val bridge = remember(documentId) {
@@ -2896,6 +2902,14 @@ private fun NotesEditorPane(
                         webViewClient = object : WebViewClient() {
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 view?.evaluateJavascript(FOCUS_SCROLL_JS, null)
+                                val restore = pendingViewport.value
+                                if (restore != null) {
+                                    pendingViewport.value = null
+                                    view?.evaluateJavascript(
+                                        NotesEditorViewport.buildRestoreScript(restore),
+                                        null
+                                    )
+                                }
                             }
                         }
                         webViewRef(this)
@@ -2905,13 +2919,25 @@ private fun NotesEditorPane(
                     webViewRef(web)
                     val sig = content.length xor content.hashCode()
                     if (loadedSig != sig) {
+                        val previousSig = loadedSig
                         loadedSig = sig
-                        val editable = NotesEditorHtml.wrap(context, content)
-                        val encoded = android.util.Base64.encodeToString(
-                            editable.toByteArray(Charsets.UTF_8),
-                            android.util.Base64.NO_WRAP
-                        )
-                        web.loadData(encoded, "text/html; charset=utf-8", "base64")
+                        if (previousSig == null) {
+                            loadNotesEditorDocument(web, context, content)
+                        } else {
+                            // Same-page refresh: prefer in-place #editor (preserve scroll/caret).
+                            val inner = NotesEditorHtml.editorInnerHtml(content)
+                            web.evaluateJavascript(NotesEditorViewport.buildCaptureScript()) { raw ->
+                                val viewport = NotesEditorViewport.parseCaptureResult(raw)
+                                web.evaluateJavascript(
+                                    NotesEditorViewport.buildApplyInnerHtmlScript(inner, viewport)
+                                ) { applied ->
+                                    if (!NotesEditorViewport.isApplySuccess(applied)) {
+                                        pendingViewport.value = viewport
+                                        loadNotesEditorDocument(web, context, content)
+                                    }
+                                }
+                            }
+                        }
                     }
                 },
                 modifier = Modifier
@@ -3099,6 +3125,15 @@ private fun flushNoteAndLeave(
         }
         vm.saveSelectedNoteNow(html.ifBlank { vm.state.value.notesContent }, clearAfter = true)
     }
+}
+
+private fun loadNotesEditorDocument(web: WebView, context: android.content.Context, content: String) {
+    val editable = NotesEditorHtml.wrap(context, content)
+    val encoded = android.util.Base64.encodeToString(
+        editable.toByteArray(Charsets.UTF_8),
+        android.util.Base64.NO_WRAP
+    )
+    web.loadData(encoded, "text/html; charset=utf-8", "base64")
 }
 
 /** Keep caret visible above the soft keyboard inside the contenteditable WebView. */
