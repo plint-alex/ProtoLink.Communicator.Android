@@ -69,9 +69,9 @@ object MessengerImageDownscale {
         originalFileName: String
     ): DownscaledImage? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        openDecodeStream(context, uri, localFilePath)?.use { stream ->
-            BitmapFactory.decodeStream(stream, null, bounds)
-        } ?: return null
+        val boundsStream = openDecodeStream(context, uri, localFilePath) ?: return null
+        // inJustDecodeBounds always returns null; dimensions land in bounds.outWidth/outHeight.
+        boundsStream.use { BitmapFactory.decodeStream(it, null, bounds) }
         val srcW = bounds.outWidth
         val srcH = bounds.outHeight
         if (srcW <= 0 || srcH <= 0) return null

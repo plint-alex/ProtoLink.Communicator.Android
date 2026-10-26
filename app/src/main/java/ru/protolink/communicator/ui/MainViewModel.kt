@@ -2871,6 +2871,7 @@ class MainViewModel @Inject constructor(
                     localFilePath = prepared.file.absolutePath
                 )
             } else {
+                Log.w("ProtoLinkChat", "image downscale fell back to original: $name ($mime, $byteLength B)")
                 if (MessengerMediaLimits.isOversize(byteLength)) {
                     _state.update { it.copy(attachStatusMessage = MessengerMediaLimits.OversizeMessageEn) }
                     return@launch
