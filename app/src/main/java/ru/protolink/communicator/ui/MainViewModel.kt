@@ -55,8 +55,10 @@ import ru.protolink.communicator.util.MessageStringValues
 import ru.protolink.communicator.util.MessengerAttachmentRender
 import ru.protolink.communicator.util.MessengerConversationScope
 import ru.protolink.communicator.util.MessengerAtomicSend
+import ru.protolink.communicator.util.MessengerImageDownscale
 import ru.protolink.communicator.util.MessengerMediaLimits
 import ru.protolink.communicator.util.MessengerSendStateMachine
+import androidx.core.content.FileProvider
 import ru.protolink.communicator.util.NoteRemoteIdResolver
 import ru.protolink.communicator.util.NotesDeleteNavigate
 import ru.protolink.communicator.util.NotesTreeShare
@@ -2816,7 +2818,7 @@ class MainViewModel @Inject constructor(
         _state.update { it.copy(attachStatusMessage = MessengerMediaLimits.CameraPermissionDeniedEn) }
     }
 
-    /** Returns false when refused (oversize / soft cap). */
+    /** Returns false when refused (oversize / soft cap). Image downscale runs off main when enabled. */
     fun tryAddPendingAttachment(
         localUri: String,
         fileName: String,
@@ -2830,19 +2832,74 @@ class MainViewModel @Inject constructor(
             _state.update { it.copy(attachStatusMessage = MessengerMediaLimits.CapRefuseEn) }
             return false
         }
-        if (MessengerMediaLimits.isOversize(byteLength)) {
-            _state.update { it.copy(attachStatusMessage = MessengerMediaLimits.OversizeMessageEn) }
-            return false
+        val name = fileName.ifBlank { "file" }
+        val mime = mimeType.ifBlank { "application/octet-stream" }
+        val reduceOn = _state.value.settings.reducePhotoSizeBeforeSend
+        val wantDownscale = MessengerImageDownscale.shouldApply(reduceOn, mime, isCloudPick = false)
+        if (!wantDownscale) {
+            if (MessengerMediaLimits.isOversize(byteLength)) {
+                _state.update { it.copy(attachStatusMessage = MessengerMediaLimits.OversizeMessageEn) }
+                return false
+            }
+            commitPendingAttachment(localUri, name, mime, byteLength, localFilePath)
+            return true
+        }
+        viewModelScope.launch {
+            val prepared = withContext(Dispatchers.IO) {
+                MessengerImageDownscale.encodeToCacheJpeg(
+                    context = appContext,
+                    uri = Uri.parse(localUri),
+                    localFilePath = localFilePath,
+                    originalFileName = name
+                )
+            }
+            if (prepared != null) {
+                val contentUri = FileProvider.getUriForFile(
+                    appContext,
+                    "${appContext.packageName}.fileprovider",
+                    prepared.file
+                ).toString()
+                if (MessengerMediaLimits.isOversize(prepared.byteLength)) {
+                    _state.update { it.copy(attachStatusMessage = MessengerMediaLimits.OversizeMessageEn) }
+                    return@launch
+                }
+                commitPendingAttachment(
+                    localUri = contentUri,
+                    fileName = prepared.fileName,
+                    mimeType = prepared.mimeType,
+                    byteLength = prepared.byteLength,
+                    localFilePath = prepared.file.absolutePath
+                )
+            } else {
+                if (MessengerMediaLimits.isOversize(byteLength)) {
+                    _state.update { it.copy(attachStatusMessage = MessengerMediaLimits.OversizeMessageEn) }
+                    return@launch
+                }
+                commitPendingAttachment(localUri, name, mime, byteLength, localFilePath)
+            }
+        }
+        return true
+    }
+
+    private fun commitPendingAttachment(
+        localUri: String,
+        fileName: String,
+        mimeType: String,
+        byteLength: Long,
+        localFilePath: String?
+    ) {
+        if (_state.value.pendingAttachments.size >= 50) {
+            _state.update { it.copy(attachStatusMessage = MessengerMediaLimits.CapRefuseEn) }
+            return
         }
         val draft = PendingAttachmentDraft(
             localUri = localUri,
-            fileName = fileName.ifBlank { "file" },
-            mimeType = mimeType.ifBlank { "application/octet-stream" },
+            fileName = fileName,
+            mimeType = mimeType,
             byteLength = byteLength,
             localFilePath = localFilePath
         )
         _state.update { it.copy(pendingAttachments = it.pendingAttachments + draft) }
-        return true
     }
 
     /** M3 — queue an existing CloudFile by id (no local path, no copy / addFile). */

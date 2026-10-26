@@ -40,7 +40,10 @@ class SettingsStore @Inject constructor(@ApplicationContext context: Context) {
 
     fun load(): AppSettings {
         val json = prefs.getString("settings", null) ?: return AppSettings()
-        return runCatching { gson.fromJson(json, AppSettings::class.java) }.getOrDefault(AppSettings())
+        val parsed = runCatching { gson.fromJson(json, AppSettings::class.java) }.getOrDefault(AppSettings())
+        // Gson sets absent boolean fields to false; default for new installs / old JSON is ON.
+        return if (json.contains("\"reducePhotoSizeBeforeSend\"")) parsed
+        else parsed.copy(reducePhotoSizeBeforeSend = true)
     }
 
     fun save(settings: AppSettings) {

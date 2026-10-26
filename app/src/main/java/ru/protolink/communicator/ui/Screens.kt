@@ -124,6 +124,7 @@ import ru.protolink.communicator.util.MapLocalFolderUi
 import ru.protolink.communicator.util.ChangePasswordStrings
 import ru.protolink.communicator.util.MessengerAttachMenuStrings
 import ru.protolink.communicator.util.MessengerAttachmentRender
+import ru.protolink.communicator.util.MessengerImageDownscaleStrings
 import ru.protolink.communicator.util.ShareAccountStrings
 import ru.protolink.communicator.util.ShareSheetStrings
 import androidx.documentfile.provider.DocumentFile
@@ -534,6 +535,26 @@ fun SettingsScreen(vm: MainViewModel, state: UiState, onClose: () -> Unit) {
                             ) { Text("Sign in / Create account") }
                         }
                     }
+                }
+            }
+
+            item {
+                TgSettingsSectionLabel("Messenger")
+                TgSettingsCard {
+                    TgSettingsRow(
+                        title = MessengerImageDownscaleStrings.toggleTitle(accountLang),
+                        subtitle = MessengerImageDownscaleStrings.toggleHint(accountLang),
+                        trailing = {
+                            Switch(
+                                checked = state.settings.reducePhotoSizeBeforeSend,
+                                onCheckedChange = { on ->
+                                    vm.saveSettings(
+                                        state.settings.copy(reducePhotoSizeBeforeSend = on)
+                                    )
+                                }
+                            )
+                        }
+                    )
                 }
             }
 

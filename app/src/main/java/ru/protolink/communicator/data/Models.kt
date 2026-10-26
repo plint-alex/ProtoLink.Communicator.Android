@@ -29,7 +29,12 @@ data class AppSettings(
     val publicSiteBaseUrl: String = "https://protolink.ru/",
     val notesRootUri: String? = null,
     /** Cache: "ownerUserId:partnerUserId" → chat folder entity id (client-contract §4). */
-    val messengerChatFolderIds: Map<String, String> = emptyMap()
+    val messengerChatFolderIds: Map<String, String> = emptyMap(),
+    /**
+     * Cycle-2 M6 — reduce Camera/Gallery/File… images before upload (default ON).
+     * Gson missing-key → false; [SettingsStore.load] migrates absent key to true.
+     */
+    val reducePhotoSizeBeforeSend: Boolean = true
 )
 
 data class CloudSyncMappingDto(
