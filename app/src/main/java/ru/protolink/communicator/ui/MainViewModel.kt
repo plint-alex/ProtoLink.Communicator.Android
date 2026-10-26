@@ -2766,14 +2766,23 @@ class MainViewModel @Inject constructor(
                 )
             }.sortedWith(compareBy({ it.timestampMillis }, { it.id }))
 
-            // Drop pending sends that now exist on the server (same body from me).
+            // Drop pending sends that now exist on the server (same non-blank body from me).
+            // Never drop Failed / blank-body (attachment-only) — empty bodies collide and wipe Retry.
             val serverMineBodies = msgs.filter { it.mine }.map { it.text.trim() }.toHashSet()
             val contactKey = contactId.lowercase()
             pendingChatSends.keys.toList().forEach { localId ->
                 val pendingContact = pendingChatSendContact[localId] ?: return@forEach
                 if (!pendingContact.equals(contactKey, ignoreCase = true)) return@forEach
                 val pendingMsg = pendingChatSends[localId] ?: return@forEach
-                if (pendingMsg.text.trim() in serverMineBodies) {
+                val body = pendingMsg.text.trim()
+                if (!MessengerSendStateMachine.shouldDropPendingAfterServerBodyMatch(
+                        body,
+                        pendingMsg.deliveryStatus
+                    )
+                ) {
+                    return@forEach
+                }
+                if (body in serverMineBodies) {
                     pendingChatSends.remove(localId)
                     pendingChatSendContact.remove(localId)
                 }

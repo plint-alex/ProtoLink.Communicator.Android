@@ -32,4 +32,32 @@ class MessengerSendStateMachineTest {
         assertThat(MessengerSendStateMachine.resolveEntityIdForRetry(null, "new-id")).isEqualTo("new-id")
         assertThat(MessengerSendStateMachine.resolveEntityIdForRetry("", null)).isNull()
     }
+
+    @Test
+    fun dropPendingAfterServerBodyMatch_keepsFailedAndBlank() {
+        assertThat(
+            MessengerSendStateMachine.shouldDropPendingAfterServerBodyMatch(
+                "hello",
+                DeliveryStatus.Sending
+            )
+        ).isTrue()
+        assertThat(
+            MessengerSendStateMachine.shouldDropPendingAfterServerBodyMatch(
+                "hello",
+                DeliveryStatus.Failed
+            )
+        ).isFalse()
+        assertThat(
+            MessengerSendStateMachine.shouldDropPendingAfterServerBodyMatch(
+                "",
+                DeliveryStatus.Uploading
+            )
+        ).isFalse()
+        assertThat(
+            MessengerSendStateMachine.shouldDropPendingAfterServerBodyMatch(
+                "   ",
+                DeliveryStatus.Sending
+            )
+        ).isFalse()
+    }
 }

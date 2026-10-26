@@ -104,6 +104,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.foundation.border
@@ -235,6 +236,7 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
     }
 
     if (state.showSettings) {
+        BackHandler { vm.toggleSettings(false) }
         if (state.pendingConflict != null) {
             val path = state.pendingConflict!!.relativePath
             AlertDialog(
@@ -451,7 +453,12 @@ fun SettingsScreen(vm: MainViewModel, state: UiState, onClose: () -> Unit) {
         )
     }
 
-    Column(Modifier.fillMaxSize().background(tgBg)) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(tgBg)
+            .windowInsetsPadding(WindowInsets.safeDrawing)
+    ) {
         Row(
             Modifier
                 .fillMaxWidth()

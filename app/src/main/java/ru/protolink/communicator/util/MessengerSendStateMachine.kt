@@ -27,4 +27,18 @@ object MessengerSendStateMachine {
         if (!previousEntityId.isNullOrBlank()) return previousEntityId
         return newlyCreatedId?.takeIf { it.isNotBlank() }
     }
+
+    /**
+     * Whether [loadMessages] may drop a local pending send because a server mine-body
+     * matches. Blank bodies collide across attachment-only messages; Failed bubbles
+     * must stay so Retry/Cancel remain available after ConnectException etc.
+     */
+    fun shouldDropPendingAfterServerBodyMatch(
+        pendingBody: String,
+        deliveryStatus: DeliveryStatus
+    ): Boolean {
+        if (deliveryStatus == DeliveryStatus.Failed) return false
+        if (pendingBody.isBlank()) return false
+        return true
+    }
 }
