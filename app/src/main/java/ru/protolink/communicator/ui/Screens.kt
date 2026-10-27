@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -109,11 +110,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.foundation.border
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.IosShare
@@ -1006,284 +1003,382 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
             }
         }
 
-        // AT-PC1 / AT-PC8: persistent Folders tree; click opens entity (anti-SAP).
-        if (state.cloudFolderTree.isNotEmpty()) {
-            Text(
-                ru.protolink.communicator.util.ShareSheetCloudStrings.foldersTree(lang),
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
-                fontSize = 11.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = Color(0xFF8E8E8E)
-            )
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 180.dp)
-                    .verticalScroll(rememberScrollState())
-            ) {
-                state.cloudFolderTree.forEach { row ->
-                    Text(
-                        text = row.name,
-                        fontSize = 13.sp,
-                        fontWeight = if (row.selected) FontWeight.SemiBold else FontWeight.Normal,
-                        color = igAccent,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(
-                                if (row.selected) Color(0xFFEFEFEF) else Color.Transparent
-                            )
-                            .clickable { vm.openCloudFolderTreeRow(row.id) }
-                            .padding(start = (12 + row.depth * 14).dp, end = 12.dp, top = 8.dp, bottom = 8.dp)
-                    )
-                    Divider(color = igBorder, thickness = 0.5.dp)
-                }
-            }
-            Divider(color = igBorder, thickness = 0.5.dp)
-        }
-
-        // AT-PC2: file preview when a CloudFile entity is open.
-        if (openFile != null) {
-            Box(
-                Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 180.dp, max = 320.dp)
-                    .background(igSurface)
-                    .padding(12.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                val bytes = state.cloudPreviewBytes
-                val err = state.cloudPreviewError
-                when {
-                    bytes != null -> {
-                        val bmp = remember(bytes) {
-                            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                        }
-                        if (bmp != null) {
-                            Image(
-                                bitmap = bmp.asImageBitmap(),
-                                contentDescription = openFile.name,
-                                modifier = Modifier.fillMaxSize(),
-                                contentScale = ContentScale.Fit
-                            )
-                        } else {
-                            Text(openFile.name, color = igAccent)
-                        }
-                    }
-                    err != null -> Text(err, color = Color(0xFF8E8E8E), fontSize = 13.sp)
-                    else -> CircularProgressIndicator(Modifier.size(28.dp), color = igAccent)
-                }
-            }
-            Divider(color = igBorder, thickness = 0.5.dp)
-        }
-
-        if (canMap || (currentId != null && mappedIds.contains(currentId))) {
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                if (canMap) {
-                    TextButton(onClick = { pickTreeForCurrentMap.launch(null) }) {
-                        Icon(Icons.Default.Link, null, Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text(MapLocalFolderStrings.mapThisFolder(lang))
-                    }
-                }
-                if (currentId != null && mappedIds.contains(currentId)) {
-                    TextButton(onClick = { vm.unmapFolder(currentId) }) {
-                        Text(ru.protolink.communicator.util.ShareSheetCloudStrings.unmap(lang))
-                    }
-                }
-            }
-        }
-
-        if (showBrowseOnlyHint) {
-            Text(
-                ru.protolink.communicator.util.ShareSheetCloudStrings.browseOnlyHint(lang),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                fontSize = 13.sp,
-                color = Color(0xFF8E8E8E)
-            )
-        }
-
-        if (state.cloudItems.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        // E9: platform-appropriate Explorer shell — Folders tree | details (+ preview).
+        Row(Modifier.fillMaxSize()) {
+            if (state.cloudFolderTree.isNotEmpty()) {
                 Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.padding(horizontal = 24.dp)
+                    Modifier
+                        .width(168.dp)
+                        .fillMaxHeight()
+                        .background(igSurface)
+                        .verticalScroll(rememberScrollState())
                 ) {
-                    Icon(Icons.Default.Cloud, null, Modifier.size(48.dp), tint = Color(0xFFDBDBDB))
-                    Spacer(Modifier.height(8.dp))
                     Text(
-                        when {
-                            isSharedListing ->
-                                ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedTitle(lang)
-                            isSharedByMeListing ->
-                                ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedByMeTitle(lang)
-                            isRecentListing ->
-                                ru.protolink.communicator.util.ShareSheetCloudStrings.emptyRecentTitle(lang)
-                            else ->
-                                ru.protolink.communicator.util.ShareSheetCloudStrings.emptyFolderTitle(lang)
-                        },
-                        color = igAccent,
+                        ru.protolink.communicator.util.ShareSheetCloudStrings.foldersTree(lang),
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                        fontSize = 11.sp,
                         fontWeight = FontWeight.SemiBold,
-                        textAlign = TextAlign.Center
+                        color = Color(0xFF8E8E8E)
                     )
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        when {
-                            isSharedListing ->
-                                ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedBody(lang)
-                            isSharedByMeListing ->
-                                ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedByMeBody(lang)
-                            isRecentListing ->
-                                ru.protolink.communicator.util.ShareSheetCloudStrings.emptyRecentBody(lang)
-                            else ->
-                                ru.protolink.communicator.util.ShareSheetCloudStrings.emptyFolderBody(lang)
-                        },
-                        color = Color(0xFF8E8E8E),
-                        fontSize = 13.sp,
-                        textAlign = TextAlign.Center
-                    )
-                }
-            }
-        } else {
-            LazyVerticalGrid(
-                columns = GridCells.Fixed(3),
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(1.dp),
-                horizontalArrangement = Arrangement.spacedBy(1.dp),
-                verticalArrangement = Arrangement.spacedBy(1.dp)
-            ) {
-                gridItems(state.cloudItems, key = { it.id }) { item ->
-                    val mapped = mappedIds.contains(item.id)
-                    val showMenu = itemMenuId == item.id && !item.isVirtualEntry
-                    val canLeaveRow = ru.protolink.communicator.util.CloudSharedScope.canLeaveSharedListRow(
-                        isSharedListing,
-                        item.isShareRoot,
-                        item.isVirtualEntry
-                    )
-                    Box {
-                    Column(
-                        Modifier
-                            .fillMaxWidth()
-                            .combinedClickable(
-                                onClick = { vm.openCloudFolder(item) },
-                                onLongClick = {
-                                    if (!item.isVirtualEntry) itemMenuId = item.id
-                                }
-                            )
-                            .background(Color.White)
-                            .padding(bottom = 8.dp)
-                    ) {
-                        Box(
+                    state.cloudFolderTree.forEach { row ->
+                        Row(
                             Modifier
                                 .fillMaxWidth()
-                                .aspectRatio(1f)
-                                .background(igSurface),
-                            contentAlignment = Alignment.Center
+                                .background(
+                                    if (row.selected) Color(0xFFE8E8E8) else Color.Transparent
+                                )
+                                .clickable { vm.openCloudFolderTreeRow(row.id) }
+                                .padding(
+                                    start = (6 + row.depth * 12).dp,
+                                    end = 6.dp,
+                                    top = 4.dp,
+                                    bottom = 4.dp
+                                ),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(
+                            Box(
+                                Modifier
+                                    .size(22.dp)
+                                    .clickable(
+                                        enabled = row.canExpand || row.isLoading || row.isExpanded
+                                    ) { vm.toggleFolderTreeExpand(row.id) },
+                                contentAlignment = Alignment.Center
+                            ) {
                                 when {
-                                    item.isFolder -> Icons.Default.Folder
-                                    ru.protolink.communicator.util.CloudFileTypeCue.looksLikeImage(
-                                        item.mimeType,
-                                        item.name
-                                    ) -> Icons.Default.Image
-                                    else -> Icons.Default.InsertDriveFile
-                                },
-                                contentDescription = null,
-                                modifier = Modifier.size(36.dp),
-                                tint = if (item.isFolder) Color(0xFF0095F6) else Color(0xFF8E8E8E)
-                            )
-                            if (mapped) {
-                                Box(
-                                    Modifier
-                                        .align(Alignment.TopEnd)
-                                        .padding(6.dp)
-                                        .size(8.dp)
-                                        .clip(CircleShape)
-                                        .background(Color(0xFF0095F6))
-                                )
-                            }
-                        }
-                        Text(
-                            item.name,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                            fontSize = 12.sp,
-                            color = igAccent,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 4.dp, vertical = 4.dp)
-                        )
-                        if (!item.subtitle.isNullOrBlank()) {
-                            Text(
-                                item.subtitle,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                                fontSize = 10.sp,
-                                color = Color(0xFF8E8E8E),
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 4.dp)
-                            )
-                        }
-                    }
-                    DropdownMenu(
-                        expanded = showMenu,
-                        onDismissRequest = { itemMenuId = null }
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text(ShareSheetStrings.copyLink(lang)) },
-                            onClick = {
-                                itemMenuId = null
-                                vm.copyCanonicalLink(item.id)
-                            }
-                        )
-                        DropdownMenuItem(
-                            text = { Text(ShareAccountStrings.copyIdLabel(lang)) },
-                            onClick = {
-                                itemMenuId = null
-                                vm.copyEntityId(item.id)
-                            }
-                        )
-                        DropdownMenuItem(
-                            text = {
-                                Text(
-                                    if (isSharedByMeListing) ShareSheetStrings.shareMenu(lang)
-                                    else ShareSheetStrings.shareButton(lang)
-                                )
-                            },
-                            onClick = {
-                                itemMenuId = null
-                                vm.openShareSheet(
-                                    entityId = item.id,
-                                    entityName = item.name,
-                                    isFolder = item.isFolder,
-                                    childCount = 0
-                                )
-                            }
-                        )
-                        if (canLeaveRow) {
-                            DropdownMenuItem(
-                                text = {
-                                    Text(ru.protolink.communicator.util.ShareSheetCloudStrings.leave(lang))
-                                },
-                                onClick = {
-                                    itemMenuId = null
-                                    leaveConfirmEntityId = item.id
+                                    row.isLoading ->
+                                        CircularProgressIndicator(
+                                            Modifier.size(12.dp),
+                                            color = igAccent,
+                                            strokeWidth = 1.5.dp
+                                        )
+                                    row.canExpand || row.isExpanded ->
+                                        Icon(
+                                            if (row.isExpanded) Icons.Default.ExpandMore
+                                            else Icons.Default.KeyboardArrowRight,
+                                            contentDescription = if (row.isExpanded) "Collapse" else "Expand",
+                                            modifier = Modifier.size(16.dp),
+                                            tint = Color(0xFF8E8E8E)
+                                        )
                                 }
+                            }
+                            Icon(
+                                Icons.Default.Folder,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                                tint = Color(0xFF0095F6)
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                text = row.name,
+                                fontSize = 12.sp,
+                                fontWeight = if (row.selected) FontWeight.SemiBold else FontWeight.Normal,
+                                color = igAccent,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
                             )
                         }
                     }
+                }
+                Divider(
+                    color = igBorder,
+                    thickness = 0.5.dp,
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .width(0.5.dp)
+                )
+            }
+
+            Column(Modifier.weight(1f).fillMaxHeight()) {
+                // AT-PC2 / E9 preview pane when a CloudFile is open.
+                if (openFile != null) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 120.dp, max = 200.dp)
+                            .background(igSurface)
+                            .padding(12.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        val bytes = state.cloudPreviewBytes
+                        val err = state.cloudPreviewError
+                        when {
+                            bytes != null -> {
+                                val bmp = remember(bytes) {
+                                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                                }
+                                if (bmp != null) {
+                                    Image(
+                                        bitmap = bmp.asImageBitmap(),
+                                        contentDescription = openFile.name,
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentScale = ContentScale.Fit
+                                    )
+                                } else {
+                                    Text(openFile.name, color = igAccent)
+                                }
+                            }
+                            err != null -> Text(err, color = Color(0xFF8E8E8E), fontSize = 13.sp)
+                            else -> CircularProgressIndicator(Modifier.size(28.dp), color = igAccent)
+                        }
+                    }
+                    Divider(color = igBorder, thickness = 0.5.dp)
+                }
+
+                if (canMap || (currentId != null && mappedIds.contains(currentId))) {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (canMap) {
+                            TextButton(onClick = { pickTreeForCurrentMap.launch(null) }) {
+                                Icon(Icons.Default.Link, null, Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text(MapLocalFolderStrings.mapThisFolder(lang))
+                            }
+                        }
+                        if (currentId != null && mappedIds.contains(currentId)) {
+                            TextButton(onClick = { vm.unmapFolder(currentId) }) {
+                                Text(ru.protolink.communicator.util.ShareSheetCloudStrings.unmap(lang))
+                            }
+                        }
+                    }
+                }
+
+                if (showBrowseOnlyHint) {
+                    Text(
+                        ru.protolink.communicator.util.ShareSheetCloudStrings.browseOnlyHint(lang),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                        fontSize = 13.sp,
+                        color = Color(0xFF8E8E8E)
+                    )
+                }
+
+                // AT-CE2 details header
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(igSurface)
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "Name",
+                        Modifier.weight(1f),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFF8E8E8E)
+                    )
+                    Text(
+                        "Type",
+                        Modifier.width(52.dp),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFF8E8E8E),
+                        textAlign = TextAlign.End
+                    )
+                    Text(
+                        "Size",
+                        Modifier.width(44.dp),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFF8E8E8E),
+                        textAlign = TextAlign.End
+                    )
+                    Text(
+                        "Date",
+                        Modifier.width(56.dp),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFF8E8E8E),
+                        textAlign = TextAlign.End
+                    )
+                }
+                Divider(color = igBorder, thickness = 0.5.dp)
+
+                if (state.cloudItems.isEmpty()) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.padding(horizontal = 24.dp)
+                        ) {
+                            Icon(Icons.Default.Cloud, null, Modifier.size(48.dp), tint = Color(0xFFDBDBDB))
+                            Spacer(Modifier.height(8.dp))
+                            Text(
+                                when {
+                                    isSharedListing ->
+                                        ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedTitle(lang)
+                                    isSharedByMeListing ->
+                                        ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedByMeTitle(lang)
+                                    isRecentListing ->
+                                        ru.protolink.communicator.util.ShareSheetCloudStrings.emptyRecentTitle(lang)
+                                    else ->
+                                        ru.protolink.communicator.util.ShareSheetCloudStrings.emptyFolderTitle(lang)
+                                },
+                                color = igAccent,
+                                fontWeight = FontWeight.SemiBold,
+                                textAlign = TextAlign.Center
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                when {
+                                    isSharedListing ->
+                                        ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedBody(lang)
+                                    isSharedByMeListing ->
+                                        ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedByMeBody(lang)
+                                    isRecentListing ->
+                                        ru.protolink.communicator.util.ShareSheetCloudStrings.emptyRecentBody(lang)
+                                    else ->
+                                        ru.protolink.communicator.util.ShareSheetCloudStrings.emptyFolderBody(lang)
+                                },
+                                color = Color(0xFF8E8E8E),
+                                fontSize = 13.sp,
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                    }
+                } else {
+                    LazyColumn(Modifier.fillMaxSize()) {
+                        items(state.cloudItems, key = { it.id }) { item ->
+                            val mapped = mappedIds.contains(item.id)
+                            val showMenu = itemMenuId == item.id && !item.isVirtualEntry
+                            val canLeaveRow =
+                                ru.protolink.communicator.util.CloudSharedScope.canLeaveSharedListRow(
+                                    isSharedListing,
+                                    item.isShareRoot,
+                                    item.isVirtualEntry
+                                )
+                            val typeText = item.typeLabel
+                                ?: if (item.isFolder) "Folder" else (item.subtitle ?: "File")
+                            Box {
+                                Row(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .combinedClickable(
+                                            onClick = { vm.openCloudFolder(item) },
+                                            onLongClick = {
+                                                if (!item.isVirtualEntry) itemMenuId = item.id
+                                            }
+                                        )
+                                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Box(Modifier.size(22.dp), contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            when {
+                                                item.isFolder -> Icons.Default.Folder
+                                                ru.protolink.communicator.util.CloudFileTypeCue.looksLikeImage(
+                                                    item.mimeType,
+                                                    item.name
+                                                ) -> Icons.Default.Image
+                                                else -> Icons.Default.InsertDriveFile
+                                            },
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp),
+                                            tint = if (item.isFolder) Color(0xFF0095F6) else Color(0xFF8E8E8E)
+                                        )
+                                        if (mapped) {
+                                            Box(
+                                                Modifier
+                                                    .align(Alignment.TopEnd)
+                                                    .size(6.dp)
+                                                    .clip(CircleShape)
+                                                    .background(Color(0xFF0095F6))
+                                            )
+                                        }
+                                    }
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(
+                                        item.name,
+                                        Modifier.weight(1f),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        fontSize = 13.sp,
+                                        color = igAccent
+                                    )
+                                    Text(
+                                        typeText,
+                                        Modifier.width(52.dp),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        fontSize = 11.sp,
+                                        color = Color(0xFF8E8E8E),
+                                        textAlign = TextAlign.End
+                                    )
+                                    Text(
+                                        item.sizeDisplay,
+                                        Modifier.width(44.dp),
+                                        maxLines = 1,
+                                        fontSize = 11.sp,
+                                        color = Color(0xFF8E8E8E),
+                                        textAlign = TextAlign.End
+                                    )
+                                    Text(
+                                        item.dateDisplay,
+                                        Modifier.width(56.dp),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        fontSize = 11.sp,
+                                        color = Color(0xFF8E8E8E),
+                                        textAlign = TextAlign.End
+                                    )
+                                }
+                                DropdownMenu(
+                                    expanded = showMenu,
+                                    onDismissRequest = { itemMenuId = null }
+                                ) {
+                                    DropdownMenuItem(
+                                        text = { Text(ShareSheetStrings.copyLink(lang)) },
+                                        onClick = {
+                                            itemMenuId = null
+                                            vm.copyCanonicalLink(item.id)
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text(ShareAccountStrings.copyIdLabel(lang)) },
+                                        onClick = {
+                                            itemMenuId = null
+                                            vm.copyEntityId(item.id)
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                if (isSharedByMeListing) ShareSheetStrings.shareMenu(lang)
+                                                else ShareSheetStrings.shareButton(lang)
+                                            )
+                                        },
+                                        onClick = {
+                                            itemMenuId = null
+                                            vm.openShareSheet(
+                                                entityId = item.id,
+                                                entityName = item.name,
+                                                isFolder = item.isFolder,
+                                                childCount = 0
+                                            )
+                                        }
+                                    )
+                                    if (canLeaveRow) {
+                                        DropdownMenuItem(
+                                            text = {
+                                                Text(
+                                                    ru.protolink.communicator.util.ShareSheetCloudStrings.leave(lang)
+                                                )
+                                            },
+                                            onClick = {
+                                                itemMenuId = null
+                                                leaveConfirmEntityId = item.id
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                            Divider(color = igBorder, thickness = 0.5.dp)
+                        }
                     }
                 }
             }

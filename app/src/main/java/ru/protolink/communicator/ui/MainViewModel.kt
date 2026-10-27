@@ -115,15 +115,24 @@ data class CloudItem(
     val isShareRoot: Boolean = false,
     val subtitle: String? = null,
     /** MIME when known (CloudFile open / preview). */
-    val mimeType: String? = null
+    val mimeType: String? = null,
+    /** Explorer Type column (AT-CE2): Folder or mime/ext cue. */
+    val typeLabel: String? = null,
+    /** Explorer Size column — cheap length or em-dash (no N+1). */
+    val sizeDisplay: String = "—",
+    /** Explorer Date when cheap (updateTime). */
+    val dateDisplay: String = ""
 )
 
-/** Persistent Folders tree row (AT-PC1 / AT-PC8). */
+/** Persistent Folders tree row (AT-PC1 / AT-PC8 / E9b). */
 data class CloudFolderTreeRow(
     val id: String,
     val name: String,
     val depth: Int,
-    val selected: Boolean
+    val selected: Boolean,
+    val isExpanded: Boolean = false,
+    val canExpand: Boolean = false,
+    val isLoading: Boolean = false
 )
 
 /** Open CloudFile preview (AT-PC2 / AT-PC4). */
@@ -317,6 +326,14 @@ class MainViewModel @Inject constructor(
     /** Code by folder id for tree root pick (CloudRoot vs CloudFolder). */
     private val folderTreeCodes = mutableMapOf<String, String>()
     private var folderTreeRefreshJob: Job? = null
+    private var folderTreeExpandJob: Job? = null
+    private var folderTreeRootId: String? = null
+    private val folderTreeChildren = linkedMapOf<String, List<CloudFolderTree.Node>>()
+    private val folderTreeNames = mutableMapOf<String, String>()
+    private val folderTreeExpanded = mutableSetOf<String>()
+    private val folderTreeLoaded = mutableSetOf<String>()
+    private val folderTreeLoading = mutableSetOf<String>()
+    private var folderTreeFolderCount = 0
     private var previewLoadJob: Job? = null
 
     init {
@@ -676,22 +693,34 @@ class MainViewModel @Inject constructor(
     /** Name-slot display name — never first value / mime-as-title (AT-UL2 / E8). */
     private fun entityDisplayName(e: EntityDto): String = EntityMeta.displayName(e)
 
-    /** Folder/file row for Cloud list; files get mime + type-cue subtitle (AT-UL3). */
+    /** Folder/file row for Cloud list; files get mime + type-cue subtitle (AT-UL3 / AT-CE2). */
     private fun cloudChildItem(e: EntityDto): CloudItem? {
         val name = entityDisplayName(e)
+        val date = ChatTime.formatListMeta(ChatTime.parseMillis(e.updateTime))
         return when (e.code) {
             CloudCodes.CLOUD_FOLDER, CloudCodes.CLOUD_ROOT -> {
                 folderTreeCodes[e.id.lowercase()] = e.code
-                CloudItem(e.id, name, true)
+                CloudItem(
+                    id = e.id,
+                    name = name,
+                    isFolder = true,
+                    typeLabel = "Folder",
+                    sizeDisplay = "—",
+                    dateDisplay = date
+                )
             }
             CloudCodes.CLOUD_FILE -> {
                 val mime = EntityMeta.mimeType(e)
+                val typeCue = CloudFileTypeCue.shortLabel(mime, name)
                 CloudItem(
                     id = e.id,
                     name = name,
                     isFolder = false,
                     mimeType = mime,
-                    subtitle = CloudFileTypeCue.shortLabel(mime, name)
+                    subtitle = typeCue,
+                    typeLabel = typeCue,
+                    sizeDisplay = "—",
+                    dateDisplay = date
                 )
             }
             else -> null
@@ -929,13 +958,17 @@ class MainViewModel @Inject constructor(
                 val mime = if (!isFolder) EntityMeta.mimeType(e) else null
                 val sharedSub = ShareSheetCloudStrings.sharedRowSubtitle(lang, creatorName, canWrite)
                 val typeCue = if (!isFolder) CloudFileTypeCue.shortLabel(mime, name) else null
+                val date = ChatTime.formatListMeta(ChatTime.parseMillis(e.updateTime))
                 CloudItem(
                     id = e.id,
                     name = name,
                     isFolder = isFolder,
                     isShareRoot = true,
                     mimeType = mime,
-                    subtitle = if (typeCue != null) "$typeCue · $sharedSub" else sharedSub
+                    subtitle = if (typeCue != null) "$typeCue · $sharedSub" else sharedSub,
+                    typeLabel = if (isFolder) "Folder" else typeCue,
+                    sizeDisplay = "—",
+                    dateDisplay = date
                 )
             }
         _state.update { it.copy(shareRootCanWrite = canWriteByRoot.toMap()) }
@@ -1005,7 +1038,9 @@ class MainViewModel @Inject constructor(
                     typeCue != null && sharedSub != null -> "$typeCue · $sharedSub"
                     typeCue != null -> typeCue
                     else -> sharedSub
-                }
+                },
+                typeLabel = if (isFolder) "Folder" else typeCue,
+                sizeDisplay = "—"
             )
         }
     }
@@ -1102,10 +1137,58 @@ class MainViewModel @Inject constructor(
     /** Tree row click → open that folder entity (AT-PC1/PC8). */
     fun openCloudFolderTreeRow(folderId: String) {
         if (folderId.isBlank() || CloudVirtualNodes.isVirtual(folderId)) return
+        // Change-then-wait: paint selection before open fetch.
+        applyOptimisticFolderTreeSelection(folderId)
         if (currentFolderId.equals(folderId, ignoreCase = true) && _state.value.cloudOpenFile == null) {
             return
         }
         viewModelScope.launch { tryOpenCloudEntity(folderId) }
+    }
+
+    /** E9b expand/collapse affordance (AT-CE9…CE11); paints chrome before lazy load. */
+    fun toggleFolderTreeExpand(folderId: String) {
+        if (folderId.isBlank()) return
+        val row = _state.value.cloudFolderTree.firstOrNull { it.id.equals(folderId, ignoreCase = true) }
+            ?: return
+        if (row.isExpanded) {
+            CloudFolderTree.collapseBranch(folderId, folderTreeChildren, folderTreeExpanded)
+            folderTreeLoading.removeAll { it.equals(folderId, ignoreCase = true) }
+            rebuildFolderTreeRows()
+            return
+        }
+        if (!row.canExpand && !folderTreeLoaded.any { it.equals(folderId, ignoreCase = true) }) return
+
+        folderTreeLoading.add(folderId)
+        rebuildFolderTreeRows()
+        folderTreeExpandJob?.cancel()
+        folderTreeExpandJob = viewModelScope.launch {
+            try {
+                // Yield so Loading glyph paints before network (change-then-wait).
+                kotlinx.coroutines.yield()
+                ensureFolderTreeChildrenLoaded(folderId)
+                val kids = folderTreeChildren.entries
+                    .firstOrNull { it.key.equals(folderId, ignoreCase = true) }
+                    ?.value
+                if (kids != null && kids.isNotEmpty()) {
+                    folderTreeExpanded.add(folderId)
+                }
+            } finally {
+                folderTreeLoading.removeAll { it.equals(folderId, ignoreCase = true) }
+                rebuildFolderTreeRows()
+            }
+        }
+    }
+
+    private fun applyOptimisticFolderTreeSelection(folderId: String) {
+        val rows = _state.value.cloudFolderTree
+        if (rows.isEmpty()) return
+        _state.update { s ->
+            s.copy(
+                cloudFolderTree = rows.map { r ->
+                    r.copy(selected = r.id.equals(folderId, ignoreCase = true))
+                }
+            )
+        }
     }
 
     /**
@@ -1344,10 +1427,11 @@ class MainViewModel @Inject constructor(
 
     private fun refreshFolderTree() {
         folderTreeRefreshJob?.cancel()
+        folderTreeExpandJob?.cancel()
         folderTreeRefreshJob = viewModelScope.launch {
             val listed = currentFolderId
             if (listed.isNullOrBlank() || CloudVirtualNodes.isVirtual(listed)) {
-                _state.update { s -> s.copy(cloudFolderTree = emptyList()) }
+                clearFolderTree()
                 return@launch
             }
             ensurePhotosLibraryId()
@@ -1366,18 +1450,15 @@ class MainViewModel @Inject constructor(
                 CloudVirtualNodes::isVirtual
             )
             if (rootId.isNullOrBlank()) {
-                _state.update { s -> s.copy(cloudFolderTree = emptyList()) }
+                clearFolderTree()
                 return@launch
             }
             try {
-                val childrenByParent = linkedMapOf<String, List<CloudFolderTree.Node>>()
-                val names = mutableMapOf<String, String>()
-                val queue = ArrayDeque<String>()
-                queue.add(rootId)
+                resetFolderTreeCache()
                 val crumbName = _state.value.breadcrumb.firstOrNull { pair ->
                     pair.first.equals(rootId, ignoreCase = true)
                 }?.second
-                names[rootId] = crumbName
+                folderTreeNames[rootId] = crumbName
                     ?: if (
                         photosLibraryId != null &&
                         rootId.equals(photosLibraryId, ignoreCase = true)
@@ -1386,57 +1467,107 @@ class MainViewModel @Inject constructor(
                     } else {
                         "Cloud"
                     }
-                var folderCount = 0
-                while (queue.isNotEmpty() && folderCount < CloudFolderTree.DEFAULT_MAX_FOLDERS) {
-                    val parentId = queue.removeFirst()
-                    val still = currentFolderId
-                    if (still == null || CloudVirtualNodes.isVirtual(still)) {
-                        _state.update { s -> s.copy(cloudFolderTree = emptyList()) }
-                        return@launch
-                    }
-                    val list = api.getEntities(
-                        GetEntitiesRequest(
-                            parentIds = listOf(parentId),
-                            includeValues = true,
-                            take = 200
-                        )
-                    )
-                    val folderKids = ArrayList<CloudFolderTree.Node>()
-                    for (e in list.filter { CloudFolderTree.isFolderTreeCode(it.code) }
-                        .sortedBy { entityDisplayName(it).lowercase() }) {
-                        folderTreeCodes[e.id.lowercase()] = e.code ?: CloudCodes.CLOUD_FOLDER
-                        val name = entityDisplayName(e)
-                        names[e.id] = name
-                        if (folderCount < CloudFolderTree.DEFAULT_MAX_FOLDERS) {
-                            queue.add(e.id)
-                            folderCount++
-                        }
-                        folderKids.add(CloudFolderTree.Node(e.id, name))
-                    }
-                    childrenByParent[parentId] = folderKids
+                ensureFolderTreeChildrenLoaded(rootId)
+                val still = currentFolderId
+                if (still == null || CloudVirtualNodes.isVirtual(still)) {
+                    clearFolderTree()
+                    return@launch
                 }
-                val openFile = _state.value.cloudOpenFile
-                val selected = CloudFolderTree.selectedFolderId(
-                    isFileOpen = openFile != null,
-                    openEntityId = if (openFile != null) openFile.id else currentFolderId,
-                    parentFolderId = openFile?.parentFolderId ?: currentFolderId
-                )
-                val flat = CloudFolderTree.flatten(
-                    CloudFolderTree.Node(rootId, names[rootId] ?: "Cloud"),
-                    childrenByParent,
-                    selected
-                )
-                _state.update { s ->
-                    s.copy(
-                        cloudFolderTree = flat.map { row ->
-                            CloudFolderTreeRow(row.id, row.name, row.depth, row.selected)
-                        }
-                    )
-                }
+                // Root expanded so direct children show; children start collapsed (AT-CE9).
+                folderTreeExpanded.add(rootId)
+                folderTreeRootId = rootId
+                rebuildFolderTreeRows()
             } catch (_: Exception) {
-                _state.update { s -> s.copy(cloudFolderTree = emptyList()) }
+                // Keep prior tree on transient failure.
             }
         }
+    }
+
+    private suspend fun ensureFolderTreeChildrenLoaded(parentId: String) {
+        if (folderTreeLoaded.any { it.equals(parentId, ignoreCase = true) }) return
+        if (folderTreeFolderCount >= CloudFolderTree.DEFAULT_MAX_FOLDERS) {
+            folderTreeChildren[parentId] = emptyList()
+            folderTreeLoaded.add(parentId)
+            return
+        }
+        val list = api.getEntities(
+            GetEntitiesRequest(
+                parentIds = listOf(parentId),
+                includeValues = true,
+                take = 200
+            )
+        )
+        val folderKids = ArrayList<CloudFolderTree.Node>()
+        for (e in list.filter { CloudFolderTree.isFolderTreeCode(it.code) }
+            .sortedBy { entityDisplayName(it).lowercase() }) {
+            if (folderTreeFolderCount >= CloudFolderTree.DEFAULT_MAX_FOLDERS) break
+            folderTreeCodes[e.id.lowercase()] = e.code ?: CloudCodes.CLOUD_FOLDER
+            val name = entityDisplayName(e)
+            folderTreeNames[e.id] = name
+            folderKids.add(CloudFolderTree.Node(e.id, name))
+            folderTreeFolderCount++
+        }
+        folderTreeChildren[parentId] = folderKids
+        folderTreeLoaded.add(parentId)
+    }
+
+    private fun rebuildFolderTreeRows() {
+        val treeRoot = folderTreeRootId
+        if (treeRoot.isNullOrBlank()) {
+            if (_state.value.cloudFolderTree.isNotEmpty()) {
+                _state.update { s -> s.copy(cloudFolderTree = emptyList()) }
+            }
+            return
+        }
+        val openFile = _state.value.cloudOpenFile
+        val selected = CloudFolderTree.selectedFolderId(
+            isFileOpen = openFile != null,
+            openEntityId = if (openFile != null) openFile.id else currentFolderId,
+            parentFolderId = openFile?.parentFolderId ?: currentFolderId
+        )
+        val rootName = folderTreeNames.entries
+            .firstOrNull { it.key.equals(treeRoot, ignoreCase = true) }
+            ?.value
+            ?: "Cloud"
+        val visible = CloudFolderTree.projectVisible(
+            root = CloudFolderTree.Node(treeRoot, rootName),
+            childrenByParent = folderTreeChildren,
+            expandedIds = folderTreeExpanded,
+            loadedParentIds = folderTreeLoaded,
+            selectedId = selected,
+            loadingIds = folderTreeLoading
+        )
+        _state.update { s ->
+            s.copy(
+                cloudFolderTree = visible.map { row ->
+                    CloudFolderTreeRow(
+                        id = row.id,
+                        name = row.name,
+                        depth = row.depth,
+                        selected = row.selected,
+                        isExpanded = row.isExpanded,
+                        canExpand = row.canExpand,
+                        isLoading = row.isLoading
+                    )
+                }
+            )
+        }
+    }
+
+    private fun resetFolderTreeCache() {
+        folderTreeChildren.clear()
+        folderTreeNames.clear()
+        folderTreeExpanded.clear()
+        folderTreeLoaded.clear()
+        folderTreeLoading.clear()
+        folderTreeFolderCount = 0
+    }
+
+    private fun clearFolderTree() {
+        if (_state.value.cloudFolderTree.isEmpty() && folderTreeRootId == null) return
+        folderTreeRootId = null
+        resetFolderTreeCache()
+        _state.update { s -> s.copy(cloudFolderTree = emptyList()) }
     }
 
     fun copyCanonicalLink(entityId: String?) {

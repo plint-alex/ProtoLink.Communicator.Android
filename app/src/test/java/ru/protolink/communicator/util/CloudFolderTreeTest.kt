@@ -65,4 +65,94 @@ class CloudFolderTreeTest {
         assertThat(CloudFolderTree.selectedFolderId(true, file, parent)).isEqualTo(parent)
         assertThat(CloudFolderTree.selectedFolderId(false, file, parent)).isEqualTo(file)
     }
+
+    @Test
+    fun projectVisible_startsCollapsed_hidesGrandchildren() {
+        val root = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val grand = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        val map = mapOf(
+            root to listOf(CloudFolderTree.Node(child, "Child")),
+            child to listOf(CloudFolderTree.Node(grand, "Grand"))
+        )
+        val rows = CloudFolderTree.projectVisible(
+            root = CloudFolderTree.Node(root, "Root"),
+            childrenByParent = map,
+            expandedIds = setOf(root),
+            loadedParentIds = setOf(root, child),
+            selectedId = null
+        )
+        assertThat(rows.map { it.id }).containsExactly(root, child).inOrder()
+        assertThat(rows[1].canExpand).isTrue()
+        assertThat(rows[1].isExpanded).isFalse()
+    }
+
+    @Test
+    fun projectVisible_expandRevealsChildren() {
+        val root = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val grand = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        val map = mapOf(
+            root to listOf(CloudFolderTree.Node(child, "Child")),
+            child to listOf(CloudFolderTree.Node(grand, "Grand"))
+        )
+        val rows = CloudFolderTree.projectVisible(
+            root = CloudFolderTree.Node(root, "Root"),
+            childrenByParent = map,
+            expandedIds = setOf(root, child),
+            loadedParentIds = setOf(root, child),
+            selectedId = grand
+        )
+        assertThat(rows.map { it.id }).containsExactly(root, child, grand).inOrder()
+        assertThat(rows[2].selected).isTrue()
+    }
+
+    @Test
+    fun projectVisible_unloadedParentStaysExpandable() {
+        val root = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val map = mapOf(root to listOf(CloudFolderTree.Node(child, "Child")))
+        val rows = CloudFolderTree.projectVisible(
+            root = CloudFolderTree.Node(root, "Root"),
+            childrenByParent = map,
+            expandedIds = setOf(root),
+            loadedParentIds = setOf(root),
+            selectedId = null
+        )
+        assertThat(rows).hasSize(2)
+        assertThat(rows[1].canExpand).isTrue()
+        assertThat(rows[1].isExpanded).isFalse()
+    }
+
+    @Test
+    fun projectVisible_loadedEmptyIsLeaf() {
+        val root = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val map = mapOf(
+            root to listOf(CloudFolderTree.Node(child, "Child")),
+            child to emptyList()
+        )
+        val rows = CloudFolderTree.projectVisible(
+            root = CloudFolderTree.Node(root, "Root"),
+            childrenByParent = map,
+            expandedIds = setOf(root),
+            loadedParentIds = setOf(root, child),
+            selectedId = null
+        )
+        assertThat(rows[1].canExpand).isFalse()
+    }
+
+    @Test
+    fun collapseBranch_removesDescendants() {
+        val root = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val grand = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        val map = mapOf(
+            root to listOf(CloudFolderTree.Node(child, "Child")),
+            child to listOf(CloudFolderTree.Node(grand, "Grand"))
+        )
+        val expanded = mutableSetOf(root, child, grand)
+        CloudFolderTree.collapseBranch(child, map, expanded)
+        assertThat(expanded).containsExactly(root)
+    }
 }
