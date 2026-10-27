@@ -68,6 +68,7 @@ import ru.protolink.communicator.util.ShareAddPeople
 import ru.protolink.communicator.util.ShareSheetCloudStrings
 import ru.protolink.communicator.util.ShareSheetLogic
 import ru.protolink.communicator.util.ShareSheetStrings
+import ru.protolink.communicator.util.SharedByMeSummary
 import ru.protolink.communicator.ui.share.ShareContactPickerItem
 import ru.protolink.communicator.ui.share.SharePersonUi
 import ru.protolink.communicator.ui.share.ShareSheetUiState
@@ -713,6 +714,8 @@ class MainViewModel @Inject constructor(
             folderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true) -> buildHubListing(lang)
             folderId.equals(CloudVirtualNodes.SHARED_WITH_ME_ID, ignoreCase = true) ->
                 loadSharedWithMeListing(lang)
+            folderId.equals(CloudVirtualNodes.SHARED_BY_ME_ID, ignoreCase = true) ->
+                loadSharedByMeListing(lang)
             folderId.equals(CloudVirtualNodes.RECENT_ID, ignoreCase = true) ->
                 loadRecentListing()
             else -> {
@@ -781,6 +784,14 @@ class MainViewModel @Inject constructor(
             CloudItem(
                 id = CloudVirtualNodes.SHARED_WITH_ME_ID,
                 name = ShareSheetCloudStrings.sharedWithMe(lang),
+                isFolder = true,
+                isVirtualEntry = true
+            )
+        )
+        rows.add(
+            CloudItem(
+                id = CloudVirtualNodes.SHARED_BY_ME_ID,
+                name = ShareSheetCloudStrings.sharedByMe(lang),
                 isFolder = true,
                 isVirtualEntry = true
             )
@@ -909,6 +920,67 @@ class MainViewModel @Inject constructor(
             }
         _state.update { it.copy(shareRootCanWrite = canWriteByRoot.toMap()) }
         return items
+    }
+
+    /**
+     * Shared by me (AT-S54): outbound writeable roots + people/guest summary.
+     * Sheet remains detail truth — rows open browse; Share… via existing sheet.
+     * No AddParent; no Leave (inbound-only).
+     */
+    private suspend fun loadSharedByMeListing(lang: String): List<CloudItem> {
+        val roots = try {
+            api.listSharedByMe(skip = 0, take = 100)
+        } catch (_: Exception) {
+            // Prod may lag LocalStand tip; never crash Cloud chrome on HTML/404 bodies.
+            _state.update { it.copy(status = ShareSheetCloudStrings.sharedByMeLoadFailed(lang)) }
+            return emptyList()
+        }
+        if (roots.isEmpty()) return emptyList()
+
+        val ids = roots.mapNotNull { it.entityId?.takeIf { id -> id.isNotBlank() } }
+        val metaById = mutableMapOf<String, EntityDto>()
+        if (ids.isNotEmpty()) {
+            try {
+                val found = api.getEntities(
+                    GetEntitiesRequest(ids = ids, includeValues = true, take = ids.size)
+                )
+                for (e in found) {
+                    metaById[e.id.lowercase()] = e
+                }
+            } catch (_: Exception) {
+                // Listing still usable with API names; treat unknown codes as folders.
+            }
+        }
+
+        return roots.mapNotNull { root ->
+            val entityId = root.entityId?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val meta = metaById[entityId.lowercase()]
+            val name = root.entityName?.takeIf { it.isNotBlank() }
+                ?: meta?.let { entityDisplayName(it) }
+                ?: entityId.take(8)
+            val isFolder = when (meta?.code) {
+                CloudCodes.CLOUD_FILE -> false
+                CloudCodes.CLOUD_FOLDER, CloudCodes.CLOUD_ROOT -> true
+                else -> true
+            }
+            val peopleNames = root.peoplePreview.orEmpty().mapNotNull { p ->
+                p.displayName?.takeIf { it.isNotBlank() }
+            }
+            CloudItem(
+                id = entityId,
+                name = name,
+                isFolder = isFolder,
+                isShareRoot = true,
+                subtitle = SharedByMeSummary.rowSubtitle(
+                    lang = lang,
+                    peopleNames = peopleNames,
+                    peopleMoreCount = root.peopleMoreCount,
+                    liveGuestLinkCount = root.liveGuestLinkCount,
+                    hasPublicAccess = root.hasPublicAccess
+                ).ifBlank { null },
+                mimeType = meta?.let { EntityMeta.mimeType(it) }
+            )
+        }
     }
 
     /**

@@ -763,6 +763,10 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
         ru.protolink.communicator.util.CloudVirtualNodes.SHARED_WITH_ME_ID,
         ignoreCase = true
     )
+    val isSharedByMeListing = currentId.equals(
+        ru.protolink.communicator.util.CloudVirtualNodes.SHARED_BY_ME_ID,
+        ignoreCase = true
+    )
     val isRecentListing = currentId.equals(
         ru.protolink.communicator.util.CloudVirtualNodes.RECENT_ID,
         ignoreCase = true
@@ -1118,6 +1122,8 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                         when {
                             isSharedListing ->
                                 ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedTitle(lang)
+                            isSharedByMeListing ->
+                                ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedByMeTitle(lang)
                             isRecentListing ->
                                 ru.protolink.communicator.util.ShareSheetCloudStrings.emptyRecentTitle(lang)
                             else ->
@@ -1132,6 +1138,8 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                         when {
                             isSharedListing ->
                                 ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedBody(lang)
+                            isSharedByMeListing ->
+                                ru.protolink.communicator.util.ShareSheetCloudStrings.emptySharedByMeBody(lang)
                             isRecentListing ->
                                 ru.protolink.communicator.util.ShareSheetCloudStrings.emptyRecentBody(lang)
                             else ->
@@ -1240,7 +1248,12 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                             }
                         )
                         DropdownMenuItem(
-                            text = { Text(ShareSheetStrings.shareButton(lang)) },
+                            text = {
+                                Text(
+                                    if (isSharedByMeListing) ShareSheetStrings.shareMenu(lang)
+                                    else ShareSheetStrings.shareButton(lang)
+                                )
+                            },
                             onClick = {
                                 itemMenuId = null
                                 vm.openShareSheet(

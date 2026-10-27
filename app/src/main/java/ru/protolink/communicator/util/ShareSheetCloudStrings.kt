@@ -14,6 +14,10 @@ object ShareSheetCloudStrings {
     fun sharedWithMe(lang: String?): String =
         if (isRussian(lang)) "Доступные мне" else "Shared with me"
 
+    /** Shared by me hub row (AT-S54 / shared-by-me spec). */
+    fun sharedByMe(lang: String?): String =
+        if (isRussian(lang)) "Я поделился" else "Shared by me"
+
     fun myCloud(lang: String?): String =
         if (isRussian(lang)) "Моё облако" else "My Cloud"
 
@@ -40,6 +44,19 @@ object ShareSheetCloudStrings {
             "Когда кто-то даст вам доступ, это появится здесь."
         else
             "When someone gives you access, it shows up here."
+
+    /** Shared by me empty (AC-SO Communicator copy). */
+    fun emptySharedByMeTitle(lang: String?): String =
+        if (isRussian(lang)) "Пока ничем не поделились" else "Nothing shared yet"
+
+    fun emptySharedByMeBody(lang: String?): String =
+        if (isRussian(lang))
+            "Когда вы откроете доступ, это появится здесь."
+        else
+            "When you give someone access, it shows up here."
+
+    fun sharedByMeLoadFailed(lang: String?): String =
+        if (isRussian(lang)) "Не удалось загрузить «Я поделился»." else "Couldn't load Shared by me."
 
     fun emptyRecentTitle(lang: String?): String =
         if (isRussian(lang)) "Пока нет недавних" else "No recent items yet"

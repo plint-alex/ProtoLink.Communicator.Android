@@ -139,9 +139,12 @@ class CloudSharedWithMeScopeTest {
         assertThat(CloudVirtualNodes.HUB_ID).isNotEqualTo(CloudVirtualNodes.SHARED_WITH_ME_ID)
         assertThat(CloudVirtualNodes.HUB_ID).isNotEqualTo(CloudVirtualNodes.RECENT_ID)
         assertThat(CloudVirtualNodes.SHARED_WITH_ME_ID).isNotEqualTo(CloudVirtualNodes.RECENT_ID)
+        assertThat(CloudVirtualNodes.SHARED_BY_ME_ID).isNotEqualTo(CloudVirtualNodes.SHARED_WITH_ME_ID)
+        assertThat(CloudVirtualNodes.SHARED_BY_ME_ID).isNotEqualTo(CloudVirtualNodes.RECENT_ID)
         assertThat(CloudVirtualNodes.isVirtual(CloudVirtualNodes.HUB_ID)).isTrue()
         assertThat(CloudVirtualNodes.isVirtual(CloudVirtualNodes.SHARED_WITH_ME_ID)).isTrue()
         assertThat(CloudVirtualNodes.isVirtual(CloudVirtualNodes.RECENT_ID)).isTrue()
+        assertThat(CloudVirtualNodes.isVirtual(CloudVirtualNodes.SHARED_BY_ME_ID)).isTrue()
         assertThat(CloudVirtualNodes.isVirtual("33333333-3333-4333-8333-333333333333")).isFalse()
     }
 

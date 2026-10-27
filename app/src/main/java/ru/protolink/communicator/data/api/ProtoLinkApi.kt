@@ -255,6 +255,13 @@ interface ProtoLinkApi {
     @POST("api/Share/LeaveSharedWithMe")
     suspend fun leaveSharedWithMe(@Body body: LeaveSharedWithMeRequest): LeaveSharedWithMeResult
 
+    /** Shared by me outbound inventory (AT-S51 / AT-S54). Signed-in user JWT only. */
+    @GET("api/Share/ListSharedByMe")
+    suspend fun listSharedByMe(
+        @Query("skip") skip: Int = 0,
+        @Query("take") take: Int? = 100
+    ): List<SharedByMeRootDto>
+
     @POST("api/Entities/RemovePermission")
     suspend fun removePermission(@Body body: RemovePermissionRequest): ResponseBody
 }
@@ -337,4 +344,20 @@ data class LeaveSharedWithMeResult(
     val entityId: String? = null,
     /** True when a direct personal grant was removed; false when already absent (idempotent). */
     val left: Boolean = true
+)
+
+/** Shared by me root (AT-S51 / AT-S52). No raw tokens. */
+data class SharedByMeRootDto(
+    val entityId: String? = null,
+    val entityName: String? = null,
+    val peoplePreview: List<SharedByMePrincipalPreviewDto>? = null,
+    val peopleMoreCount: Int = 0,
+    val liveGuestLinkCount: Int = 0,
+    val hasPublicAccess: Boolean = false
+)
+
+data class SharedByMePrincipalPreviewDto(
+    val principalKind: String? = null,
+    val permissionForId: String? = null,
+    val displayName: String? = null
 )
