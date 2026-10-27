@@ -17,6 +17,35 @@ class ShareAddPeopleTest {
     }
 
     @Test
+    fun classifyPasteLookup_guidUrlEmailAndGarbage() {
+        val id = "8f3a1111-2222-3333-4444-555555555555"
+        assertThat(ShareAddPeople.classifyPasteLookup("").kind)
+            .isEqualTo(ShareAddPeople.PasteLookupKind.Empty)
+        assertThat(ShareAddPeople.classifyPasteLookup("   ").kind)
+            .isEqualTo(ShareAddPeople.PasteLookupKind.Empty)
+
+        val byId = ShareAddPeople.classifyPasteLookup(id)
+        assertThat(byId.kind).isEqualTo(ShareAddPeople.PasteLookupKind.ById)
+        assertThat(byId.value).isEqualTo(id)
+
+        val fromUrl = ShareAddPeople.classifyPasteLookup("https://protolink.ru/$id?lang=ru-RU")
+        assertThat(fromUrl.kind).isEqualTo(ShareAddPeople.PasteLookupKind.ById)
+        assertThat(fromUrl.value).isEqualTo(id)
+
+        val email = ShareAddPeople.classifyPasteLookup("  molina.tina@ya.ru  ")
+        assertThat(email.kind).isEqualTo(ShareAddPeople.PasteLookupKind.ByLogin)
+        assertThat(email.value).isEqualTo("molina.tina@ya.ru")
+
+        val garbage = ShareAddPeople.classifyPasteLookup("not-a-guid")
+        assertThat(garbage.kind).isEqualTo(ShareAddPeople.PasteLookupKind.ByLogin)
+        assertThat(garbage.value).isEqualTo("not-a-guid")
+
+        assertThat(ShareAddPeople.shouldAutoResolvePaste("molina.tina@ya.ru")).isTrue()
+        assertThat(ShareAddPeople.shouldAutoResolvePaste(id)).isTrue()
+        assertThat(ShareAddPeople.shouldAutoResolvePaste("")).isFalse()
+    }
+
+    @Test
     fun pickResolvedDisplayName_rejectsGuidShaped() {
         val id = "8f3a1111-2222-3333-4444-555555555555"
         assertThat(ShareAddPeople.pickResolvedDisplayName(id, id)).isNull()
@@ -70,6 +99,9 @@ class ShareAddPeopleTest {
         assertThat(ShareSheetStrings.addedToast("en", "Maria K.", canWrite = false).lowercase())
             .contains("view")
         assertThat(ShareSheetStrings.pasteIdHint("en").lowercase()).doesNotContain("token")
+        assertThat(ShareSheetStrings.pasteIdHint("en").lowercase()).contains("email")
+        assertThat(ShareSheetStrings.pasteIdPlaceholder("en").lowercase()).contains("email")
+        assertThat(ShareSheetStrings.noUserWithId("en").lowercase()).contains("email")
         assertThat(ShareSheetLogic.assertNoForbiddenUserText(ShareSheetStrings.canEditHelper("ru")))
             .isTrue()
     }

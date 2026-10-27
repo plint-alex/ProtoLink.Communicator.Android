@@ -335,6 +335,7 @@ class MainViewModel @Inject constructor(
     private val folderTreeLoading = mutableSetOf<String>()
     private var folderTreeFolderCount = 0
     private var previewLoadJob: Job? = null
+    private var pasteResolveJob: Job? = null
 
     init {
         refreshAuth()
@@ -1976,6 +1977,8 @@ class MainViewModel @Inject constructor(
     }
 
     fun shareSheetCancelAddPeople() {
+        pasteResolveJob?.cancel()
+        pasteResolveJob = null
         updateShareSheet {
             it.copy(
                 showAddPeople = false,
@@ -2007,6 +2010,7 @@ class MainViewModel @Inject constructor(
     }
 
     fun shareSheetSetPasteId(value: String) {
+        pasteResolveJob?.cancel()
         updateShareSheet {
             it.copy(
                 pasteId = value,
@@ -2014,6 +2018,12 @@ class MainViewModel @Inject constructor(
                 pastePreviewError = null,
                 pasteResolvedUserId = null
             )
+        }
+        // share-sheet-ux §4: auto-resolve GUID / URL / email after debounce (Win parity 350ms).
+        if (!ShareAddPeople.shouldAutoResolvePaste(value)) return
+        pasteResolveJob = viewModelScope.launch {
+            delay(350)
+            shareSheetResolvePaste()
         }
     }
 
@@ -2030,8 +2040,9 @@ class MainViewModel @Inject constructor(
         if (!ShareSheetLogic.canMutate(sheet.isOnline, sheet.canEdit, sheet.showCreatedPanel) ||
             !sheet.showAddPeople || sheet.busy
         ) return@launch
-        val parsed = ShareAddPeople.parseUserIdInput(sheet.pasteId)
-        if (parsed == null) {
+        val raw = sheet.pasteId
+        val paste = ShareAddPeople.classifyPasteLookup(raw)
+        if (paste.kind == ShareAddPeople.PasteLookupKind.Empty) {
             updateShareSheet {
                 it.copy(
                     pastePreviewName = null,
@@ -2043,9 +2054,19 @@ class MainViewModel @Inject constructor(
         }
         updateShareSheet { it.copy(busy = true, pastePreviewError = null, pastePreviewName = null) }
         try {
-            val user = api.getUserById(parsed)
+            val user = when (paste.kind) {
+                ShareAddPeople.PasteLookupKind.ById -> api.getUserById(paste.value)
+                ShareAddPeople.PasteLookupKind.ByLogin -> api.getUser(paste.value)
+                ShareAddPeople.PasteLookupKind.Empty -> error("unreachable")
+            }
+            // Stale if paste changed while Auth was in flight.
+            if (_state.value.shareSheet.pasteId != raw) {
+                updateShareSheet { it.copy(busy = false) }
+                return@launch
+            }
+            val resolvedId = user.id?.trim()?.takeIf { it.isNotEmpty() }
             val name = ShareAddPeople.pickResolvedDisplayName(user.name, user.login)
-            if (name == null) {
+            if (resolvedId == null || name == null) {
                 updateShareSheet {
                     it.copy(
                         busy = false,
@@ -2058,13 +2079,17 @@ class MainViewModel @Inject constructor(
                 updateShareSheet {
                     it.copy(
                         busy = false,
-                        pasteResolvedUserId = parsed,
+                        pasteResolvedUserId = resolvedId.lowercase(),
                         pastePreviewName = name,
                         pastePreviewError = null
                     )
                 }
             }
         } catch (_: Exception) {
+            if (_state.value.shareSheet.pasteId != raw) {
+                updateShareSheet { it.copy(busy = false) }
+                return@launch
+            }
             updateShareSheet {
                 it.copy(
                     busy = false,

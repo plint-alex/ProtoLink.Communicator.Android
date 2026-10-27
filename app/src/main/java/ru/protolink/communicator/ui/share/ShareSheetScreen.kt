@@ -390,7 +390,7 @@ private fun AddPeoplePanel(
         )
         TextButton(
             onClick = onResolvePaste,
-            enabled = enabled && ShareAddPeople.parseUserIdInput(sheet.pasteId) != null
+            enabled = enabled && ShareAddPeople.shouldAutoResolvePaste(sheet.pasteId)
         ) {
             Text(ShareSheetStrings.resolvePaste(lang))
         }

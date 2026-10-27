@@ -171,15 +171,15 @@ object ShareSheetStrings {
         if (ru(lang)) "Поиск по контактам…" else "Search your contacts…"
 
     fun pasteIdHint(lang: String?) =
-        if (ru(lang)) "Нет в контактах? Вставьте их ID пользователя"
-        else "Not in your contacts? Paste their user ID"
+        if (ru(lang)) "Нет в контактах? Вставьте их ID или email"
+        else "Not in your contacts? Paste their user ID or email"
 
     fun pasteIdPlaceholder(lang: String?) =
-        if (ru(lang)) "ID пользователя или ссылка /{id}" else "User ID or /{id} link"
+        if (ru(lang)) "ID, email или ссылка /{id}" else "User ID, email, or /{id} link"
 
     fun noUserWithId(lang: String?) =
-        if (ru(lang)) "Нет пользователя ProtoLink с таким ID"
-        else "No ProtoLink user with this ID"
+        if (ru(lang)) "Нет пользователя ProtoLink с таким ID или email"
+        else "No ProtoLink user with this ID or email"
 
     fun canEditHelper(lang: String?) =
         if (ru(lang)) "Редактирование также позволяет делиться и отключать ссылки."

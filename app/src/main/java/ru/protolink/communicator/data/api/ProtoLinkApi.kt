@@ -170,6 +170,10 @@ interface ProtoLinkApi {
     @GET("api/Authentication/GetUserById")
     suspend fun getUserById(@Query("userId") userId: String): UserDto
 
+    /** Friends / Share Add paste: resolve registered email/login. */
+    @GET("api/Authentication/GetUser")
+    suspend fun getUser(@Query("login") login: String): UserDto
+
     @POST("api/Entities/GetEntities")
     suspend fun getEntities(@Body body: GetEntitiesRequest): List<EntityDto>
 

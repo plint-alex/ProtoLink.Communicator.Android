@@ -3,7 +3,7 @@ package ru.protolink.communicator.util
 /**
  * Pure helpers for Share sheet Add people (share-sheet-ux §4).
  * Parity with Windows ShareAddPeople. Contacts = Messenger UserContacts;
- * paste-ID resolve uses display name (never GUID-shaped).
+ * paste resolve uses Auth GetUser / GetUserById (display name never GUID-shaped).
  */
 object ShareAddPeople {
     private val guidRegex = Regex(
@@ -13,6 +13,14 @@ object ShareAddPeople {
         "/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\\b"
     )
 
+    enum class PasteLookupKind {
+        Empty,
+        ById,
+        ByLogin
+    }
+
+    data class PasteLookup(val kind: PasteLookupKind, val value: String)
+
     /** Parse raw GUID or a pasted /{userId} (or site URL ending in GUID). */
     fun parseUserIdInput(raw: String?): String? {
         val s = raw?.trim().orEmpty()
@@ -21,6 +29,22 @@ object ShareAddPeople {
         val m = guidInPathRegex.find(s) ?: return null
         return m.groupValues[1].lowercase()
     }
+
+    /**
+     * Share Add paste: GUID / URL → ById; else non-empty → ByLogin (email).
+     * Mirrors Windows ShareAddPeople.ClassifyPasteLookup.
+     */
+    fun classifyPasteLookup(raw: String?): PasteLookup {
+        val s = raw?.trim().orEmpty()
+        if (s.isEmpty()) return PasteLookup(PasteLookupKind.Empty, "")
+        val id = parseUserIdInput(s)
+        if (id != null) return PasteLookup(PasteLookupKind.ById, id)
+        return PasteLookup(PasteLookupKind.ByLogin, s)
+    }
+
+    /** True when paste has something to resolve (GUID, /{id} URL, or email/login). */
+    fun shouldAutoResolvePaste(raw: String?): Boolean =
+        classifyPasteLookup(raw).kind != PasteLookupKind.Empty
 
     /** True when the string is only a GUID — must never be shown as a person name. */
     fun isGuidText(text: String?): Boolean {
