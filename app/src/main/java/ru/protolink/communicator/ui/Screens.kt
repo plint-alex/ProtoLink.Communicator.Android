@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Message
@@ -1188,7 +1189,14 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(
-                                if (item.isFolder) Icons.Default.Folder else Icons.Default.InsertDriveFile,
+                                when {
+                                    item.isFolder -> Icons.Default.Folder
+                                    ru.protolink.communicator.util.CloudFileTypeCue.looksLikeImage(
+                                        item.mimeType,
+                                        item.name
+                                    ) -> Icons.Default.Image
+                                    else -> Icons.Default.InsertDriveFile
+                                },
                                 contentDescription = null,
                                 modifier = Modifier.size(36.dp),
                                 tint = if (item.isFolder) Color(0xFF0095F6) else Color(0xFF8E8E8E)

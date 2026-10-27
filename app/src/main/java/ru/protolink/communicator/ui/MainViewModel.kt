@@ -42,6 +42,7 @@ import ru.protolink.communicator.data.messenger.MessengerChatFolderResolver
 import ru.protolink.communicator.data.messenger.PendingAttachmentDraft
 import ru.protolink.communicator.data.messenger.ProgressRequestBody
 import ru.protolink.communicator.util.ChatTime
+import ru.protolink.communicator.util.CloudFileTypeCue
 import ru.protolink.communicator.util.CloudFolderTree
 import ru.protolink.communicator.util.CloudListingStatus
 import ru.protolink.communicator.util.CloudMainParent
@@ -672,10 +673,30 @@ class MainViewModel @Inject constructor(
 
     private fun uiLang(): String = Locale.getDefault().toLanguageTag()
 
-    private fun entityDisplayName(e: EntityDto): String =
-        e.values?.firstOrNull()?.value?.asString?.trim()?.takeIf { it.isNotEmpty() }
-            ?: e.code?.takeIf { it.isNotBlank() }
-            ?: e.id.take(8)
+    /** Name-slot display name — never first value / mime-as-title (AT-UL2 / E8). */
+    private fun entityDisplayName(e: EntityDto): String = EntityMeta.displayName(e)
+
+    /** Folder/file row for Cloud list; files get mime + type-cue subtitle (AT-UL3). */
+    private fun cloudChildItem(e: EntityDto): CloudItem? {
+        val name = entityDisplayName(e)
+        return when (e.code) {
+            CloudCodes.CLOUD_FOLDER, CloudCodes.CLOUD_ROOT -> {
+                folderTreeCodes[e.id.lowercase()] = e.code
+                CloudItem(e.id, name, true)
+            }
+            CloudCodes.CLOUD_FILE -> {
+                val mime = EntityMeta.mimeType(e)
+                CloudItem(
+                    id = e.id,
+                    name = name,
+                    isFolder = false,
+                    mimeType = mime,
+                    subtitle = CloudFileTypeCue.shortLabel(mime, name)
+                )
+            }
+            else -> null
+        }
+    }
 
     suspend fun ensureCloudRoot() {
         val userId = auth.current()?.userId ?: return
@@ -722,22 +743,7 @@ class MainViewModel @Inject constructor(
                 val children = api.getEntities(
                     GetEntitiesRequest(parentIds = listOf(folderId), includeValues = true, take = 500)
                 )
-                children.mapNotNull { e ->
-                    val name = entityDisplayName(e)
-                    when (e.code) {
-                        CloudCodes.CLOUD_FOLDER, CloudCodes.CLOUD_ROOT -> {
-                            folderTreeCodes[e.id.lowercase()] = e.code ?: CloudCodes.CLOUD_FOLDER
-                            CloudItem(e.id, name, true)
-                        }
-                        CloudCodes.CLOUD_FILE -> CloudItem(
-                            id = e.id,
-                            name = name,
-                            isFolder = false,
-                            mimeType = EntityMeta.mimeType(e)
-                        )
-                        else -> null
-                    }
-                }
+                children.mapNotNull { e -> cloudChildItem(e) }
             }
         }
         _state.update {
@@ -835,7 +841,16 @@ class MainViewModel @Inject constructor(
             val name = entityDisplayName(entity)
             val isFolder =
                 entity.code == CloudCodes.CLOUD_FOLDER || entity.code == CloudCodes.CLOUD_ROOT
-            fresh.add(CloudItem(id = entity.id, name = name, isFolder = isFolder))
+            val mime = if (!isFolder) EntityMeta.mimeType(entity) else null
+            fresh.add(
+                CloudItem(
+                    id = entity.id,
+                    name = name,
+                    isFolder = isFolder,
+                    mimeType = mime,
+                    subtitle = if (!isFolder) CloudFileTypeCue.shortLabel(mime, name) else null
+                )
+            )
             pruned.add(
                 CloudRecentList.Entry(
                     entityId = entity.id,
@@ -910,12 +925,17 @@ class MainViewModel @Inject constructor(
                 }
                 val isFolder =
                     e.code == CloudCodes.CLOUD_FOLDER || e.code == CloudCodes.CLOUD_ROOT
+                val name = entityDisplayName(e)
+                val mime = if (!isFolder) EntityMeta.mimeType(e) else null
+                val sharedSub = ShareSheetCloudStrings.sharedRowSubtitle(lang, creatorName, canWrite)
+                val typeCue = if (!isFolder) CloudFileTypeCue.shortLabel(mime, name) else null
                 CloudItem(
                     id = e.id,
-                    name = entityDisplayName(e),
+                    name = name,
                     isFolder = isFolder,
                     isShareRoot = true,
-                    subtitle = ShareSheetCloudStrings.sharedRowSubtitle(lang, creatorName, canWrite)
+                    mimeType = mime,
+                    subtitle = if (typeCue != null) "$typeCue · $sharedSub" else sharedSub
                 )
             }
         _state.update { it.copy(shareRootCanWrite = canWriteByRoot.toMap()) }
@@ -966,19 +986,26 @@ class MainViewModel @Inject constructor(
             val peopleNames = root.peoplePreview.orEmpty().mapNotNull { p ->
                 p.displayName?.takeIf { it.isNotBlank() }
             }
+            val mime = if (!isFolder) meta?.let { EntityMeta.mimeType(it) } else null
+            val sharedSub = SharedByMeSummary.rowSubtitle(
+                lang = lang,
+                peopleNames = peopleNames,
+                peopleMoreCount = root.peopleMoreCount,
+                liveGuestLinkCount = root.liveGuestLinkCount,
+                hasPublicAccess = root.hasPublicAccess
+            ).ifBlank { null }
+            val typeCue = if (!isFolder) CloudFileTypeCue.shortLabel(mime, name) else null
             CloudItem(
                 id = entityId,
                 name = name,
                 isFolder = isFolder,
                 isShareRoot = true,
-                subtitle = SharedByMeSummary.rowSubtitle(
-                    lang = lang,
-                    peopleNames = peopleNames,
-                    peopleMoreCount = root.peopleMoreCount,
-                    liveGuestLinkCount = root.liveGuestLinkCount,
-                    hasPublicAccess = root.hasPublicAccess
-                ).ifBlank { null },
-                mimeType = meta?.let { EntityMeta.mimeType(it) }
+                mimeType = mime,
+                subtitle = when {
+                    typeCue != null && sharedSub != null -> "$typeCue · $sharedSub"
+                    typeCue != null -> typeCue
+                    else -> sharedSub
+                }
             )
         }
     }
@@ -1293,23 +1320,7 @@ class MainViewModel @Inject constructor(
                             take = 500
                         )
                     )
-                    val items = children.mapNotNull { e ->
-                        val name = entityDisplayName(e)
-                        when (e.code) {
-                            CloudCodes.CLOUD_FOLDER, CloudCodes.CLOUD_ROOT -> {
-                                folderTreeCodes[e.id.lowercase()] =
-                                    e.code ?: CloudCodes.CLOUD_FOLDER
-                                CloudItem(e.id, name, true)
-                            }
-                            CloudCodes.CLOUD_FILE -> CloudItem(
-                                id = e.id,
-                                name = name,
-                                isFolder = false,
-                                mimeType = EntityMeta.mimeType(e)
-                            )
-                            else -> null
-                        }
-                    }
+                    val items = children.mapNotNull { e -> cloudChildItem(e) }
                     val mime = EntityMeta.mimeType(entity)
                     _state.update { s -> s.copy(cloudItems = items) }
                     setCloudFileOpen(
@@ -1386,7 +1397,7 @@ class MainViewModel @Inject constructor(
                     val list = api.getEntities(
                         GetEntitiesRequest(
                             parentIds = listOf(parentId),
-                            includeValues = false,
+                            includeValues = true,
                             take = 200
                         )
                     )
