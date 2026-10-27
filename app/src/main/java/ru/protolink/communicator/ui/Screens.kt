@@ -1021,13 +1021,14 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                         color = Color(0xFF8E8E8E)
                     )
                     state.cloudFolderTree.forEach { row ->
+                        // Expand + open are sibling click targets (not nested) so name taps
+                        // reliably open the folder (AT-CE3) and chevron still toggles (AT-CE9…11).
                         Row(
                             Modifier
                                 .fillMaxWidth()
                                 .background(
                                     if (row.selected) Color(0xFFE8E8E8) else Color.Transparent
                                 )
-                                .clickable { vm.openCloudFolderTreeRow(row.id) }
                                 .padding(
                                     start = (6 + row.depth * 12).dp,
                                     end = 6.dp,
@@ -1061,22 +1062,29 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                                         )
                                 }
                             }
-                            Icon(
-                                Icons.Default.Folder,
-                                contentDescription = null,
-                                modifier = Modifier.size(16.dp),
-                                tint = Color(0xFF0095F6)
-                            )
-                            Spacer(Modifier.width(4.dp))
-                            Text(
-                                text = row.name,
-                                fontSize = 12.sp,
-                                fontWeight = if (row.selected) FontWeight.SemiBold else FontWeight.Normal,
-                                color = igAccent,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f)
-                            )
+                            Row(
+                                Modifier
+                                    .weight(1f)
+                                    .clickable { vm.openCloudFolderTreeRow(row.id) },
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    Icons.Default.Folder,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp),
+                                    tint = Color(0xFF0095F6)
+                                )
+                                Spacer(Modifier.width(4.dp))
+                                Text(
+                                    text = row.name,
+                                    fontSize = 12.sp,
+                                    fontWeight = if (row.selected) FontWeight.SemiBold else FontWeight.Normal,
+                                    color = igAccent,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
                         }
                     }
                 }

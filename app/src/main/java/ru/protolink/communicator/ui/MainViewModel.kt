@@ -1134,12 +1134,24 @@ class MainViewModel @Inject constructor(
         recordRecentOpen(item.id, item.name, isFolder = true)
     }
 
-    /** Tree row click → open that folder entity (AT-PC1/PC8). */
+    /** Tree row click → open that folder entity (AT-CE3 / AT-PC1/PC8). */
     fun openCloudFolderTreeRow(folderId: String) {
         if (folderId.isBlank() || CloudVirtualNodes.isVirtual(folderId)) return
         // Change-then-wait: paint selection before open fetch.
         applyOptimisticFolderTreeSelection(folderId)
         if (currentFolderId.equals(folderId, ignoreCase = true) && _state.value.cloudOpenFile == null) {
+            return
+        }
+        // Prefer local tree trail (Windows parity) — avoids silent-fail parent walks on nested folders.
+        val treeRows = _state.value.cloudFolderTree.map { Triple(it.id, it.name, it.depth) }
+        val trail = CloudFolderTree.buildAncestorTrail(treeRows, folderId)
+        if (trail.isNotEmpty()) {
+            clearCloudFileOpen()
+            val composed = CloudFolderTree.composeBreadcrumb(_state.value.breadcrumb, trail)
+            _state.update { it.copy(breadcrumb = composed) }
+            val name = trail.last().second
+            loadCloudFolder(folderId)
+            recordRecentOpen(folderId, name, isFolder = true)
             return
         }
         viewModelScope.launch { tryOpenCloudEntity(folderId) }

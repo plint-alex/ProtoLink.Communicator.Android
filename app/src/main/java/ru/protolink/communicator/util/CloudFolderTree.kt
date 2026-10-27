@@ -150,4 +150,48 @@ object CloudFolderTree {
             ?: return
         for (k in kids) collapseBranch(k.id, childrenByParent, expandedIds)
     }
+
+    /**
+     * Walk flat tree rows (depth order) back from [selectedId] to the tree root.
+     * Empty when the id is not in the rows. Parity with Windows CloudFolderNavigation.
+     */
+    fun buildAncestorTrail(
+        rows: List<Triple<String, String, Int>>,
+        selectedId: String
+    ): List<Pair<String, String>> {
+        if (rows.isEmpty() || selectedId.isBlank()) return emptyList()
+        val idx = rows.indexOfFirst { it.first.equals(selectedId, ignoreCase = true) }
+        if (idx < 0) return emptyList()
+        val trail = ArrayList<Pair<String, String>>()
+        var depth = rows[idx].third
+        trail.add(rows[idx].first to rows[idx].second)
+        var i = idx - 1
+        while (i >= 0 && depth > 0) {
+            if (rows[i].third == depth - 1) {
+                trail.add(0, rows[i].first to rows[i].second)
+                depth--
+            }
+            i--
+        }
+        return trail
+    }
+
+    /**
+     * Prefix existing breadcrumb crumbs that sit above the tree root, then append the tree trail
+     * (which starts at the tree root). Parity with Windows CloudFolderNavigation.ComposeBreadcrumb.
+     */
+    fun composeBreadcrumb(
+        existingCrumbs: List<Pair<String, String>>,
+        treeAncestorsToSelected: List<Pair<String, String>>
+    ): List<Pair<String, String>> {
+        if (treeAncestorsToSelected.isEmpty()) return existingCrumbs
+        val treeRoot = treeAncestorsToSelected[0].first
+        val prefix = ArrayList<Pair<String, String>>()
+        for (c in existingCrumbs) {
+            if (c.first.equals(treeRoot, ignoreCase = true)) break
+            prefix.add(c)
+        }
+        prefix.addAll(treeAncestorsToSelected)
+        return prefix
+    }
 }

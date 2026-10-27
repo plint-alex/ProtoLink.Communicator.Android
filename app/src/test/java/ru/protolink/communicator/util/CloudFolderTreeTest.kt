@@ -155,4 +155,38 @@ class CloudFolderTreeTest {
         CloudFolderTree.collapseBranch(child, map, expanded)
         assertThat(expanded).containsExactly(root)
     }
+
+    @Test
+    fun buildAncestorTrail_walksDepthBackToRoot() {
+        val root = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val a = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val b = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        val rows = listOf(
+            Triple(root, "Root", 0),
+            Triple(a, "A", 1),
+            Triple(b, "B", 2)
+        )
+        val trail = CloudFolderTree.buildAncestorTrail(rows, b)
+        assertThat(trail.map { it.first }).containsExactly(root, a, b).inOrder()
+        assertThat(trail.map { it.second }).containsExactly("Root", "A", "B").inOrder()
+    }
+
+    @Test
+    fun buildAncestorTrail_unknownId_empty() {
+        val rows = listOf(Triple("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "Root", 0))
+        assertThat(
+            CloudFolderTree.buildAncestorTrail(rows, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        ).isEmpty()
+    }
+
+    @Test
+    fun composeBreadcrumb_prefixesHubAboveTreeRoot() {
+        val hub = "hub" to "Cloud"
+        val root = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val existing = listOf(hub, root to "My Cloud", child to "Child")
+        val tree = listOf(root to "My Cloud", child to "Child")
+        val composed = CloudFolderTree.composeBreadcrumb(existing, tree)
+        assertThat(composed).containsExactly(hub, root to "My Cloud", child to "Child").inOrder()
+    }
 }
