@@ -2123,7 +2123,8 @@ class MainViewModel @Inject constructor(
                     AddPermissionRequest(
                         permissionForId = userId,
                         canWrite = canWrite,
-                        id = sheet.entityId
+                        id = sheet.entityId,
+                        includeSubtree = sheet.isFolder
                     )
                 )
             }

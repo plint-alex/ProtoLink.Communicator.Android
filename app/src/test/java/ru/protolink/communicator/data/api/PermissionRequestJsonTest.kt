@@ -29,6 +29,22 @@ class PermissionRequestJsonTest {
         assertEquals("e1", json["id"].asString)
         assertEquals("u1", json["permissionForId"].asString)
         assertEquals(true, json["canWrite"].asBoolean)
+        assertEquals(false, json["includeSubtree"].asBoolean)
         assertFalse(json.has("entityId"))
+    }
+
+    @Test
+    fun addPermission_folderPeopleGrant_serializesIncludeSubtree() {
+        val json = toJson(
+            AddPermissionRequest(
+                permissionForId = "u1",
+                canWrite = false,
+                id = "folder1",
+                includeSubtree = true
+            )
+        )
+
+        assertEquals(true, json["includeSubtree"].asBoolean)
+        assertEquals("folder1", json["id"].asString)
     }
 }

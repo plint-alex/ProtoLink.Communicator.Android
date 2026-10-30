@@ -97,7 +97,9 @@ data class AddPermissionRequest(
     val permissionForId: String,
     val canWrite: Boolean = false,
     /** Used by standalone AddPermission; ignored when nested under AddEntity. */
-    val id: String? = null
+    val id: String? = null,
+    /** Folder Share Add people: D1-stamp children. Default false keeps messenger/file root grants. */
+    val includeSubtree: Boolean = false
 )
 
 /** api/Entities/GetPermissions row (M3 shareability). */
