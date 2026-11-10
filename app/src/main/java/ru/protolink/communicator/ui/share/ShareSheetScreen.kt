@@ -74,7 +74,13 @@ fun ShareSheetScreen(
     onResolvePaste: () -> Unit,
     onAddCanWriteChange: (Boolean) -> Unit,
     onAddPeople: () -> Unit,
-    onDismissAddedBanner: () -> Unit
+    onDismissAddedBanner: () -> Unit,
+    onSendCreatedInMessenger: () -> Unit,
+    onSendCanonicalInMessenger: () -> Unit,
+    onCancelMessengerSend: () -> Unit,
+    onPickMessengerSendContact: (String) -> Unit,
+    messengerContacts: List<ShareContactPickerItem>,
+    canSendInMessenger: Boolean
 ) {
     if (!sheet.isOpen) return
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -132,14 +138,35 @@ fun ShareSheetScreen(
                         TextButton(onClick = onCopyCanonical) {
                             Text(ShareSheetStrings.copyLink(lang))
                         }
+                        TextButton(
+                            onClick = onSendCanonicalInMessenger,
+                            enabled = canSendInMessenger
+                        ) {
+                            Text(ShareSheetStrings.sendInMessenger(lang))
+                        }
                         TextButton(onClick = onDismissAddedBanner) {
                             Text(ShareSheetStrings.done(lang))
                         }
                     }
+                    if (!canSendInMessenger) {
+                        Text(
+                            ShareSheetStrings.sendInMessengerNoContacts(lang),
+                            color = muted,
+                            fontSize = 12.sp
+                        )
+                    }
                 }
             }
 
-            if (sheet.showAddPeople) {
+            if (!sheet.messengerSendUrl.isNullOrBlank()) {
+                MessengerSendPicker(
+                    lang = lang,
+                    muted = muted,
+                    contacts = messengerContacts,
+                    onCancel = onCancelMessengerSend,
+                    onPick = onPickMessengerSendContact
+                )
+            } else if (sheet.showAddPeople) {
                 AddPeoplePanel(
                     sheet = sheet,
                     lang = lang,
@@ -181,7 +208,9 @@ fun ShareSheetScreen(
                     CreatedPanel(
                         sheet = sheet,
                         lang = lang,
+                        canSendInMessenger = canSendInMessenger,
                         onCopyCreated = onCopyCreated,
+                        onSendInMessenger = onSendCreatedInMessenger,
                         onDoneCreated = onDoneCreated,
                         onCopyAndClose = onCopyAndClose,
                         onCloseAnyway = onCloseAnyway
@@ -448,7 +477,9 @@ private fun SectionLabel(text: String) {
 private fun CreatedPanel(
     sheet: ShareSheetUiState,
     lang: String?,
+    canSendInMessenger: Boolean,
     onCopyCreated: () -> Unit,
+    onSendInMessenger: () -> Unit,
     onDoneCreated: () -> Unit,
     onCopyAndClose: () -> Unit,
     onCloseAnyway: () -> Unit
@@ -464,6 +495,20 @@ private fun CreatedPanel(
                 else ShareSheetStrings.copyLink(lang)
             )
         }
+        TextButton(
+            onClick = onSendInMessenger,
+            enabled = canSendInMessenger && !sheet.createdUrl.isNullOrBlank(),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(ShareSheetStrings.sendInMessenger(lang))
+        }
+        if (!canSendInMessenger) {
+            Text(
+                ShareSheetStrings.sendInMessengerNoContacts(lang),
+                color = Color(0xFF8E8E93),
+                fontSize = 12.sp
+            )
+        }
         if (sheet.showCloseWithoutCopy) {
             Text(ShareSheetStrings.closeWithoutCopy(lang), fontSize = 13.sp)
             Row {
@@ -474,6 +519,35 @@ private fun CreatedPanel(
             TextButton(onClick = onDoneCreated) { Text(ShareSheetStrings.done(lang)) }
         }
     }
+}
+
+@Composable
+private fun MessengerSendPicker(
+    lang: String?,
+    muted: Color,
+    contacts: List<ShareContactPickerItem>,
+    onCancel: () -> Unit,
+    onPick: (String) -> Unit
+) {
+    Spacer(Modifier.height(12.dp))
+    SectionLabel(ShareSheetStrings.sendInMessenger(lang))
+    Text(ShareSheetStrings.sendInMessengerPick(lang), color = muted, fontSize = 13.sp)
+    Spacer(Modifier.height(8.dp))
+    if (contacts.isEmpty()) {
+        Text(ShareSheetStrings.noContactsYet(lang), color = muted, fontSize = 13.sp)
+    } else {
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            for (c in contacts) {
+                TextButton(
+                    onClick = { onPick(c.userId) },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(c.name, modifier = Modifier.fillMaxWidth())
+                }
+            }
+        }
+    }
+    TextButton(onClick = onCancel) { Text(ShareSheetStrings.cancel(lang)) }
 }
 
 @Composable

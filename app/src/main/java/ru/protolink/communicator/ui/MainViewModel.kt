@@ -66,6 +66,7 @@ import ru.protolink.communicator.util.NotesTreeShare
 import ru.protolink.communicator.util.PhotosLibrary
 import ru.protolink.communicator.util.ShareAccountStrings
 import ru.protolink.communicator.util.ShareAddPeople
+import ru.protolink.communicator.util.ShareSendInMessenger
 import ru.protolink.communicator.util.ShareSheetCloudStrings
 import ru.protolink.communicator.util.ShareSheetLogic
 import ru.protolink.communicator.util.ShareSheetStrings
@@ -287,6 +288,8 @@ data class UiState(
     val notesShareAffordanceEpoch: Int = 0,
     /** E6: bump to switch Main tab to Cloud before showing the add-local wizard. */
     val preferCloudTabNonce: Int = 0,
+    /** Share Send-in-Messenger: bump to switch Main tab to Messenger after picking a contact. */
+    val preferMessengerTabNonce: Int = 0,
     val mapWizardOpen: Boolean = false,
     val mapWizardPrefillUri: String? = null,
     val mapWizardCandidates: List<MapLocalFolderCandidate> = emptyList(),
@@ -1779,7 +1782,8 @@ class MainViewModel @Inject constructor(
                 newLabel = "",
                 expiryChoice = 30,
                 errorText = null,
-                showAddPeople = false
+                showAddPeople = false,
+                messengerSendUrl = null
             )
         }
     }
@@ -1839,6 +1843,70 @@ class MainViewModel @Inject constructor(
         copyTextToClipboard(url, ShareSheetStrings.copied(uiLang()))
         updateShareSheet { it.copy(createdUrlCopied = true, showCloseWithoutCopy = false) }
     }
+
+    fun shareSheetSendCreatedInMessenger() {
+        val url = ShareSendInMessenger.normalizeUrl(_state.value.shareSheet.createdUrl) ?: return
+        beginMessengerSendPicker(url)
+    }
+
+    fun shareSheetSendCanonicalInMessenger() {
+        val sheet = _state.value.shareSheet
+        val url = ShareSendInMessenger.canonicalUrl(
+            _state.value.settings.publicSiteBaseUrl,
+            sheet.entityId
+        ) ?: return
+        beginMessengerSendPicker(url)
+    }
+
+    fun shareSheetCancelMessengerSend() {
+        updateShareSheet { it.copy(messengerSendUrl = null) }
+    }
+
+    fun shareSheetPickMessengerSendContact(userId: String) {
+        val url = ShareSendInMessenger.normalizeUrl(_state.value.shareSheet.messengerSendUrl) ?: return
+        val contact = _state.value.contacts.firstOrNull {
+            it.userId.equals(userId, ignoreCase = true)
+        } ?: return
+        // Intentional send of the link — leave created panel without UX-S2 warn (same as Win callback).
+        closeShareSheet(force = true)
+        _state.update {
+            it.copy(
+                selectedContact = contact,
+                composerDraftRestore = url,
+                preferMessengerTabNonce = it.preferMessengerTabNonce + 1,
+                status = ""
+            )
+        }
+        loadMessages(contact)
+        startChatPoll()
+    }
+
+    private fun beginMessengerSendPicker(url: String) {
+        val contacts = messengerSendContactItems()
+        if (contacts.isEmpty()) {
+            _state.update {
+                it.copy(status = ShareSheetStrings.sendInMessengerNoContacts(uiLang()))
+            }
+            return
+        }
+        updateShareSheet { it.copy(messengerSendUrl = url) }
+    }
+
+    private fun messengerSendContactItems(): List<ShareContactPickerItem> {
+        val me = auth.current()?.userId?.lowercase()
+        return _state.value.contacts
+            .filter { c -> c.userId.lowercase() != me }
+            .map { c ->
+                val name = ShareAddPeople.pickResolvedDisplayName(c.displayName, null)
+                    ?: c.displayName.takeIf { !ShareAddPeople.isGuidText(it) }
+                    ?: "…"
+                ShareContactPickerItem(userId = c.userId, name = name)
+            }
+    }
+
+    fun shareMessengerSendContacts(): List<ShareContactPickerItem> = messengerSendContactItems()
+
+    fun canShareSendInMessenger(): Boolean = messengerSendContactItems().isNotEmpty()
 
     fun shareSheetDoneCreated(force: Boolean = false) {
         val sheet = _state.value.shareSheet
@@ -1970,7 +2038,8 @@ class MainViewModel @Inject constructor(
                 pastePreviewError = null,
                 pasteResolvedUserId = null,
                 addCanWrite = false,
-                errorText = null
+                errorText = null,
+                messengerSendUrl = null
             )
         }
         rebuildShareContactPicker()

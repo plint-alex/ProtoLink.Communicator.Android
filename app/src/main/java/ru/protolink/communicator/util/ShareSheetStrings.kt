@@ -26,6 +26,16 @@ object ShareSheetStrings {
 
     fun copyLink(lang: String?) = if (ru(lang)) "Копировать ссылку" else "Copy link"
 
+    fun sendInMessenger(lang: String?) =
+        if (ru(lang)) "Отправить в Мессенджере" else "Send in Messenger"
+
+    fun sendInMessengerPick(lang: String?) =
+        if (ru(lang)) "Кому отправить ссылку?" else "Who should get the link?"
+
+    fun sendInMessengerNoContacts(lang: String?) =
+        if (ru(lang)) "Сначала добавьте контакт в Мессенджере."
+        else "Add a Messenger contact first."
+
     fun guestLinksSection(lang: String?) = if (ru(lang)) "ГОСТЕВЫЕ ССЫЛКИ" else "GUEST LINKS"
 
     fun guestLinksHelper(lang: String?) =

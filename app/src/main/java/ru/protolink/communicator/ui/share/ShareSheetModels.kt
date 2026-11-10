@@ -45,7 +45,9 @@ data class ShareSheetUiState(
     val pasteResolvedUserId: String? = null,
     val addCanWrite: Boolean = false,
     val showAddedBanner: Boolean = false,
-    val addedBannerText: String? = null
+    val addedBannerText: String? = null,
+    /** When set, Share sheet shows a single-select Messenger contact picker for this URL. */
+    val messengerSendUrl: String? = null
 )
 
 data class SharePersonUi(

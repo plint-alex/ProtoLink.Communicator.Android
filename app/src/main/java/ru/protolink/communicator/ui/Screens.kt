@@ -166,6 +166,10 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
         if (state.preferCloudTabNonce > 0) tab = 2
     }
 
+    LaunchedEffect(state.preferMessengerTabNonce) {
+        if (state.preferMessengerTabNonce > 0) tab = 0
+    }
+
     LaunchedEffect(Unit) {
         if (android.os.Build.VERSION.SDK_INT >= 33) {
             notifPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
@@ -2509,7 +2513,13 @@ private fun ProtoLinkShareSheetHost(vm: MainViewModel, state: UiState, lang: Str
         onResolvePaste = { vm.shareSheetResolvePaste() },
         onAddCanWriteChange = { vm.shareSheetSetAddCanWrite(it) },
         onAddPeople = { vm.shareSheetAddPeople() },
-        onDismissAddedBanner = { vm.shareSheetDismissAddedBanner() }
+        onDismissAddedBanner = { vm.shareSheetDismissAddedBanner() },
+        onSendCreatedInMessenger = { vm.shareSheetSendCreatedInMessenger() },
+        onSendCanonicalInMessenger = { vm.shareSheetSendCanonicalInMessenger() },
+        onCancelMessengerSend = { vm.shareSheetCancelMessengerSend() },
+        onPickMessengerSendContact = { vm.shareSheetPickMessengerSendContact(it) },
+        messengerContacts = vm.shareMessengerSendContacts(),
+        canSendInMessenger = vm.canShareSendInMessenger()
     )
 }
 
