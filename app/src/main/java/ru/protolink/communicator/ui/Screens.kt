@@ -135,11 +135,8 @@ import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.sp
 import android.os.Handler
@@ -2843,16 +2840,22 @@ private fun NotesEditorPane(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    var selBold by remember { mutableStateOf(false) }
-    var selItalic by remember { mutableStateOf(false) }
-    var selUnderline by remember { mutableStateOf(false) }
-    var selStrike by remember { mutableStateOf(false) }
-    var selCheckbox by remember { mutableStateOf(false) }
-    var selBlock by remember { mutableStateOf("p") }
+    val formatLang = remember { java.util.Locale.getDefault().toLanguageTag() }
+    var hasTextSelection by remember(documentId) { mutableStateOf(false) }
+    var selBold by remember(documentId) { mutableStateOf(false) }
+    var selItalic by remember(documentId) { mutableStateOf(false) }
+    var selUnderline by remember(documentId) { mutableStateOf(false) }
+    var selStrike by remember(documentId) { mutableStateOf(false) }
+    var selCheckbox by remember(documentId) { mutableStateOf(false) }
+    var selBlock by remember(documentId) { mutableStateOf("p") }
     var showLinkDialog by remember { mutableStateOf(false) }
     var linkUrl by remember { mutableStateOf("https://") }
     var showHeadingMenu by remember { mutableStateOf(false) }
     var showOverflow by remember { mutableStateOf(false) }
+    val showFormatBar = ru.protolink.communicator.util.NotesFormatBarVisibility.shouldShow(
+        hasSelection = hasTextSelection,
+        formatChromePinned = showHeadingMenu || showLinkDialog
+    )
 
     fun runJs(js: String) {
         getWebView()?.evaluateJavascript(js, null)
@@ -2960,30 +2963,6 @@ private fun NotesEditorPane(
             }
         }
 
-        // Format bar above the editor (not under IME) — mobile UX preference.
-        NotesFormatBar(
-            bold = selBold,
-            italic = selItalic,
-            underline = selUnderline,
-            strike = selStrike,
-            checkbox = selCheckbox,
-            block = selBlock,
-            onBold = { runJs(notesEditorApplyJs("bold")) },
-            onItalic = { runJs(notesEditorApplyJs("italic")) },
-            onUnderline = { runJs(notesEditorApplyJs("underline")) },
-            onStrike = { runJs(notesEditorApplyJs("strikeThrough")) },
-            onHeading = { showHeadingMenu = true },
-            onBullet = { runJs(notesEditorApplyJs("insertUnorderedList")) },
-            onNumbered = { runJs(notesEditorApplyJs("insertOrderedList")) },
-            onCheckbox = { runJs(notesEditorApplyJs("checkboxList")) },
-            onOutdent = { runJs(notesEditorApplyJs("outdent")) },
-            onIndent = { runJs(notesEditorApplyJs("indent")) },
-            onLink = {
-                linkUrl = "https://"
-                showLinkDialog = true
-            }
-        )
-
         key(documentId) {
             var loadedSig by remember(documentId) { mutableStateOf<Int?>(null) }
             // Holder (not Compose state): WebViewClient / JS callbacks must see latest restore.
@@ -3003,7 +2982,8 @@ private fun NotesEditorPane(
                             scheduleState.value(html)
                         }
                     },
-                    onSelectionState = { bold, italic, underline, strike, checkbox, block ->
+                    onSelectionState = { hasSelection, bold, italic, underline, strike, checkbox, block ->
+                        hasTextSelection = hasSelection
                         selBold = bold
                         selItalic = italic
                         selUnderline = underline
@@ -3131,111 +3111,33 @@ private fun NotesEditorPane(
                 }
             }
         }
-    }
-}
 
-@Composable
-private fun NotesFormatBar(
-    bold: Boolean,
-    italic: Boolean,
-    underline: Boolean,
-    strike: Boolean,
-    checkbox: Boolean,
-    block: String,
-    onBold: () -> Unit,
-    onItalic: () -> Unit,
-    onUnderline: () -> Unit,
-    onStrike: () -> Unit,
-    onHeading: () -> Unit,
-    onBullet: () -> Unit,
-    onNumbered: () -> Unit,
-    onCheckbox: () -> Unit,
-    onOutdent: () -> Unit,
-    onIndent: () -> Unit,
-    onLink: () -> Unit
-) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .background(Color(0xFFF7F8FA))
-            .border(1.dp, Color(0xFFE0E3E7))
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 6.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        FmtToggle("B", bold, onBold, boldWeight = true)
-        FmtToggle("I", italic, onItalic, italicStyle = true)
-        FmtToggle("U", underline, onUnderline, underline = true)
-        FmtToggle("S", strike, onStrike, strike = true)
-        FmtSep()
-        FmtToggle(
-            when (block) {
-                "h1" -> "H1"
-                "h2" -> "H2"
-                "h3" -> "H3"
-                else -> "¶"
-            },
-            active = block == "h1" || block == "h2" || block == "h3",
-            onClick = onHeading
-        )
-        FmtSep()
-        FmtToggle("•", false, onBullet)
-        FmtToggle("1.", false, onNumbered)
-        FmtToggle("☐", checkbox, onCheckbox)
-        FmtToggle("⇤", false, onOutdent)
-        FmtToggle("⇥", false, onIndent)
-        FmtSep()
-        FmtToggle("🔗", false, onLink)
-    }
-}
-
-@Composable
-private fun FmtSep() {
-    Spacer(Modifier.width(4.dp))
-    Box(
-        Modifier
-            .width(1.dp)
-            .height(28.dp)
-            .background(Color(0xFFD0D5DB))
-    )
-    Spacer(Modifier.width(4.dp))
-}
-
-@Composable
-private fun FmtToggle(
-    label: String,
-    active: Boolean,
-    onClick: () -> Unit,
-    boldWeight: Boolean = false,
-    italicStyle: Boolean = false,
-    underline: Boolean = false,
-    strike: Boolean = false
-) {
-    Box(
-        modifier = Modifier
-            .size(width = 44.dp, height = 44.dp)
-            .padding(2.dp)
-            .background(
-                if (active) Color(0x1A2AABEE) else Color.Transparent,
-                RoundedCornerShape(8.dp)
-            )
-            .clickable(onClick = onClick),
-        contentAlignment = Alignment.Center
-    ) {
-        Text(
-            label,
-            style = MaterialTheme.typography.titleMedium.copy(
-                fontWeight = if (boldWeight) FontWeight.Bold else FontWeight.Medium,
-                fontStyle = if (italicStyle) FontStyle.Italic else FontStyle.Normal,
-                textDecoration = when {
-                    underline && strike -> TextDecoration.Underline + TextDecoration.LineThrough
-                    underline -> TextDecoration.Underline
-                    strike -> TextDecoration.LineThrough
-                    else -> TextDecoration.None
+        // Pattern 2: compact format chrome above IME only while text is selected (UX-N-A1…A3).
+        if (showFormatBar) {
+            NotesFormatBar(
+                lang = formatLang,
+                bold = selBold,
+                italic = selItalic,
+                underline = selUnderline,
+                strike = selStrike,
+                checkbox = selCheckbox,
+                block = selBlock,
+                onBold = { runJs(notesEditorApplyJs("bold")) },
+                onItalic = { runJs(notesEditorApplyJs("italic")) },
+                onUnderline = { runJs(notesEditorApplyJs("underline")) },
+                onStrike = { runJs(notesEditorApplyJs("strikeThrough")) },
+                onHeading = { showHeadingMenu = true },
+                onBullet = { runJs(notesEditorApplyJs("insertUnorderedList")) },
+                onNumbered = { runJs(notesEditorApplyJs("insertOrderedList")) },
+                onCheckbox = { runJs(notesEditorApplyJs("checkboxList")) },
+                onOutdent = { runJs(notesEditorApplyJs("outdent")) },
+                onIndent = { runJs(notesEditorApplyJs("indent")) },
+                onLink = {
+                    linkUrl = "https://"
+                    showLinkDialog = true
                 }
-            ),
-            color = Color(0xFF1C1C1E)
-        )
+            )
+        }
     }
 }
 
@@ -3304,7 +3206,7 @@ private const val FOCUS_SCROLL_JS = """
 
 private class NotesEditorBridge(
     private val onDirty: () -> Unit,
-    private val onSelectionState: (Boolean, Boolean, Boolean, Boolean, Boolean, String) -> Unit,
+    private val onSelectionState: (Boolean, Boolean, Boolean, Boolean, Boolean, Boolean, String) -> Unit,
     private val onRequestLink: () -> Unit,
     private val onOpenLink: (String) -> Unit
 ) {
@@ -3324,6 +3226,7 @@ private class NotesEditorBridge(
                         if (url.startsWith("http://") || url.startsWith("https://")) onOpenLink(url)
                     }
                     "selectionState" -> onSelectionState(
+                        obj.optBoolean("hasSelection"),
                         obj.optBoolean("bold"),
                         obj.optBoolean("italic"),
                         obj.optBoolean("underline"),

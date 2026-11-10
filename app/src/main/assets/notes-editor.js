@@ -776,6 +776,7 @@
 
   function collectSelectionState() {
     var bold = false, italic = false, underline = false, strike = false;
+    var hasSelection = false;
     try {
       bold = document.queryCommandState('bold');
       italic = document.queryCommandState('italic');
@@ -785,10 +786,14 @@
     var checkbox = false;
     try {
       var sel = window.getSelection();
-      if (sel && sel.rangeCount) checkbox = !!closestCheckboxLi(sel.getRangeAt(0).startContainer);
+      if (sel && sel.rangeCount) {
+        hasSelection = !sel.isCollapsed && editor.contains(sel.anchorNode);
+        checkbox = !!closestCheckboxLi(sel.getRangeAt(0).startContainer);
+      }
     } catch (e2) { /* ignore */ }
     return {
       type: 'selectionState',
+      hasSelection: !!hasSelection,
       bold: !!bold,
       italic: !!italic,
       underline: !!underline,
@@ -801,9 +806,10 @@
   var _selTimer = null;
   function scheduleSelectionState() {
     clearTimeout(_selTimer);
+    // ~150ms debounce — Pattern 2 / UX-N-A2 parity with Win floating bar.
     _selTimer = setTimeout(function () {
       postToHost(collectSelectionState());
-    }, 80);
+    }, 150);
   }
 
   // --- keydown ---
