@@ -2515,7 +2515,9 @@ class MainViewModel @Inject constructor(
     private fun requestFullSync() {
         viewModelScope.launch {
             if (!auth.isAuthenticated) {
-                _state.update { it.copy(status = "Log in before sync", syncing = false) }
+                _state.update {
+                    it.copy(status = "Log in before sync", syncing = false, showSettings = true)
+                }
                 return@launch
             }
             val mappings = mappingStore.load()

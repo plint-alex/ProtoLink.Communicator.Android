@@ -118,6 +118,7 @@ import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.People
 import androidx.compose.material3.AlertDialog
 import ru.protolink.communicator.ui.share.ShareSheetScreen
+import ru.protolink.communicator.util.AuthShellGate
 import ru.protolink.communicator.util.MapLocalFolderStrings
 import ru.protolink.communicator.util.MapLocalFolderUi
 import ru.protolink.communicator.util.ChangePasswordStrings
@@ -147,11 +148,13 @@ import android.webkit.JavascriptInterface
 @Composable
 fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
     val state by vm.state.collectAsState()
-    var tab by remember { mutableIntStateOf(0) }
+    // Notes-without-login: unsigned boot lands on Notes, not Messenger.
+    var tab by remember { mutableIntStateOf(AuthShellGate.NOTES_TAB) }
+    var showAuthFlow by remember { mutableStateOf(false) }
     val config = LocalConfiguration.current
     val compactWidth = config.screenWidthDp < 600
-    val notesEditing = tab == 1 && state.selectedNotePath != null
-    val messengerInChat = tab == 0 && state.selectedContact != null
+    val notesEditing = tab == AuthShellGate.NOTES_TAB && state.selectedNotePath != null
+    val messengerInChat = tab == AuthShellGate.MESSENGER_TAB && state.selectedContact != null
     // On phones, hide chrome while in chat/editor so content + keyboard get full height.
     val hideBottomBar = compactWidth && (notesEditing || messengerInChat)
     val hideTopBar = compactWidth && (messengerInChat || notesEditing)
@@ -162,12 +165,31 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
         ActivityResultContracts.RequestPermission()
     ) { /* granted or not — notifications simply won't show if denied */ }
 
+    fun promptLogin() {
+        showAuthFlow = true
+    }
+
+    LaunchedEffect(state.authenticated) {
+        if (state.authenticated) showAuthFlow = false
+        tab = AuthShellGate.resolveTabAfterAuthChange(state.authenticated, tab)
+    }
+
     LaunchedEffect(state.preferCloudTabNonce) {
-        if (state.preferCloudTabNonce > 0) tab = 2
+        if (state.preferCloudTabNonce <= 0) return@LaunchedEffect
+        if (AuthShellGate.shouldPromptLoginForTab(state.authenticated, AuthShellGate.CLOUD_TAB)) {
+            promptLogin()
+            return@LaunchedEffect
+        }
+        tab = AuthShellGate.CLOUD_TAB
     }
 
     LaunchedEffect(state.preferMessengerTabNonce) {
-        if (state.preferMessengerTabNonce > 0) tab = 0
+        if (state.preferMessengerTabNonce <= 0) return@LaunchedEffect
+        if (AuthShellGate.shouldPromptLoginForTab(state.authenticated, AuthShellGate.MESSENGER_TAB)) {
+            promptLogin()
+            return@LaunchedEffect
+        }
+        tab = AuthShellGate.MESSENGER_TAB
     }
 
     LaunchedEffect(Unit) {
@@ -225,11 +247,16 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
         }
     }
 
-    if (!state.authenticated && !state.showSettings) {
+    // Notes-without-login: do not hard-return AuthFlow before Notes tabs.
+    // Messenger/Cloud prompt AuthFlow; Settings gear still available for API URL / Sign in.
+    if (showAuthFlow && !state.authenticated) {
         AuthFlowScreen(
             vm = vm,
             status = state.status,
-            onOpenSettings = { vm.toggleSettings(true) }
+            onOpenSettings = {
+                showAuthFlow = false
+                vm.toggleSettings(true)
+            }
         )
         return
     }
@@ -304,7 +331,15 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
                 }
             )
         }
-        SettingsScreen(vm, state) { vm.toggleSettings(false) }
+        SettingsScreen(
+            vm = vm,
+            state = state,
+            onClose = { vm.toggleSettings(false) },
+            onSignIn = {
+                vm.toggleSettings(false)
+                showAuthFlow = true
+            }
+        )
         return
     }
 
@@ -387,16 +422,38 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
                     if (!hideBottomBar) {
                         NavigationBar {
                             NavigationBarItem(
-                                selected = tab == 0,
+                                selected = tab == AuthShellGate.MESSENGER_TAB,
                                 onClick = {
+                                    if (AuthShellGate.shouldPromptLoginForTab(
+                                            state.authenticated, AuthShellGate.MESSENGER_TAB
+                                        )
+                                    ) {
+                                        promptLogin()
+                                        return@NavigationBarItem
+                                    }
                                     // Returning to Messenger shows the chat list (not a leftover thread).
-                                    if (tab != 0 && compactWidth) vm.clearSelectedContact()
-                                    tab = 0
+                                    if (tab != AuthShellGate.MESSENGER_TAB && compactWidth) {
+                                        vm.clearSelectedContact()
+                                    }
+                                    tab = AuthShellGate.MESSENGER_TAB
                                 },
                                 icon = { Icon(Icons.Default.Message, null) }, label = { Text("Messenger") })
-                            NavigationBarItem(selected = tab == 1, onClick = { tab = 1 },
+                            NavigationBarItem(
+                                selected = tab == AuthShellGate.NOTES_TAB,
+                                onClick = { tab = AuthShellGate.NOTES_TAB },
                                 icon = { Icon(Icons.Default.Note, null) }, label = { Text("Notes") })
-                            NavigationBarItem(selected = tab == 2, onClick = { tab = 2 },
+                            NavigationBarItem(
+                                selected = tab == AuthShellGate.CLOUD_TAB,
+                                onClick = {
+                                    if (AuthShellGate.shouldPromptLoginForTab(
+                                            state.authenticated, AuthShellGate.CLOUD_TAB
+                                        )
+                                    ) {
+                                        promptLogin()
+                                        return@NavigationBarItem
+                                    }
+                                    tab = AuthShellGate.CLOUD_TAB
+                                },
                                 icon = { Icon(Icons.Default.Cloud, null) }, label = { Text("Cloud") })
                         }
                     }
@@ -425,16 +482,21 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
                 .fillMaxSize()
         ) {
             when (tab) {
-                0 -> MessengerScreen(vm, state, compactWidth = compactWidth)
-                1 -> NotesScreen(vm, state, compactWidth = compactWidth)
-                2 -> CloudScreen(vm, state)
+                AuthShellGate.MESSENGER_TAB -> MessengerScreen(vm, state, compactWidth = compactWidth)
+                AuthShellGate.NOTES_TAB -> NotesScreen(vm, state, compactWidth = compactWidth)
+                AuthShellGate.CLOUD_TAB -> CloudScreen(vm, state)
             }
         }
     }
 }
 
 @Composable
-fun SettingsScreen(vm: MainViewModel, state: UiState, onClose: () -> Unit) {
+fun SettingsScreen(
+    vm: MainViewModel,
+    state: UiState,
+    onClose: () -> Unit,
+    onSignIn: () -> Unit = onClose
+) {
     var api by remember { mutableStateOf(state.settings.apiBaseAddress) }
     var showChangePassword by remember { mutableStateOf(false) }
     val tgBg = Color(0xFFEFEFF4)
@@ -530,12 +592,12 @@ fun SettingsScreen(vm: MainViewModel, state: UiState, onClose: () -> Unit) {
                     } else {
                         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             Text(
-                                "Sign in or create an account to use Messenger.",
+                                "Sign in or create an account to use Messenger and Cloud.",
                                 color = tgMuted,
                                 fontSize = 14.sp
                             )
                             Button(
-                                onClick = onClose,
+                                onClick = onSignIn,
                                 modifier = Modifier.fillMaxWidth(),
                                 colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = tgBlue)
                             ) { Text("Sign in / Create account") }
