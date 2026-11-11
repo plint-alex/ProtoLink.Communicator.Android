@@ -47,4 +47,27 @@ class EntityMetaDisplayNameTest {
         )
         assertThat(EntityMeta.displayName(entity)).isEqualTo("orphan-label")
     }
+
+    @Test
+    fun displayName_folderWithoutValues_usesFolderFallback_notSkippedBySync() {
+        val id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+        val entity = EntityDto(id = id, code = CloudCodes.CLOUD_FOLDER, values = null)
+        val name = EntityMeta.displayName(entity)
+        assertThat(name).isEqualTo("folder-${id.replace("-", "")}")
+        assertThat(EntityMeta.isSyntheticCloudFileDisplayName(entity, name)).isFalse()
+    }
+
+    @Test
+    fun syntheticCloudFile_skippedBySyncWalk_foldersKept() {
+        val fileId = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+        val file = EntityDto(id = fileId, code = CloudCodes.CLOUD_FILE, values = emptyList())
+        val fileName = EntityMeta.displayName(file)
+        assertThat(fileName).isEqualTo("file-${fileId.replace("-", "")}")
+        assertThat(EntityMeta.isSyntheticCloudFileDisplayName(file, fileName)).isTrue()
+
+        val folderId = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        val folder = EntityDto(id = folderId, code = CloudCodes.CLOUD_FOLDER, values = emptyList())
+        val folderName = EntityMeta.displayName(folder)
+        assertThat(EntityMeta.isSyntheticCloudFileDisplayName(folder, folderName)).isFalse()
+    }
 }

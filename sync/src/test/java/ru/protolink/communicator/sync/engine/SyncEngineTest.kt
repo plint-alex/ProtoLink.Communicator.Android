@@ -536,4 +536,59 @@ class SyncEngineTest {
         SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
         assertThat(store.getAll("m1").filter { !it.isFolder }).hasSize(5)
     }
+
+    @Test
+    fun bootstrap_remoteFoldersAndFiles_materializeLocally() = runTest {
+        val (store, fs, remote) = harness()
+        remote.seedFolder("child-a", "cloud-root", "Projects")
+        remote.seedFolder("child-b", "child-a", "Notes")
+        remote.seedFile("note-1", "child-b", "index.html", "<p>hello</p>".toByteArray())
+
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        assertThat(fs.exists(root, "projects")).isTrue()
+        assertThat(fs.exists(root, "projects/notes")).isTrue()
+        assertThat(fs.exists(root, "projects/notes/index.html")).isTrue()
+        assertThat(String(fs.readFile(root, "projects/notes/index.html"))).isEqualTo("<p>hello</p>")
+        assertThat(store.getAll("m1").any { it.relativePath == "projects" && it.isFolder }).isTrue()
+        assertThat(store.getAll("m1").any { it.relativePath == "projects/notes" && it.isFolder }).isTrue()
+    }
+
+    @Test
+    fun remoteAdd_folder_materializesAfterBootstrap() = runTest {
+        val (store, fs, remote) = harness()
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+        remote.seedFolder("new-folder", "cloud-root", "Inbox")
+        remote.seedFile("inbox-note", "new-folder", "readme.txt", "hi".toByteArray())
+
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        assertThat(fs.exists(root, "inbox")).isTrue()
+        assertThat(String(fs.readFile(root, "inbox/readme.txt"))).isEqualTo("hi")
+    }
+
+    @Test
+    fun materializeCreateFails_softFailsAndContinuesSibling() = runTest {
+        val (store, innerFs, remote) = harness()
+        remote.seedFolder("bad-folder", "cloud-root", "Broken")
+        remote.seedFolder("ok-folder", "cloud-root", "Good")
+        remote.seedFile("ok-file", "ok-folder", "ok.txt", "ok-bytes".toByteArray())
+
+        val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
+            override fun createDirectory(rootPath: String, relativePath: String) {
+                if (PathUtil.normalize(relativePath) == "broken") {
+                    error("SAF create failed for broken")
+                }
+                innerFs.createDirectory(rootPath, relativePath)
+            }
+        }
+
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        assertThat(fs.exists(root, "broken")).isFalse()
+        assertThat(fs.exists(root, "good")).isTrue()
+        assertThat(String(fs.readFile(root, "good/ok.txt"))).isEqualTo("ok-bytes")
+        assertThat(remote.get("bad-folder")).isNotNull()
+        assertThat(remote.get("ok-folder")).isNotNull()
+    }
 }

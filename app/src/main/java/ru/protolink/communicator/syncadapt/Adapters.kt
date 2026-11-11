@@ -20,6 +20,7 @@ import ru.protolink.communicator.sync.model.FsEntry
 import ru.protolink.communicator.sync.model.RemoteEntry
 import ru.protolink.communicator.sync.ports.LocalFileSystem
 import ru.protolink.communicator.sync.ports.RemoteCloud
+import ru.protolink.communicator.util.EntityMeta
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.MultipartBody
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -39,8 +40,11 @@ class ApiRemoteCloud(private val api: ProtoLinkApi) : RemoteCloud {
                 val isFolder = e.code == CloudCodes.CLOUD_FOLDER
                 val isFile = e.code == CloudCodes.CLOUD_FILE
                 if (!isFolder && !isFile) continue
-                val name = displayName(e) ?: continue
-                if (isFile && name.equals("file-${e.id.replace("-", "")}", true)) continue
+                // Same name resolver as Cloud UI (EntityMeta). Old adapter returned null and
+                // skipped — Sync never walked folders Cloud listed → mapped ghosts (NFR-SYNC-1 /
+                // #android-mapped-missing-local). Only skip synthetic unnamed CloudFiles (Win parity).
+                val name = EntityMeta.displayName(e)
+                if (EntityMeta.isSyntheticCloudFileDisplayName(e, name)) continue
                 all.add(
                     RemoteEntry(
                         id = e.id,
@@ -126,20 +130,6 @@ class ApiRemoteCloud(private val api: ProtoLinkApi) : RemoteCloud {
 
     override suspend fun delete(entityId: String) {
         api.deleteEntity(DeleteEntityRequest(entityId))
-    }
-
-    private fun displayName(e: ru.protolink.communicator.data.api.EntityDto): String? {
-        val values = e.values ?: return null
-        for (v in values) {
-            val s = v.value?.asString?.trim()?.takeIf { it.isNotEmpty() } ?: continue
-            if (v.parents?.any { it.equals(CloudCodes.NAME_TYPE_ID, true) } == true) return s
-        }
-        for (v in values) {
-            val s = v.value?.asString?.trim()?.takeIf { it.isNotEmpty() } ?: continue
-            if (v.parents?.any { it.equals(CloudCodes.MIME_TYPE_ID, true) } == true) continue
-            return s
-        }
-        return null
     }
 
     private fun parseTime(s: String?): Instant? =

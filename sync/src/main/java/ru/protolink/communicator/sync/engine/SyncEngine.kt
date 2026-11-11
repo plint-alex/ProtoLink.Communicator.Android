@@ -228,29 +228,44 @@ class SyncEngine(
         walkRemote(mapping.cloudFolderId, mapping.id, "", located)
         val enriched = enrichRemoteSizes(located)
         for (loc in enriched.sortedBy { it.relativePath.count { c -> c == '/' } }) {
-            if (loc.entry.isFolder) {
-                if (!fs.exists(mapping.localRootPath, loc.relativePath)) {
-                    fs.createDirectory(mapping.localRootPath, loc.relativePath)
-                }
-            } else {
-                val missing = !fs.exists(mapping.localRootPath, loc.relativePath)
-                // Bootstrap has no meta baseline — prefer cloud content so devices share one tree.
-                val remoteBytes = remote.downloadFile(loc.entry.id)
-                if (remoteBytes != null && remoteBytes.isNotEmpty()) {
-                    if (missing) {
-                        fs.writeFile(mapping.localRootPath, loc.relativePath, remoteBytes)
-                    } else {
-                        val localHash = ContentHashUtil.sha256Hex(
-                            fs.readFile(mapping.localRootPath, loc.relativePath)
-                        )
-                        val remoteHash = ContentHashUtil.sha256Hex(remoteBytes)
-                        if (!localHash.equals(remoteHash, ignoreCase = true)) {
-                            fs.writeFile(mapping.localRootPath, loc.relativePath, remoteBytes)
-                        }
+            try {
+                if (loc.entry.isFolder) {
+                    if (!fs.exists(mapping.localRootPath, loc.relativePath)) {
+                        fs.createDirectory(mapping.localRootPath, loc.relativePath)
                     }
-                } else if (missing) {
-                    continue
+                } else {
+                    val missing = !fs.exists(mapping.localRootPath, loc.relativePath)
+                    // Bootstrap has no meta baseline — prefer cloud content so devices share one tree.
+                    val remoteBytes = remote.downloadFile(loc.entry.id)
+                    if (remoteBytes != null && remoteBytes.isNotEmpty()) {
+                        if (missing) {
+                            fs.writeFile(mapping.localRootPath, loc.relativePath, remoteBytes)
+                        } else {
+                            val localHash = ContentHashUtil.sha256Hex(
+                                fs.readFile(mapping.localRootPath, loc.relativePath)
+                            )
+                            val remoteHash = ContentHashUtil.sha256Hex(remoteBytes)
+                            if (!localHash.equals(remoteHash, ignoreCase = true)) {
+                                fs.writeFile(mapping.localRootPath, loc.relativePath, remoteBytes)
+                            }
+                        }
+                    } else if (missing) {
+                        if (remoteBytes == null) {
+                            SyncRemoteDownload.logFailed(
+                                "BootstrapFromRemote", loc.relativePath, loc.entry.id
+                            )
+                        }
+                        continue
+                    }
                 }
+            } catch (e: Exception) {
+                SyncRemoteDownload.logMaterializeFailed(
+                    "BootstrapFromRemote",
+                    loc.relativePath,
+                    loc.entry.id,
+                    e.message ?: e.javaClass.simpleName
+                )
+                continue
             }
             val fsSnap = fs.snapshot(mapping.localRootPath)
                 .firstOrNull { PathUtil.normalize(it.relativePath) == PathUtil.normalize(loc.relativePath) }
@@ -534,7 +549,7 @@ class SyncEngine(
                             fs.delete(mapping.localRootPath, c.meta.relativePath, c.meta.isFolder)
                         }
                         store.delete(mapping.id, c.meta.relativePath)
-                        val destPath = PathUtil.normalize(located!!.relativePath)
+                        val destPath = PathUtil.normalize(located.relativePath)
                         if (c.meta.isFolder) {
                             fs.createDirectory(dest.localRootPath, destPath)
                         } else if (bytes != null && bytes.isNotEmpty()) {
@@ -566,35 +581,51 @@ class SyncEngine(
                 is RemoteChange.Added -> {
                     val located = cross.find { it.entry.id == c.remote.id } ?: continue
                     if (located.mappingId != mapping.id) continue
-                    if (c.remote.isFolder) {
-                        fs.createDirectory(mapping.localRootPath, c.relativePath)
-                        store.upsert(
-                            SyncItemMeta(
-                                mappingId = mapping.id,
-                                remoteId = c.remote.id,
-                                parentRemoteId = c.remote.parentId,
-                                relativePath = c.relativePath,
-                                isFolder = true,
-                                sizeBytes = 0,
-                                remoteUpdateTime = c.remote.updateTime
+                    try {
+                        if (c.remote.isFolder) {
+                            fs.createDirectory(mapping.localRootPath, c.relativePath)
+                            store.upsert(
+                                SyncItemMeta(
+                                    mappingId = mapping.id,
+                                    remoteId = c.remote.id,
+                                    parentRemoteId = c.remote.parentId,
+                                    relativePath = c.relativePath,
+                                    isFolder = true,
+                                    sizeBytes = 0,
+                                    remoteUpdateTime = c.remote.updateTime
+                                )
                             )
-                        )
-                    } else {
-                        val bytes = remote.downloadFile(c.remote.id) ?: continue
-                        if (bytes.isEmpty()) continue
-                        fs.writeFile(mapping.localRootPath, c.relativePath, bytes)
-                        store.upsert(
-                            SyncItemMeta(
-                                mappingId = mapping.id,
-                                remoteId = c.remote.id,
-                                parentRemoteId = c.remote.parentId,
-                                relativePath = c.relativePath,
-                                isFolder = false,
-                                sizeBytes = bytes.size.toLong(),
-                                contentHash = ContentHashUtil.sha256Hex(bytes),
-                                remoteUpdateTime = c.remote.updateTime
+                        } else {
+                            val bytes = remote.downloadFile(c.remote.id)
+                            if (bytes == null) {
+                                SyncRemoteDownload.logFailed(
+                                    "ApplyRemotePhase.Added", c.relativePath, c.remote.id
+                                )
+                                continue
+                            }
+                            if (bytes.isEmpty()) continue
+                            fs.writeFile(mapping.localRootPath, c.relativePath, bytes)
+                            store.upsert(
+                                SyncItemMeta(
+                                    mappingId = mapping.id,
+                                    remoteId = c.remote.id,
+                                    parentRemoteId = c.remote.parentId,
+                                    relativePath = c.relativePath,
+                                    isFolder = false,
+                                    sizeBytes = bytes.size.toLong(),
+                                    contentHash = ContentHashUtil.sha256Hex(bytes),
+                                    remoteUpdateTime = c.remote.updateTime
+                                )
                             )
+                        }
+                    } catch (e: Exception) {
+                        SyncRemoteDownload.logMaterializeFailed(
+                            "ApplyRemotePhase.Added",
+                            c.relativePath,
+                            c.remote.id,
+                            e.message ?: e.javaClass.simpleName
                         )
+                        continue
                     }
                     applied++
                 }

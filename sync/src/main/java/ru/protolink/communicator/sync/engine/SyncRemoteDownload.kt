@@ -11,4 +11,11 @@ object SyncRemoteDownload {
             "[SyncEngine] soft-fail remote download ($phase): relative=$relativePath remoteId=$remoteId"
         )
     }
+
+    /** Local create/write failed for one mapped child — continue the pass (NFR-SYNC-1). */
+    fun logMaterializeFailed(phase: String, relativePath: String, remoteId: String, detail: String) {
+        System.err.println(
+            "[SyncEngine] soft-fail materialize ($phase): relative=$relativePath remoteId=$remoteId detail=$detail"
+        )
+    }
 }
