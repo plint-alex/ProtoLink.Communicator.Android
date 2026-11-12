@@ -54,6 +54,7 @@ import ru.protolink.communicator.util.JsonValues
 import ru.protolink.communicator.util.MapLocalFolderStrings
 import ru.protolink.communicator.util.MessageStringValues
 import ru.protolink.communicator.util.MessengerAttachmentRender
+import ru.protolink.communicator.util.MessengerConversationMerge
 import ru.protolink.communicator.util.MessengerConversationScope
 import ru.protolink.communicator.util.MessengerAtomicSend
 import ru.protolink.communicator.util.MessengerImageDownscale
@@ -317,6 +318,8 @@ class MainViewModel @Inject constructor(
     private var autoSyncJob: Job? = null
     private var chatPollJob: Job? = null
     private var loadMessagesJob: Job? = null
+    /** Coalesce overlapping loadMessages for the same chat (avoid cancel → Socket closed). */
+    @Volatile private var loadMessagesQueuedContactId: String? = null
     private val readReceiptNotified = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val chatFolderResolver by lazy { MessengerChatFolderResolver(api, settingsStore) }
     private val uploadGates = ConcurrentHashMap<String, Mutex>()
@@ -3022,6 +3025,7 @@ class MainViewModel @Inject constructor(
     fun clearSelectedContact() {
         chatPollJob?.cancel()
         chatPollJob = null
+        loadMessagesQueuedContactId = null
         loadMessagesJob?.cancel()
         _state.update { it.copy(selectedContact = null, messages = emptyList()) }
     }
@@ -3038,104 +3042,122 @@ class MainViewModel @Inject constructor(
     }
 
     fun loadMessages(c: ContactItem) {
-        loadMessagesJob?.cancel()
-        loadMessagesJob = viewModelScope.launch {
-        val me = auth.current()?.userId ?: return@launch
         val contactId = c.userId
-        Log.i("ProtoLinkChat", "loadMessages start contact=$contactId")
-        try {
-            val all = api.getEntities(
-                GetEntitiesRequest(
-                    parentIds = listOf(SystemEntities.MESSAGE),
-                    includeValues = true,
-                    skip = 0,
-                    take = MessengerConversationScope.MESSAGE_PAGE_SIZE,
-                    conversationUserIds = MessengerConversationScope.conversationUserIds(me, contactId)
-                )
-            )
-            val selectedId = _state.value.selectedContact?.userId
-            if (selectedId == null || !selectedId.equals(contactId, ignoreCase = true)) {
-                Log.w("ProtoLinkChat", "loadMessages skip stale contact=$contactId selected=$selectedId")
-                return@launch
-            }
-
-            // Server already scoped to this conversation (newest-first); UI sorts oldest→newest.
-            val msgs = all.mapNotNull { e ->
-                val vals = e.values ?: return@mapNotNull null
-                val texts = vals.mapNotNull { JsonValues.asText(it.value)?.trim()?.takeIf { t -> t.isNotEmpty() } }
-                val sender = texts.firstOrNull { it.startsWith("sender:", true) }?.substringAfter(":")
-                if (sender.isNullOrBlank()) return@mapNotNull null
-
-                val valueDateRaw = texts.firstOrNull { ChatTime.looksLikeIsoDate(it) }
-                val forBodyParse = texts.filter { !ChatTime.looksLikeIsoDate(it) }
-                val parsed = MessageStringValues.parse(forBodyParse)
-                // Attachment-only: keep when ids present so GUID never becomes body.
-                if (parsed.bodyText.isBlank() && parsed.attachmentIds.isEmpty()) return@mapNotNull null
-
-                val millis = ChatTime.resolveMessageMillis(e.creationTime, e.updateTime, valueDateRaw)
-                val isMine = sender.equals(me, ignoreCase = true)
-                val isRead = isMine && texts.any { it.equals("status:read", true) }
-                MessageItem(
-                    id = e.id,
-                    text = parsed.bodyText,
-                    mine = isMine,
-                    timestampMillis = millis,
-                    deliveryStatus = when {
-                        !isMine -> DeliveryStatus.Sent
-                        isRead -> DeliveryStatus.Read
-                        else -> DeliveryStatus.Sent
-                    },
-                    attachmentIds = parsed.attachmentIds
-                )
-            }.sortedWith(compareBy({ it.timestampMillis }, { it.id }))
-
-            // Drop pending sends that now exist on the server (same non-blank body from me).
-            // Never drop Failed / blank-body (attachment-only) — empty bodies collide and wipe Retry.
-            val serverMineBodies = msgs.filter { it.mine }.map { it.text.trim() }.toHashSet()
-            val contactKey = contactId.lowercase()
-            pendingChatSends.keys.toList().forEach { localId ->
-                val pendingContact = pendingChatSendContact[localId] ?: return@forEach
-                if (!pendingContact.equals(contactKey, ignoreCase = true)) return@forEach
-                val pendingMsg = pendingChatSends[localId] ?: return@forEach
-                val body = pendingMsg.text.trim()
-                if (!MessengerSendStateMachine.shouldDropPendingAfterServerBodyMatch(
-                        body,
-                        pendingMsg.deliveryStatus
-                    )
-                ) {
-                    return@forEach
-                }
-                if (body in serverMineBodies) {
-                    pendingChatSends.remove(localId)
-                    pendingChatSendContact.remove(localId)
-                }
-            }
-
-            val pendingForChat = pendingChatSends.mapNotNull { (localId, msg) ->
-                val pc = pendingChatSendContact[localId] ?: return@mapNotNull null
-                if (pc.equals(contactKey, ignoreCase = true)) msg else null
-            }
-            val merged = (msgs + pendingForChat)
-                .distinctBy { it.id }
-                .sortedWith(compareBy({ it.timestampMillis }, { it.id }))
-            Log.i("ProtoLinkChat", "loadMessages done raw=${all.size} matched=${msgs.size} pending=${pendingForChat.size} merged=${merged.size}")
-            val prev = _state.value.messages
-            if (prev.size == merged.size &&
-                prev.zip(merged).all { (a, b) ->
-                    a.id == b.id && a.text == b.text && a.mine == b.mine &&
-                        a.deliveryStatus == b.deliveryStatus && a.attachmentIds == b.attachmentIds &&
-                        a.statusLine == b.statusLine && a.uploadProgress == b.uploadProgress
-                }
-            ) {
-                markOpenChatRead(contactId, merged)
-                return@launch
-            }
-            _state.update { it.copy(messages = merged, status = "Messages: ${merged.size}") }
-            markOpenChatRead(contactId, merged)
-        } catch (ex: Exception) {
-            if (ex is kotlinx.coroutines.CancellationException) throw ex
-            showError("Load messages failed", httpDetail(ex), ex)
+        val active = loadMessagesJob
+        if (active?.isActive == true) {
+            // Do not cancel in-flight GetEntities (Socket closed); queue one follow-up pass.
+            loadMessagesQueuedContactId = contactId
+            return
         }
+        loadMessagesJob = viewModelScope.launch {
+            var targetContactId = contactId
+            while (isActive) {
+                loadMessagesQueuedContactId = null
+                val me = auth.current()?.userId ?: return@launch
+                val open = _state.value.selectedContact
+                if (open == null || !open.userId.equals(targetContactId, ignoreCase = true)) {
+                    Log.w("ProtoLinkChat", "loadMessages skip stale contact=$targetContactId selected=${open?.userId}")
+                    return@launch
+                }
+                Log.i("ProtoLinkChat", "loadMessages start contact=$targetContactId")
+                try {
+                    val all = api.getEntities(
+                        GetEntitiesRequest(
+                            parentIds = listOf(SystemEntities.MESSAGE),
+                            includeValues = true,
+                            skip = 0,
+                            take = MessengerConversationScope.MESSAGE_PAGE_SIZE,
+                            conversationUserIds = MessengerConversationScope.conversationUserIds(me, targetContactId)
+                        )
+                    )
+                    val selectedId = _state.value.selectedContact?.userId
+                    if (selectedId == null || !selectedId.equals(targetContactId, ignoreCase = true)) {
+                        Log.w("ProtoLinkChat", "loadMessages skip stale contact=$targetContactId selected=$selectedId")
+                        return@launch
+                    }
+
+                    // Server already scoped to this conversation (newest-first); UI sorts oldest→newest.
+                    val msgs = all.mapNotNull { e ->
+                        val vals = e.values ?: return@mapNotNull null
+                        val texts = vals.mapNotNull { JsonValues.asText(it.value)?.trim()?.takeIf { t -> t.isNotEmpty() } }
+                        val sender = texts.firstOrNull { it.startsWith("sender:", true) }?.substringAfter(":")
+                        if (sender.isNullOrBlank()) return@mapNotNull null
+
+                        val valueDateRaw = texts.firstOrNull { ChatTime.looksLikeIsoDate(it) }
+                        val forBodyParse = texts.filter { !ChatTime.looksLikeIsoDate(it) }
+                        val parsed = MessageStringValues.parse(forBodyParse)
+                        // Attachment-only: keep when ids present so GUID never becomes body.
+                        if (parsed.bodyText.isBlank() && parsed.attachmentIds.isEmpty()) return@mapNotNull null
+
+                        val millis = ChatTime.resolveMessageMillis(e.creationTime, e.updateTime, valueDateRaw)
+                        val isMine = sender.equals(me, ignoreCase = true)
+                        val isRead = isMine && texts.any { it.equals("status:read", true) }
+                        MessageItem(
+                            id = e.id,
+                            text = parsed.bodyText,
+                            mine = isMine,
+                            timestampMillis = millis,
+                            deliveryStatus = when {
+                                !isMine -> DeliveryStatus.Sent
+                                isRead -> DeliveryStatus.Read
+                                else -> DeliveryStatus.Sent
+                            },
+                            attachmentIds = parsed.attachmentIds
+                        )
+                    }.sortedWith(compareBy({ it.timestampMillis }, { it.id }))
+
+                    // Drop pending sends that now exist on the server (same non-blank body from me).
+                    // Never drop Failed / blank-body (attachment-only) — empty bodies collide and wipe Retry.
+                    val serverMineBodies = msgs.filter { it.mine }.map { it.text.trim() }.toHashSet()
+                    val contactKey = targetContactId.lowercase()
+                    pendingChatSends.keys.toList().forEach { localId ->
+                        val pendingContact = pendingChatSendContact[localId] ?: return@forEach
+                        if (!pendingContact.equals(contactKey, ignoreCase = true)) return@forEach
+                        val pendingMsg = pendingChatSends[localId] ?: return@forEach
+                        val body = pendingMsg.text.trim()
+                        if (!MessengerSendStateMachine.shouldDropPendingAfterServerBodyMatch(
+                                body,
+                                pendingMsg.deliveryStatus
+                            )
+                        ) {
+                            return@forEach
+                        }
+                        if (body in serverMineBodies) {
+                            pendingChatSends.remove(localId)
+                            pendingChatSendContact.remove(localId)
+                        }
+                    }
+
+                    val pendingForChat = pendingChatSends.mapNotNull { (localId, msg) ->
+                        val pc = pendingChatSendContact[localId] ?: return@mapNotNull null
+                        if (pc.equals(contactKey, ignoreCase = true)) msg else null
+                    }
+                    val prev = _state.value.messages
+                    val merged = MessengerConversationMerge.mergeServerAndPending(prev, msgs, pendingForChat)
+                    Log.i("ProtoLinkChat", "loadMessages done raw=${all.size} matched=${msgs.size} pending=${pendingForChat.size} merged=${merged.size}")
+                    if (prev.size == merged.size &&
+                        prev.zip(merged).all { (a, b) ->
+                            a.id == b.id && a.text == b.text && a.mine == b.mine &&
+                                a.deliveryStatus == b.deliveryStatus && a.attachmentIds == b.attachmentIds &&
+                                a.statusLine == b.statusLine && a.uploadProgress == b.uploadProgress &&
+                                a.pendingLocalAttachments == b.pendingLocalAttachments
+                        }
+                    ) {
+                        markOpenChatRead(targetContactId, merged)
+                    } else {
+                        _state.update { it.copy(messages = merged, status = "Messages: ${merged.size}") }
+                        markOpenChatRead(targetContactId, merged)
+                    }
+                } catch (ex: Exception) {
+                    if (ex is kotlinx.coroutines.CancellationException) throw ex
+                    showError("Load messages failed", httpDetail(ex), ex)
+                }
+
+                val queued = loadMessagesQueuedContactId ?: break
+                val stillOpen = _state.value.selectedContact ?: break
+                if (!stillOpen.userId.equals(queued, ignoreCase = true)) break
+                targetContactId = queued
+            }
         }
     }
 
@@ -3720,7 +3742,8 @@ class MainViewModel @Inject constructor(
                     status = "Sent $messageId"
                 )
             }
-            _state.value.selectedContact?.let { loadMessages(it) }
+            // UI already has messageId + attachmentIds + draft seeds; immediate reload races
+            // attachment GetEntities (Socket closed) and can blank the file-row. Poll covers sync.
         } finally {
             for (s in openStreams) runCatching { s.close() }
         }

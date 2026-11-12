@@ -62,11 +62,14 @@ import ru.protolink.communicator.data.api.ProtoLinkApi
 import ru.protolink.communicator.util.EntityLinkUnfurl
 import ru.protolink.communicator.util.EntityMeta
 import ru.protolink.communicator.util.MessengerAttachmentRender
+import ru.protolink.communicator.util.MessengerAttachmentSeed
+import ru.protolink.communicator.util.MessengerAttachmentSeedLogic
 import ru.protolink.communicator.util.MessengerAttachmentVisualKind
 import ru.protolink.communicator.util.MessengerMediaLimits
 import ru.protolink.communicator.util.MessengerThumbMemoryCache
 import ru.protolink.communicator.util.MessengerUnfurlCache
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
 
 private val TgAccent = Color(0xFF2AABEE)
 private val MetaMuted = Color(0xFF667781)
@@ -94,7 +97,8 @@ fun MessageAttachmentsColumn(
     attachmentIds: List<String>,
     api: ProtoLinkApi,
     multiImageMaxHeight: Boolean,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    seedsByEntityId: Map<String, MessengerAttachmentSeed> = emptyMap()
 ) {
     if (attachmentIds.isEmpty()) return
     Column(modifier = modifier.fillMaxWidth()) {
@@ -103,6 +107,7 @@ fun MessageAttachmentsColumn(
                 entityId = id,
                 api = api,
                 multiImageMaxHeight = multiImageMaxHeight,
+                seed = seedsByEntityId[id.lowercase()] ?: seedsByEntityId[id],
                 modifier = Modifier.padding(bottom = 4.dp)
             )
         }
@@ -216,10 +221,20 @@ private fun AttachmentBlock(
     entityId: String,
     api: ProtoLinkApi,
     multiImageMaxHeight: Boolean,
+    seed: MessengerAttachmentSeed? = null,
     modifier: Modifier = Modifier
 ) {
-    var state by remember(entityId) {
-        mutableStateOf(AttachmentUiState(entityId = entityId))
+    var state by remember(entityId, seed?.fileName, seed?.mimeType, seed?.byteLength) {
+        val kind = MessengerAttachmentSeedLogic.initialKind(seed)
+        mutableStateOf(
+            AttachmentUiState(
+                entityId = entityId,
+                kind = kind,
+                fileName = MessengerAttachmentSeedLogic.displayFileName(seed),
+                mimeType = seed?.mimeType,
+                byteLength = seed?.byteLength
+            )
+        )
     }
     var lightboxOpen by remember { mutableStateOf(false) }
     val density = LocalDensity.current
@@ -227,8 +242,9 @@ private fun AttachmentBlock(
     val scope = rememberCoroutineScope()
     val isRu = remember { Locale.getDefault().language.equals("ru", ignoreCase = true) }
 
-    LaunchedEffect(entityId) {
-        state = loadRemoteAttachment(api, entityId, density.density)
+    LaunchedEffect(entityId, seed?.fileName, seed?.mimeType, seed?.byteLength) {
+        // Non-image seeds already show a File row; still refresh name/size from server.
+        state = loadRemoteAttachment(api, entityId, density.density, seed)
     }
 
     when (state.kind) {
@@ -240,7 +256,17 @@ private fun AttachmentBlock(
                     .background(Color(0x22000000), RoundedCornerShape(10.dp)),
                 contentAlignment = Alignment.Center
             ) {
-                CircularProgressIndicator(modifier = Modifier.size(28.dp), color = TgAccent, strokeWidth = 2.dp)
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    if (state.fileName.isNotBlank() && state.fileName != "…") {
+                        Text(
+                            state.fileName,
+                            color = Color(0xFF111111),
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.padding(bottom = 8.dp, start = 8.dp, end = 8.dp)
+                        )
+                    }
+                    CircularProgressIndicator(modifier = Modifier.size(28.dp), color = TgAccent, strokeWidth = 2.dp)
+                }
             }
         }
         MessengerAttachmentVisualKind.Image -> {
@@ -256,6 +282,23 @@ private fun AttachmentBlock(
                         .clip(RoundedCornerShape(10.dp))
                         .clickable { lightboxOpen = true },
                     contentScale = ContentScale.FillWidth
+                )
+            } else {
+                // Never leave an empty green bubble if thumb decode raced away.
+                FileRow(
+                    fileName = state.fileName,
+                    sizeLabel = state.byteLength?.let { MessengerAttachmentRender.formatByteSize(it) },
+                    onDownload = {
+                        scope.launch {
+                            val ok = downloadAttachmentToDevice(context, api, state)
+                            Toast.makeText(
+                                context,
+                                if (ok) "Saved: ${state.fileName}" else MessengerAttachmentRender.DOWNLOAD_FAILED_EN,
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    },
+                    modifier = modifier
                 )
             }
         }
@@ -454,16 +497,18 @@ private data class ImageFetch(
 private suspend fun loadRemoteAttachment(
     api: ProtoLinkApi,
     entityId: String,
-    density: Float
+    density: Float,
+    seed: MessengerAttachmentSeed? = null
 ): AttachmentUiState = withContext(Dispatchers.IO) {
-    var fileName = "…"
-    var mime: String? = null
+    var fileName = MessengerAttachmentSeedLogic.displayFileName(seed)
+    var mime: String? = seed?.mimeType
+    val seedBytes = seed?.byteLength
     try {
         val entities = api.getEntities(GetEntitiesRequest(ids = listOf(entityId), take = 1, includeValues = true))
         if (entities.isNotEmpty()) {
             val e = entities[0]
-            fileName = EntityMeta.displayName(e)
-            mime = EntityMeta.mimeType(e)
+            fileName = EntityMeta.displayName(e).ifBlank { fileName }
+            mime = EntityMeta.mimeType(e) ?: mime
         } else {
             val probe = api.getFile(entityId)
             return@withContext when (probe.code()) {
@@ -474,10 +519,13 @@ private suspend fun loadRemoteAttachment(
                     AttachmentUiState(
                         entityId = entityId,
                         kind = MessengerAttachmentVisualKind.File,
-                        fileName = EntityMeta.displayName(
-                            ru.protolink.communicator.data.api.EntityDto(id = entityId, code = CloudCodes.CLOUD_FILE)
-                        ),
-                        mimeType = "application/octet-stream"
+                        fileName = fileName.ifBlank {
+                            EntityMeta.displayName(
+                                ru.protolink.communicator.data.api.EntityDto(id = entityId, code = CloudCodes.CLOUD_FILE)
+                            )
+                        },
+                        mimeType = mime ?: "application/octet-stream",
+                        byteLength = seedBytes
                     )
                 }
             }
@@ -485,7 +533,7 @@ private suspend fun loadRemoteAttachment(
 
         val initial = MessengerAttachmentRender.initialKind(mime, forceFileRow = false)
         if (initial == MessengerAttachmentVisualKind.File) {
-            val len = contentLengthOrNull(api, entityId)
+            val len = contentLengthOrNull(api, entityId) ?: seedBytes
             return@withContext AttachmentUiState(
                 entityId = entityId,
                 kind = MessengerAttachmentVisualKind.File,
@@ -529,7 +577,7 @@ private suspend fun loadRemoteAttachment(
             MessengerAttachmentVisualKind.TombstoneNoAccess ->
                 AttachmentUiState(entityId, kind, fileName, mime)
             else -> {
-                val len = contentLengthOrNull(api, entityId)
+                val len = contentLengthOrNull(api, entityId) ?: seedBytes
                 AttachmentUiState(
                     entityId = entityId,
                     kind = MessengerAttachmentVisualKind.File,
@@ -539,12 +587,15 @@ private suspend fun loadRemoteAttachment(
                 )
             }
         }
+    } catch (ex: CancellationException) {
+        throw ex
     } catch (_: Exception) {
         AttachmentUiState(
             entityId = entityId,
             kind = MessengerAttachmentVisualKind.File,
             fileName = fileName,
-            mimeType = mime
+            mimeType = mime,
+            byteLength = seedBytes
         )
     }
 }

@@ -1973,7 +1973,15 @@ private fun MessengerChatPane(
                     contentPadding = PaddingValues(vertical = 8.dp, horizontal = 6.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    items(chatRows.size) { index ->
+                    items(
+                        count = chatRows.size,
+                        key = { index ->
+                            when (val row = chatRows[index]) {
+                                is ChatRow.DateHeader -> "day:${row.label}"
+                                is ChatRow.Bubble -> "msg:${row.message.id}"
+                            }
+                        }
+                    ) { index ->
                         when (val row = chatRows[index]) {
                             is ChatRow.DateHeader -> DateChip(row.label)
                             is ChatRow.Bubble -> MessageBubble(
@@ -2210,7 +2218,17 @@ private fun MessageBubble(
     val align = if (m.mine) Alignment.CenterEnd else Alignment.CenterStart
     val pendingLocal = m.pendingLocalAttachments.orEmpty()
     val hasServerAttachments = m.attachmentIds.isNotEmpty()
-    val hasLocalPreview = pendingLocal.isNotEmpty() && (uploading || sending || failed)
+    // Keep local name visible through Sent when server ids are not yet on the row
+    // (reload race); once ids exist, seed MessageAttachmentsColumn instead.
+    val hasLocalPreview = pendingLocal.isNotEmpty() && (uploading || sending || failed || !hasServerAttachments)
+    val attachmentSeeds = pendingLocal.mapNotNull { d ->
+        val id = d.cloudFileEntityId?.trim()?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+        id.lowercase() to ru.protolink.communicator.util.MessengerAttachmentSeed(
+            fileName = d.fileName,
+            mimeType = d.mimeType.takeIf { it.isNotBlank() },
+            byteLength = d.byteLength.takeIf { it > 0L }
+        )
+    }.toMap()
     val imageOnly = (hasServerAttachments || hasLocalPreview) && m.text.isBlank()
     val bubblePadding = if (imageOnly) Modifier.padding(2.dp) else Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
     val bubbleAlpha = if (failed) 0.7f else 1f
@@ -2238,7 +2256,8 @@ private fun MessageBubble(
                             ru.protolink.communicator.ui.messenger.MessageAttachmentsColumn(
                                 attachmentIds = m.attachmentIds,
                                 api = api,
-                                multiImageMaxHeight = m.attachmentIds.size > 1
+                                multiImageMaxHeight = m.attachmentIds.size > 1,
+                                seedsByEntityId = attachmentSeeds
                             )
                             if (uploading) {
                                 UploadProgressOverlay(m.uploadProgress)
