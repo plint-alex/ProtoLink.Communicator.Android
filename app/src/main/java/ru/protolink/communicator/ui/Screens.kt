@@ -1323,6 +1323,13 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                                     item.isShareRoot,
                                     item.isVirtualEntry
                                 )
+                            val canDeleteRow =
+                                ru.protolink.communicator.util.CloudFolderDelete.canDeleteItem(
+                                    item.isVirtualEntry,
+                                    item.id,
+                                    crumbIds,
+                                    state.shareRootCanWrite
+                                )
                             val typeText = item.typeLabel
                                 ?: if (item.isFolder) "Folder" else (item.subtitle ?: "File")
                             Box {
@@ -1446,6 +1453,20 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                                             }
                                         )
                                     }
+                                    if (canDeleteRow) {
+                                        DropdownMenuItem(
+                                            text = {
+                                                Text(
+                                                    ru.protolink.communicator.util.CloudFolderDelete.deleteMenu(lang),
+                                                    color = MaterialTheme.colorScheme.error
+                                                )
+                                            },
+                                            onClick = {
+                                                itemMenuId = null
+                                                vm.requestDeleteCloudItem(item)
+                                            }
+                                        )
+                                    }
                                 }
                             }
                             Divider(color = igBorder, thickness = 0.5.dp)
@@ -1457,6 +1478,39 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
     }
 
     ProtoLinkShareSheetHost(vm = vm, state = state, lang = lang)
+
+    state.pendingDeleteCloud?.let { pending ->
+        AlertDialog(
+            onDismissRequest = { vm.dismissDeleteCloud() },
+            title = {
+                Text(ru.protolink.communicator.util.CloudFolderDelete.confirmTitle(lang))
+            },
+            text = {
+                Text(
+                    ru.protolink.communicator.util.CloudFolderDelete.confirmBody(
+                        lang,
+                        pending.name,
+                        pending.isFolder
+                    )
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = { vm.confirmDeleteCloud() },
+                    colors = androidx.compose.material3.ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Text(ru.protolink.communicator.util.CloudFolderDelete.deleteMenu(lang))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { vm.dismissDeleteCloud() }) {
+                    Text(ShareSheetStrings.cancel(lang))
+                }
+            }
+        )
+    }
 
     leaveConfirmEntityId?.let { leaveId ->
         AlertDialog(

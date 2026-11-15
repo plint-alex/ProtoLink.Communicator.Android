@@ -27,6 +27,7 @@ import ru.protolink.communicator.data.SystemEntities
 import ru.protolink.communicator.data.api.AddEntityRequest
 import ru.protolink.communicator.data.api.AddPermissionRequest
 import ru.protolink.communicator.data.api.AddValueRequest
+import ru.protolink.communicator.data.api.DeleteEntityRequest
 import ru.protolink.communicator.data.api.EntityDto
 import ru.protolink.communicator.data.api.GetEntitiesRequest
 import ru.protolink.communicator.data.api.ProtoLinkApi
@@ -43,6 +44,7 @@ import ru.protolink.communicator.data.messenger.PendingAttachmentDraft
 import ru.protolink.communicator.data.messenger.ProgressRequestBody
 import ru.protolink.communicator.util.ChatTime
 import ru.protolink.communicator.util.CloudFileTypeCue
+import ru.protolink.communicator.util.CloudFolderDelete
 import ru.protolink.communicator.util.CloudFolderTree
 import ru.protolink.communicator.util.CloudListingStatus
 import ru.protolink.communicator.util.CloudMainParent
@@ -232,6 +234,13 @@ data class PendingDeleteNote(
     val hasChildren: Boolean
 )
 
+/** Dialog: confirm Cloud folder/file delete (E10 / AT-CFD). */
+data class PendingDeleteCloud(
+    val id: String,
+    val name: String,
+    val isFolder: Boolean
+)
+
 data class UiState(
     val authenticated: Boolean = false,
     val login: String = "",
@@ -279,6 +288,7 @@ data class UiState(
     val pendingConflict: PendingConflict? = null,
     val pendingCreateNote: PendingCreateNote? = null,
     val pendingDeleteNote: PendingDeleteNote? = null,
+    val pendingDeleteCloud: PendingDeleteCloud? = null,
     val syncError: String? = null,
     val userError: UserError? = null,
     val syncSuccess: String? = null,
@@ -2902,6 +2912,148 @@ class MainViewModel @Inject constructor(
         val parent = currentFolderId ?: return@launch
         createCloudFolderUnder(parent, name) ?: return@launch
         loadCloudFolder(parent)
+    }
+
+    /** E10 / AT-CFD: show confirm for Cloud item Delete (gated by CanWrite under Shared-with-me). */
+    fun requestDeleteCloudItem(item: CloudItem) {
+        val crumbIds = _state.value.breadcrumb.map { it.first }
+        if (!CloudFolderDelete.canDeleteItem(
+                item.isVirtualEntry,
+                item.id,
+                crumbIds,
+                _state.value.shareRootCanWrite
+            )
+        ) {
+            _state.update { it.copy(status = CloudFolderDelete.permissionDenied(uiLang())) }
+            return
+        }
+        _state.update {
+            it.copy(
+                pendingDeleteCloud = PendingDeleteCloud(
+                    id = item.id,
+                    name = item.name,
+                    isFolder = item.isFolder
+                )
+            )
+        }
+    }
+
+    fun dismissDeleteCloud() {
+        _state.update { it.copy(pendingDeleteCloud = null) }
+    }
+
+    fun confirmDeleteCloud() {
+        val pending = _state.value.pendingDeleteCloud ?: return
+        _state.update { it.copy(pendingDeleteCloud = null) }
+        deleteCloudItem(pending.id, pending.name, pending.isFolder)
+    }
+
+    private fun deleteCloudItem(id: String, name: String, isFolder: Boolean) = viewModelScope.launch {
+        val crumbIds = _state.value.breadcrumb.map { it.first }
+        if (!CloudFolderDelete.canDeleteItem(
+                isVirtualEntry = false,
+                itemId = id,
+                breadcrumbIds = crumbIds,
+                shareRootCanWrite = _state.value.shareRootCanWrite
+            )
+        ) {
+            _state.update { it.copy(status = CloudFolderDelete.permissionDenied(uiLang())) }
+            return@launch
+        }
+
+        val mappings = mappingStore.load()
+        val wasMappedRoot = isFolder && mappings.any { it.cloudFolderId.equals(id, ignoreCase = true) }
+        val mirror = CloudFolderDelete.resolveMirrorTarget(
+            itemId = id,
+            itemName = name,
+            breadcrumb = _state.value.breadcrumb,
+            mappings = mappings
+        ) ?: run {
+            // Prefer metadata relative path when breadcrumb path is incomplete (e.g. Recent).
+            val meta = runCatching { metadataStore.findByRemoteId(id) }.getOrNull()
+            if (meta != null) {
+                val map = mappings.firstOrNull {
+                    it.cloudFolderId.replace("-", "")
+                        .equals(meta.mappingId, ignoreCase = true) ||
+                        it.cloudFolderId.equals(meta.mappingId, ignoreCase = true)
+                }
+                if (map != null && map.localPath.isNotBlank()) {
+                    CloudFolderDelete.MirrorTarget(
+                        rootUri = map.localPath,
+                        relativePath = meta.relativePath,
+                        isMappedRoot = meta.relativePath.isBlank()
+                    )
+                } else null
+            } else null
+        }
+
+        try {
+            if (isFolder) {
+                CloudFolderDelete.deleteFolderRecursive(
+                    folderId = id,
+                    listChildren = { folderId ->
+                        api.getEntities(
+                            GetEntitiesRequest(
+                                parentIds = listOf(folderId),
+                                includeValues = false,
+                                take = 500
+                            )
+                        ).map { CloudFolderDelete.ChildRef(it.id, it.code) }
+                    },
+                    deleteEntity = { entityId ->
+                        api.deleteEntity(DeleteEntityRequest(entityId))
+                    }
+                )
+            } else {
+                api.deleteEntity(DeleteEntityRequest(id))
+            }
+
+            // NFR-SYNC-1: mirror IO soft-fails; Cloud tree already deleted.
+            CloudFolderDelete.softDeleteLocalMirror(localFs, mirror, isFolder)
+            if (wasMappedRoot) {
+                unmapFolderQuiet(id)
+            } else if (mirror != null && mirror.relativePath.isNotBlank()) {
+                val mappingId = mappings.firstOrNull {
+                    it.localPath == mirror.rootUri
+                }?.cloudFolderId?.replace("-", "")
+                if (mappingId != null) {
+                    runCatching { metadataStore.delete(mappingId, mirror.relativePath) }
+                }
+            }
+            runCatching { metadataStore.deleteByRemoteId(id) }
+
+            val openFile = _state.value.cloudOpenFile
+            if (openFile?.id.equals(id, ignoreCase = true)) {
+                clearCloudFileOpen()
+            }
+
+            val listed = currentFolderId
+            val statusOk = CloudFolderDelete.deletedStatus(uiLang(), name)
+            if (listed != null) {
+                loadCloudFolder(listed, statusAfterLoad = statusOk)
+            } else {
+                _state.update { it.copy(status = statusOk) }
+            }
+            refreshFolderTree()
+        } catch (e: Exception) {
+            val http = e as? retrofit2.HttpException
+            if (http?.code() == 403) {
+                _state.update { it.copy(status = CloudFolderDelete.permissionDenied(uiLang())) }
+            } else {
+                showError("Delete failed", httpDetail(e), e)
+            }
+        }
+    }
+
+    /** Unmap without status toast (mapped-root delete honesty). */
+    private fun unmapFolderQuiet(cloudFolderId: String) {
+        val list = mappingStore.load().toMutableList()
+        if (list.none { it.cloudFolderId.equals(cloudFolderId, ignoreCase = true) }) return
+        list.removeAll { it.cloudFolderId.equals(cloudFolderId, ignoreCase = true) }
+        mappingStore.save(list)
+        val mappingId = cloudFolderId.replace("-", "")
+        runCatching { metadataStore.clearMapping(mappingId) }
+        _state.update { it.copy(mappings = list) }
     }
 
     fun loadContacts() = viewModelScope.launch {

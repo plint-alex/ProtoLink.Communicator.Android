@@ -43,6 +43,37 @@ class CloudSharedWithMeScopeTest {
     }
 
     @Test
+    fun allowsWriteUnderSharedScope_matchesMapGate() {
+        val writeRoot = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        val readRoot = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        val canWrite = mapOf(
+            writeRoot.lowercase() to true,
+            readRoot.lowercase() to false
+        )
+        val writeCrumbs = listOf(
+            CloudVirtualNodes.HUB_ID,
+            CloudVirtualNodes.SHARED_WITH_ME_ID,
+            writeRoot
+        )
+        val readCrumbs = listOf(
+            CloudVirtualNodes.HUB_ID,
+            CloudVirtualNodes.SHARED_WITH_ME_ID,
+            readRoot
+        )
+        assertThat(
+            CloudSharedScope.allowsWriteUnderSharedScope(writeCrumbs, writeRoot, canWrite)
+        ).isTrue()
+        assertThat(
+            CloudSharedScope.allowsWriteUnderSharedScope(readCrumbs, readRoot, canWrite)
+        ).isFalse()
+        assertThat(
+            CloudSharedScope.allowsMapUnderSharedScope(writeCrumbs, writeRoot, canWrite)
+        ).isEqualTo(
+            CloudSharedScope.allowsWriteUnderSharedScope(writeCrumbs, writeRoot, canWrite)
+        )
+    }
+
+    @Test
     fun canMap_writeShareRoot_true_readShareRoot_false() {
         val writeRoot = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
         val readRoot = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"

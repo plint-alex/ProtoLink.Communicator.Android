@@ -38,14 +38,26 @@ object CloudSharedScope {
         return shareRootCanWrite[rootId.lowercase()] == true
     }
 
+    /**
+     * Outside Shared with me always true; inside, only when the active share root is writable.
+     * Shared by Map, Delete, and other write mutations (AT-CFD-5 / AT-S42). Win parity:
+     * [AllowsWriteUnderSharedScope].
+     */
+    fun allowsWriteUnderSharedScope(
+        breadcrumbIds: Iterable<String>,
+        entityId: String,
+        shareRootCanWrite: Map<String, Boolean>
+    ): Boolean =
+        !isInSharedWithMeScope(breadcrumbIds) ||
+            isShareRootWritable(breadcrumbIds, entityId, shareRootCanWrite)
+
     /** Outside Shared with me always true; inside, only when the active share root is writable. */
     fun allowsMapUnderSharedScope(
         breadcrumbIds: Iterable<String>,
         folderId: String,
         shareRootCanWrite: Map<String, Boolean>
     ): Boolean =
-        !isInSharedWithMeScope(breadcrumbIds) ||
-            isShareRootWritable(breadcrumbIds, folderId, shareRootCanWrite)
+        allowsWriteUnderSharedScope(breadcrumbIds, folderId, shareRootCanWrite)
 
     fun showSharedBrowseOnlyHint(
         currentFolderId: String?,
