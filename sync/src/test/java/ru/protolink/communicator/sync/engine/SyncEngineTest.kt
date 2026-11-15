@@ -290,7 +290,7 @@ class SyncEngineTest {
     }
 
     @Test
-    fun comparePhase_emptyRemoteBytes_reachesHashDecideNotDownloadFailure() = runTest {
+    fun comparePhase_emptyRemoteBytes_cloudWinsWithoutThrow() = runTest {
         val (store, fs, inner) = harness()
         // Non-stub local (len >= 64) so compare reaches hash decide with empty remote bytes.
         val localBody = "x".repeat(64)
@@ -306,15 +306,10 @@ class SyncEngineTest {
         )
         fs.writeFile(root, "note/index.html", localBody.toByteArray())
 
-        var threw: Throwable? = null
-        try {
-            SyncEngine(store, fs, inner).reconcileAll(listOf(mapping))
-        } catch (t: Throwable) {
-            threw = t
-        }
-        assertThat(threw).isInstanceOf(SyncConflictException::class.java)
-        assertThat(threw!!.message).doesNotContain("returned empty")
-        assertThat(threw.message!!.lowercase()).doesNotContain("download failed")
+        SyncEngine(store, fs, inner).reconcileAll(listOf(mapping))
+
+        assertThat(fs.readFile(root, "note/index.html")).isEmpty()
+        assertThat(inner.get(id)!!.bytes!!).isEmpty()
     }
 
     @Test
@@ -394,21 +389,15 @@ class SyncEngineTest {
     }
 
     @Test
-    fun bothChanged_diverged_throwsConflict() = runTest {
+    fun bothChanged_diverged_cloudWins() = runTest {
         val (store, fs, remote) = harness()
         fs.writeFile(root, "c.txt", "aa".toByteArray())
         SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
         val id = store.getAll("m1").first().remoteId
         fs.writeFile(root, "c.txt", "local-wins-content".toByteArray())
         remote.uploadFile(id, "c.txt", "REMOTE".toByteArray(), "text/plain")
-        try {
-            SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
-            throw AssertionError("expected SyncConflictException")
-        } catch (e: SyncConflictException) {
-            assertThat(e.relativePath).isEqualTo("c.txt")
-        }
-        // Unchanged until Force Upload / Force Download
-        assertThat(String(fs.readFile(root, "c.txt"))).isEqualTo("local-wins-content")
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+        assertThat(String(fs.readFile(root, "c.txt"))).isEqualTo("REMOTE")
         assertThat(String(remote.get(id)!!.bytes!!)).isEqualTo("REMOTE")
     }
 

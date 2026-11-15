@@ -94,34 +94,34 @@ class SyncDirectionDecideTest {
     }
 
     @Test
-    fun decideByHash_emptyMeta_diverged_conflicts() {
+    fun decideByHash_emptyMeta_diverged_readsCloud() {
         val local = ContentHashUtil.sha256Hex("Test6".toByteArray())
         val remote = ContentHashUtil.sha256Hex("Test5".toByteArray())
         assertThat(ContentHashUtil.decideByHash(local, remote, null))
-            .isEqualTo(SyncDirectionDecide.Action.Conflict)
+            .isEqualTo(SyncDirectionDecide.Action.Read)
         assertThat(
             ContentHashUtil.decideByHash(
                 local, remote, "",
                 remoteUpdateTime = Instant.EPOCH,
                 metaUpdateTime = Instant.EPOCH
             )
-        ).isEqualTo(SyncDirectionDecide.Action.Conflict)
+        ).isEqualTo(SyncDirectionDecide.Action.Read)
         assertThat(
             ContentHashUtil.decideByHash(
                 local, remote, "",
                 remoteUpdateTime = Instant.parse("2024-01-02T00:00:00Z"),
                 metaUpdateTime = Instant.parse("2024-01-01T00:00:00Z")
             )
-        ).isEqualTo(SyncDirectionDecide.Action.Conflict)
+        ).isEqualTo(SyncDirectionDecide.Action.Read)
     }
 
     @Test
-    fun decideByHash_bothDivergedFromMeta_conflicts() {
+    fun decideByHash_bothDivergedFromMeta_readsCloud() {
         val local = ContentHashUtil.sha256Hex("local".toByteArray())
         val remote = ContentHashUtil.sha256Hex("remote".toByteArray())
         val meta = ContentHashUtil.sha256Hex("baseline".toByteArray())
         assertThat(ContentHashUtil.decideByHash(local, remote, meta))
-            .isEqualTo(SyncDirectionDecide.Action.Conflict)
+            .isEqualTo(SyncDirectionDecide.Action.Read)
     }
 
     @Test

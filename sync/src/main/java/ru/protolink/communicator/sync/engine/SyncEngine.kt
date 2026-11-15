@@ -208,14 +208,17 @@ class SyncEngine(
                     )
                 }
                 SyncDirectionDecide.Action.Conflict -> {
-                    throw SyncConflictException(
-                        path,
-                        localHash,
-                        remoteHash,
-                        meta.contentHash,
-                        "Local and remote both differ from sync baseline (or baseline is empty).",
-                        mappingId = mapping.id
+                    // DecideByHash no longer returns Conflict (cloud-wins Read); keep as Read.
+                    fs.writeFile(mapping.localRootPath, meta.relativePath, remoteBytes)
+                    store.upsert(
+                        meta.copy(
+                            sizeBytes = remoteBytes.size.toLong(),
+                            contentHash = remoteHash,
+                            remoteUpdateTime = located.entry.updateTime ?: Instant.now()
+                        )
                     )
+                    dirty.add(path)
+                    reads++
                 }
             }
         }
@@ -413,7 +416,10 @@ class SyncEngine(
                                 )
                             )
                         }
-                        SyncDirectionDecide.Action.Read, SyncDirectionDecide.Action.Skip -> {
+                        SyncDirectionDecide.Action.Read,
+                        SyncDirectionDecide.Action.Skip,
+                        SyncDirectionDecide.Action.Conflict -> {
+                            // Conflict(legacy) → same as Read: adopt cloud when hashes differ.
                             if (!localHash.equals(remoteHash, ignoreCase = true)) {
                                 fs.writeFile(mapping.localRootPath, a.entry.relativePath, cloud)
                             }
@@ -428,16 +434,6 @@ class SyncEngine(
                                     contentHash = remoteHash,
                                     remoteUpdateTime = existingRemote.entry.updateTime ?: Instant.now()
                                 )
-                            )
-                        }
-                        SyncDirectionDecide.Action.Conflict -> {
-                            throw SyncConflictException(
-                                path,
-                                localHash,
-                                remoteHash,
-                                null,
-                                "Local add collides with different remote content.",
-                                mappingId = mapping.id
                             )
                         }
                     }

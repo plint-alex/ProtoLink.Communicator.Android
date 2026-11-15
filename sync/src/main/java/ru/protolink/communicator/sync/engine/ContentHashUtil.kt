@@ -18,7 +18,8 @@ object ContentHashUtil {
     /**
      * Convergence decision once both local and remote content hashes are known.
      * Never call with an empty remoteHash — download first; on download failure throw.
-     * Ambiguous cases (empty meta, both diverged) → Conflict (no silent LWW / Write bias).
+     * Ambiguous cases (empty meta, both diverged) → Read (cloud wins) so every device
+     * mapped to the same CloudFolderId ends with the same bytes (delete/overwrite OK).
      */
     internal fun decideByHash(
         localHash: String?,
@@ -39,9 +40,9 @@ object ContentHashUtil {
         if (localMatchesMeta && !remoteMatchesMeta) return SyncDirectionDecide.Action.Read
         if (remoteMatchesMeta && !localMatchesMeta) return SyncDirectionDecide.Action.Write
 
-        // Empty baseline or both sides diverged — do not guess.
+        // Empty baseline or both sides diverged — cloud is the shared truth across devices.
         @Suppress("UNUSED_VARIABLE")
         val unusedTimes = remoteUpdateTime to metaUpdateTime
-        return SyncDirectionDecide.Action.Conflict
+        return SyncDirectionDecide.Action.Read
     }
 }
