@@ -32,7 +32,8 @@ import ru.protolink.communicator.util.SameNamedCloudFolderHeal
 data class MapLocalFolderCandidate(
     val id: String,
     val name: String,
-    val creationTime: String? = null
+    val creationTime: String? = null,
+    val immediateChildCount: Int = 0
 )
 
 data class MapLocalFolderWizardResult(
@@ -62,7 +63,12 @@ fun MapLocalFolderWizardDialog(
         SameNamedCloudFolderHeal.preferExistingSameName(
             suggestedName,
             candidates.map {
-                SameNamedCloudFolderHeal.Sibling(it.id, it.name, it.creationTime)
+                SameNamedCloudFolderHeal.Sibling(
+                    it.id,
+                    it.name,
+                    it.creationTime,
+                    it.immediateChildCount
+                )
             }
         )
     }

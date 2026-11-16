@@ -2,15 +2,20 @@ package ru.protolink.communicator.util
 
 /**
  * Dual same-named CloudFolders (e.g. two "MyNotesFolder") break cross-device sync when
- * Create-new in the map wizard adds a second id while Win already maps the older one.
- * Canonical pick = earliest creationTime among case-insensitive name matches.
+ * Create-new in the map wizard adds a second id while Win already maps the populated one.
+ *
+ * Canonical pick among case-insensitive name matches:
+ * 1) higher immediateChildCount (populated wins over empty older duplicates),
+ * 2) then earliest creationTime,
+ * 3) then id.
  */
 object SameNamedCloudFolderHeal {
 
     data class Sibling(
         val id: String,
         val name: String,
-        val creationTime: String? = null
+        val creationTime: String? = null,
+        val immediateChildCount: Int = 0
     )
 
     data class MappingRow(
@@ -26,7 +31,7 @@ object SameNamedCloudFolderHeal {
         val folderName: String
     )
 
-    /** Prefer existing same-named sibling instead of AddEntity(create). Oldest wins. */
+    /** Prefer existing same-named sibling instead of AddEntity(create). Populated, then oldest. */
     fun preferExistingSameName(desiredName: String, siblings: List<Sibling>): Sibling? {
         val name = desiredName.trim()
         if (name.isEmpty()) return null
@@ -36,7 +41,7 @@ object SameNamedCloudFolderHeal {
     }
 
     /**
-     * Among siblings sharing [mappedName], return the canonical id (oldest).
+     * Among siblings sharing [mappedName], return the canonical id (populated, then oldest).
      * Null when there is no duplicate or mapped already is canonical.
      */
     fun canonicalIdIfMappedIsDuplicate(
@@ -55,7 +60,7 @@ object SameNamedCloudFolderHeal {
 
     /**
      * For each mapping whose Cloud folder name collides with a sibling under the same parent,
-     * remap localPath onto the canonical (oldest) id.
+     * remap localPath onto the canonical (populated, then oldest) id.
      */
     fun remapsForDuplicateNames(
         mappings: List<MappingRow>,
@@ -125,6 +130,8 @@ object SameNamedCloudFolderHeal {
     }
 
     private val siblingCanonicalOrder = Comparator<Sibling> { a, b ->
+        val childCmp = b.immediateChildCount.compareTo(a.immediateChildCount)
+        if (childCmp != 0) return@Comparator childCmp
         val ta = a.creationTime?.trim().orEmpty()
         val tb = b.creationTime?.trim().orEmpty()
         when {

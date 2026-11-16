@@ -2495,17 +2495,15 @@ class MainViewModel @Inject constructor(
     }
 
     private suspend fun loadUnmappedChildFolders(parentId: String): List<MapLocalFolderCandidate> {
-        val children = api.getEntities(
-            GetEntitiesRequest(parentIds = listOf(parentId), includeValues = true, take = 500)
-        )
+        val siblings = loadChildFolderSiblings(parentId)
         val mapped = mappingStore.load().map { it.cloudFolderId.lowercase() }.toSet()
-        return children.mapNotNull { e ->
-            if (e.code != CloudCodes.CLOUD_FOLDER && e.code != CloudCodes.CLOUD_ROOT) return@mapNotNull null
-            if (mapped.contains(e.id.lowercase())) return@mapNotNull null
+        return siblings.mapNotNull { s ->
+            if (mapped.contains(s.id.lowercase())) return@mapNotNull null
             MapLocalFolderCandidate(
-                id = e.id,
-                name = entityDisplayName(e),
-                creationTime = e.creationTime
+                id = s.id,
+                name = s.name,
+                creationTime = s.creationTime,
+                immediateChildCount = s.immediateChildCount
             )
         }
     }
@@ -2514,7 +2512,7 @@ class MainViewModel @Inject constructor(
         val children = api.getEntities(
             GetEntitiesRequest(parentIds = listOf(parentId), includeValues = true, take = 500)
         )
-        return children.mapNotNull { e ->
+        val base = children.mapNotNull { e ->
             if (e.code != CloudCodes.CLOUD_FOLDER && e.code != CloudCodes.CLOUD_ROOT) return@mapNotNull null
             SameNamedCloudFolderHeal.Sibling(
                 id = e.id,
@@ -2522,11 +2520,40 @@ class MainViewModel @Inject constructor(
                 creationTime = e.creationTime
             )
         }
+        return enrichDuplicateSiblingChildCounts(base)
     }
 
     /**
-     * Remap Notes/Cloud mappings that point at a newer duplicate same-named CloudFolder
-     * onto the oldest sibling (Win/AC MyNotesFolder = earliest CreationTime).
+     * When same-named folders collide, load immediate child counts so canonical pick
+     * prefers the populated Win/AC id over an older empty duplicate.
+     */
+    private suspend fun enrichDuplicateSiblingChildCounts(
+        siblings: List<SameNamedCloudFolderHeal.Sibling>
+    ): List<SameNamedCloudFolderHeal.Sibling> {
+        if (siblings.size < 2) return siblings
+        val dupNames = siblings
+            .groupBy { it.name.trim().lowercase() }
+            .filter { it.key.isNotEmpty() && it.value.size >= 2 }
+            .keys
+        if (dupNames.isEmpty()) return siblings
+        return siblings.map { s ->
+            if (s.name.trim().lowercase() !in dupNames) return@map s
+            val count = runCatching {
+                api.getEntities(
+                    GetEntitiesRequest(
+                        parentIds = listOf(s.id),
+                        includeValues = false,
+                        take = 500
+                    )
+                ).size
+            }.getOrDefault(0)
+            s.copy(immediateChildCount = count)
+        }
+    }
+
+    /**
+     * Remap Notes/Cloud mappings that point at a duplicate same-named CloudFolder
+     * onto the canonical sibling (populated preferred, then oldest CreationTime).
      */
     private suspend fun healDuplicateSameNamedMappings(): Int {
         val mappings = mappingStore.load()

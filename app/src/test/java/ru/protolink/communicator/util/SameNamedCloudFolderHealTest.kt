@@ -4,8 +4,8 @@ import com.google.common.truth.Truth.assertThat
 import org.junit.Test
 
 /**
- * FAIL class P1-20261117: Android mapped duplicate MyNotesFolder 0bc549dd (newer empty films)
- * while Win/AC use older 898c1453.
+ * FAIL class P1-20261117: Android mapped duplicate MyNotesFolder 0bc549dd
+ * while Win/AC use populated 898c1453. Live: empty dup is older than populated Win id.
  */
 class SameNamedCloudFolderHealTest {
 
@@ -13,48 +13,72 @@ class SameNamedCloudFolderHealTest {
     private val dupId = "0bc549dd-c880-42df-af32-4f3c340ba970"
     private val local = "content://com.android.externalstorage.documents/tree/primary%3AMyNotesFolder"
 
-    private val siblings = listOf(
-        SameNamedCloudFolderHeal.Sibling(dupId, "MyNotesFolder", "2026-11-15T10:00:00"),
-        SameNamedCloudFolderHeal.Sibling(winId, "MyNotesFolder", "2026-10-29T18:49:32.7901832"),
-        SameNamedCloudFolderHeal.Sibling("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "Other", "2026-01-01T00:00:00")
+    /** Prior assumption (Win oldest) — both empty → oldest still wins. */
+    private val siblingsWinOldest = listOf(
+        SameNamedCloudFolderHeal.Sibling(dupId, "MyNotesFolder", "2026-11-15T10:00:00", 0),
+        SameNamedCloudFolderHeal.Sibling(winId, "MyNotesFolder", "2026-10-29T18:49:32.7901832", 0),
+        SameNamedCloudFolderHeal.Sibling("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "Other", "2026-01-01T00:00:00", 0)
+    )
+
+    /**
+     * Live ADY-LX9: empty 0bc549dd created 2026-10-28 (older), populated 898c1453 on 2026-10-29.
+     * Pure oldest-wins wrongly keeps the empty dup.
+     */
+    private val siblingsLiveEmptyOlder = listOf(
+        SameNamedCloudFolderHeal.Sibling(dupId, "MyNotesFolder", "2026-10-28T12:00:00", 0),
+        SameNamedCloudFolderHeal.Sibling(winId, "MyNotesFolder", "2026-10-29T18:49:32.7901832", 12),
+        SameNamedCloudFolderHeal.Sibling("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "Other", "2026-01-01T00:00:00", 0)
     )
 
     @Test
-    fun preferExistingSameName_picksOldestMyNotesFolder() {
-        val pick = SameNamedCloudFolderHeal.preferExistingSameName("MyNotesFolder", siblings)
+    fun preferExistingSameName_picksOldestWhenChildCountsEqual() {
+        val pick = SameNamedCloudFolderHeal.preferExistingSameName("MyNotesFolder", siblingsWinOldest)
+        assertThat(pick!!.id).isEqualTo(winId)
+    }
+
+    @Test
+    fun preferExistingSameName_prefersPopulatedOverOlderEmpty() {
+        val pick = SameNamedCloudFolderHeal.preferExistingSameName("MyNotesFolder", siblingsLiveEmptyOlder)
         assertThat(pick!!.id).isEqualTo(winId)
     }
 
     @Test
     fun preferExistingSameName_noMatch_returnsNull() {
         assertThat(
-            SameNamedCloudFolderHeal.preferExistingSameName("BrandNew", siblings)
+            SameNamedCloudFolderHeal.preferExistingSameName("BrandNew", siblingsWinOldest)
         ).isNull()
     }
 
     @Test
     fun canonicalIdIfMappedIsDuplicate_remapsNewerDupToWin() {
         assertThat(
-            SameNamedCloudFolderHeal.canonicalIdIfMappedIsDuplicate(dupId, "MyNotesFolder", siblings)
+            SameNamedCloudFolderHeal.canonicalIdIfMappedIsDuplicate(dupId, "MyNotesFolder", siblingsWinOldest)
+        ).isEqualTo(winId)
+    }
+
+    @Test
+    fun canonicalIdIfMappedIsDuplicate_remapsOlderEmptyDupToPopulatedWin() {
+        assertThat(
+            SameNamedCloudFolderHeal.canonicalIdIfMappedIsDuplicate(dupId, "MyNotesFolder", siblingsLiveEmptyOlder)
         ).isEqualTo(winId)
     }
 
     @Test
     fun canonicalIdIfMappedIsDuplicate_alreadyCanonical_null() {
         assertThat(
-            SameNamedCloudFolderHeal.canonicalIdIfMappedIsDuplicate(winId, "MyNotesFolder", siblings)
+            SameNamedCloudFolderHeal.canonicalIdIfMappedIsDuplicate(winId, "MyNotesFolder", siblingsLiveEmptyOlder)
         ).isNull()
     }
 
     @Test
-    fun remapsAndApply_healsAndroidDupMapping() {
+    fun remapsAndApply_healsAndroidDupMappingWhenEmptyIsOlder() {
         val mappings = listOf(
             SameNamedCloudFolderHeal.MappingRow(dupId, local, "MyNotesFolder")
         )
         val parent = "cloud-root-id"
         val remaps = SameNamedCloudFolderHeal.remapsForDuplicateNames(
             mappings = mappings,
-            siblingsByParent = mapOf(parent to siblings),
+            siblingsByParent = mapOf(parent to siblingsLiveEmptyOlder),
             parentIdByMappedId = mapOf(dupId to parent)
         )
         assertThat(remaps).hasSize(1)
