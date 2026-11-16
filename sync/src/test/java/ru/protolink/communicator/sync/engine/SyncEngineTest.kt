@@ -580,4 +580,98 @@ class SyncEngineTest {
         assertThat(remote.get("bad-folder")).isNotNull()
         assertThat(remote.get("ok-folder")).isNotNull()
     }
+
+    /**
+     * FAIL class from P1-20261115-verify-mynotesfolder-sync-android: partial bootstrap left
+     * folder meta + empty local dirs; next Sync must fill remote files (heal folders-only).
+     */
+    @Test
+    fun folderOnlyMeta_healsMissingRemoteFilesOnNextSync() = runTest {
+        val (store, fs, remote) = harness()
+        remote.seedFolder("films-f", "cloud-root", "films")
+        remote.seedFile("films-i", "films-f", "index.html", "<p>Movie</p>".toByteArray())
+        remote.seedFolder("atv-f", "cloud-root", "agentteamverify")
+        remote.seedFile("atv-i", "atv-f", "probe-test.txt", "fixture".toByteArray())
+
+        fs.createDirectory(root, "films")
+        fs.createDirectory(root, "agentteamverify")
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "films-f",
+                parentRemoteId = "cloud-root",
+                relativePath = "films",
+                isFolder = true,
+                sizeBytes = 0
+            )
+        )
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "atv-f",
+                parentRemoteId = "cloud-root",
+                relativePath = "agentteamverify",
+                isFolder = true,
+                sizeBytes = 0
+            )
+        )
+
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("<p>Movie</p>")
+        assertThat(String(fs.readFile(root, "agentteamverify/probe-test.txt"))).isEqualTo("fixture")
+    }
+
+    /** Bootstrap must not call full-tree snapshot once per remote item (O(n²) on polluted roots). */
+    @Test
+    fun bootstrap_doesNotSnapshotWholeTreePerRemoteItem() = runTest {
+        val (store, innerFs, remote) = harness()
+        var snapshots = 0
+        val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
+            override fun snapshot(rootPath: String): List<FsEntry> {
+                snapshots++
+                return innerFs.snapshot(rootPath)
+            }
+        }
+        remote.seedFolder("films-f", "cloud-root", "films")
+        remote.seedFile("films-i", "films-f", "index.html", "movie".toByteArray())
+        repeat(25) { i ->
+            remote.seedFile("r$i", "cloud-root", "cloud-$i.txt", "c$i".toByteArray())
+        }
+        repeat(40) { i ->
+            innerFs.writeFile(root, "local-junk-$i.bin", ByteArray(2048) { i.toByte() })
+        }
+
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
+        // recomputeFolderSizes (1) + compare (1) + local (1) ≈ 3; old bug was 26+ during bootstrap alone.
+        assertThat(snapshots).isAtMost(8)
+    }
+
+    /** Remote children fill even when local junk would otherwise dominate the pass. */
+    @Test
+    fun remoteMissingFiles_materializeDespiteLocalJunk() = runTest {
+        val (store, fs, remote) = harness()
+        remote.seedFolder("films-f", "cloud-root", "films")
+        remote.seedFile("films-i", "films-f", "index.html", "from-cloud".toByteArray())
+        fs.createDirectory(root, "films")
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "films-f",
+                parentRemoteId = "cloud-root",
+                relativePath = "films",
+                isFolder = true,
+                sizeBytes = 0
+            )
+        )
+        repeat(15) { i ->
+            fs.writeFile(root, "evidence-$i.png", ByteArray(512) { 1 })
+        }
+
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("from-cloud")
+    }
 }

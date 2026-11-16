@@ -29,7 +29,9 @@ class SyncEngine(
         val dirtyByMapping = mutableMapOf<String, MutableSet<String>>()
 
         for (mapping in mappings) {
-            if (store.getAll(mapping.id).isEmpty()) {
+            val meta = store.getAll(mapping.id)
+            // Empty store OR folders-only (partial bootstrap died after mkdir) → pull remote files.
+            if (meta.isEmpty() || meta.none { !it.isFolder }) {
                 bootstrapFromRemote(mapping)
             }
         }
@@ -49,10 +51,10 @@ class SyncEngine(
             val (writes, reads) = applyComparePhase(mapping, enrichedRemote, dirty)
             localCount += writes
             remoteCount += reads
-            val remoteForMapping = enrichedRemote.filter { it.mappingId == mapping.id }
-            localCount += applyLocalPhase(mapping, dirty, skipSizeUpdates = true, remoteForMapping)
             dirtyByMapping[mapping.id] = dirty
         }
+        // Cloud materialize before local upload so polluted Notes trees (local junk) cannot
+        // starve / timeout the pass before missing remote children are filled (cloud-wins).
         for (mapping in mappings) {
             remoteCount += applyRemotePhase(
                 mapping,
@@ -61,6 +63,11 @@ class SyncEngine(
                 enrichedRemote,
                 dirtyByMapping[mapping.id] ?: emptySet()
             )
+        }
+        for (mapping in mappings) {
+            val dirty = dirtyByMapping[mapping.id] ?: mutableSetOf()
+            val remoteForMapping = enrichedRemote.filter { it.mappingId == mapping.id }
+            localCount += applyLocalPhase(mapping, dirty, skipSizeUpdates = true, remoteForMapping)
             store.setLastSyncUtc(mapping.id, Instant.now())
         }
         return Result(localCount, remoteCount)
@@ -225,12 +232,18 @@ class SyncEngine(
         return writes to reads
     }
 
-    /** Seed store from remote and pull missing / empty local files. */
+    /**
+     * Seed store from remote and pull missing / empty local files.
+     * Per-item size/hash must NOT call [LocalFileSystem.snapshot] (full-tree walk + hash) —
+     * that is O(n²) on large/polluted Notes roots and dies after mkdir-only stubs (Win hashes
+     * only the written file). Match Windows BootstrapFromRemoteAsync.
+     */
     private suspend fun bootstrapFromRemote(mapping: SyncMapping) {
         val located = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
         walkRemote(mapping.cloudFolderId, mapping.id, "", located)
         val enriched = enrichRemoteSizes(located)
         for (loc in enriched.sortedBy { it.relativePath.count { c -> c == '/' } }) {
+            var fileBytes: ByteArray? = null
             try {
                 if (loc.entry.isFolder) {
                     if (!fs.exists(mapping.localRootPath, loc.relativePath)) {
@@ -243,13 +256,16 @@ class SyncEngine(
                     if (remoteBytes != null && remoteBytes.isNotEmpty()) {
                         if (missing) {
                             fs.writeFile(mapping.localRootPath, loc.relativePath, remoteBytes)
+                            fileBytes = remoteBytes
                         } else {
-                            val localHash = ContentHashUtil.sha256Hex(
-                                fs.readFile(mapping.localRootPath, loc.relativePath)
-                            )
+                            val localBytes = fs.readFile(mapping.localRootPath, loc.relativePath)
+                            val localHash = ContentHashUtil.sha256Hex(localBytes)
                             val remoteHash = ContentHashUtil.sha256Hex(remoteBytes)
                             if (!localHash.equals(remoteHash, ignoreCase = true)) {
                                 fs.writeFile(mapping.localRootPath, loc.relativePath, remoteBytes)
+                                fileBytes = remoteBytes
+                            } else {
+                                fileBytes = localBytes
                             }
                         }
                     } else if (missing) {
@@ -259,6 +275,11 @@ class SyncEngine(
                             )
                         }
                         continue
+                    } else {
+                        fileBytes = runCatching {
+                            fs.readFile(mapping.localRootPath, loc.relativePath)
+                        }.getOrNull()
+                        if (fileBytes == null) continue
                     }
                 }
             } catch (e: Exception) {
@@ -270,11 +291,16 @@ class SyncEngine(
                 )
                 continue
             }
-            val fsSnap = fs.snapshot(mapping.localRootPath)
-                .firstOrNull { PathUtil.normalize(it.relativePath) == PathUtil.normalize(loc.relativePath) }
-            val fsSize = fsSnap?.sizeBytes
-                ?: loc.entry.sizeBytes
-                ?: 0L
+            val fsSize = when {
+                loc.entry.isFolder -> 0L
+                fileBytes != null -> fileBytes.size.toLong()
+                else -> loc.entry.sizeBytes ?: 0L
+            }
+            val hash = if (loc.entry.isFolder || fileBytes == null) {
+                ""
+            } else {
+                ContentHashUtil.sha256Hex(fileBytes)
+            }
             store.upsert(
                 SyncItemMeta(
                     mappingId = mapping.id,
@@ -283,7 +309,7 @@ class SyncEngine(
                     relativePath = loc.relativePath,
                     isFolder = loc.entry.isFolder,
                     sizeBytes = fsSize,
-                    contentHash = if (loc.entry.isFolder) "" else (fsSnap?.contentHash ?: ""),
+                    contentHash = hash,
                     remoteUpdateTime = loc.entry.updateTime
                 )
             )
