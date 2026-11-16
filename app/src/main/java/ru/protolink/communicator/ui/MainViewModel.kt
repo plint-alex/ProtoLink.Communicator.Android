@@ -54,6 +54,7 @@ import ru.protolink.communicator.util.CloudVirtualNodes
 import ru.protolink.communicator.util.EntityMeta
 import ru.protolink.communicator.util.JsonValues
 import ru.protolink.communicator.util.MapLocalFolderStrings
+import ru.protolink.communicator.util.SameNamedCloudFolderHeal
 import ru.protolink.communicator.util.MessageStringValues
 import ru.protolink.communicator.util.MessengerAttachmentRender
 import ru.protolink.communicator.util.MessengerConversationMerge
@@ -2349,7 +2350,11 @@ class MainViewModel @Inject constructor(
             return
         }
         val list = mappingStore.load().toMutableList()
-        list.removeAll { it.cloudFolderId.equals(folderId, ignoreCase = true) }
+        // One Cloud id and one local tree URI — drop stale dual maps (same Notes root → wrong id).
+        list.removeAll {
+            it.cloudFolderId.equals(folderId, ignoreCase = true) ||
+                it.localPath.equals(treeUri, ignoreCase = true)
+        }
         val name = folderName.ifBlank { "Folder" }
         list.add(CloudSyncMappingDto(folderId, treeUri, name))
         mappingStore.save(list)
@@ -2434,15 +2439,25 @@ class MainViewModel @Inject constructor(
                         _state.update { it.copy(mapWizardBusy = false) }
                         return@launch
                     }
-                    val createdId = createCloudFolderUnder(parent, name)
-                    if (createdId == null) {
-                        _state.update {
-                            it.copy(mapWizardBusy = false, status = "Could not create Cloud folder")
+                    // Never mint a second same-named CloudFolder (dual MyNotesFolder FAIL class).
+                    val existing = SameNamedCloudFolderHeal.preferExistingSameName(
+                        name,
+                        loadChildFolderSiblings(parent)
+                    )
+                    if (existing != null) {
+                        folderId = existing.id
+                        folderName = existing.name.ifBlank { name }
+                    } else {
+                        val createdId = createCloudFolderUnder(parent, name)
+                        if (createdId == null) {
+                            _state.update {
+                                it.copy(mapWizardBusy = false, status = "Could not create Cloud folder")
+                            }
+                            return@launch
                         }
-                        return@launch
+                        folderId = createdId
+                        folderName = name
                     }
-                    folderId = createdId
-                    folderName = name
                 } else {
                     folderId = result.existingFolderId ?: run {
                         _state.update { it.copy(mapWizardBusy = false) }
@@ -2487,8 +2502,79 @@ class MainViewModel @Inject constructor(
         return children.mapNotNull { e ->
             if (e.code != CloudCodes.CLOUD_FOLDER && e.code != CloudCodes.CLOUD_ROOT) return@mapNotNull null
             if (mapped.contains(e.id.lowercase())) return@mapNotNull null
-            MapLocalFolderCandidate(id = e.id, name = entityDisplayName(e))
+            MapLocalFolderCandidate(
+                id = e.id,
+                name = entityDisplayName(e),
+                creationTime = e.creationTime
+            )
         }
+    }
+
+    private suspend fun loadChildFolderSiblings(parentId: String): List<SameNamedCloudFolderHeal.Sibling> {
+        val children = api.getEntities(
+            GetEntitiesRequest(parentIds = listOf(parentId), includeValues = true, take = 500)
+        )
+        return children.mapNotNull { e ->
+            if (e.code != CloudCodes.CLOUD_FOLDER && e.code != CloudCodes.CLOUD_ROOT) return@mapNotNull null
+            SameNamedCloudFolderHeal.Sibling(
+                id = e.id,
+                name = entityDisplayName(e),
+                creationTime = e.creationTime
+            )
+        }
+    }
+
+    /**
+     * Remap Notes/Cloud mappings that point at a newer duplicate same-named CloudFolder
+     * onto the oldest sibling (Win/AC MyNotesFolder = earliest CreationTime).
+     */
+    private suspend fun healDuplicateSameNamedMappings(): Int {
+        val mappings = mappingStore.load()
+        if (mappings.isEmpty()) return 0
+        val parentByMapped = linkedMapOf<String, String>()
+        for (m in mappings) {
+            val parents = runCatching {
+                api.getEntities(
+                    GetEntitiesRequest(
+                        idsToFindParents = listOf(m.cloudFolderId),
+                        includeValues = false,
+                        take = 50
+                    )
+                )
+            }.getOrElse { emptyList() }
+            val parent = parents.firstOrNull {
+                it.code == CloudCodes.CLOUD_FOLDER || it.code == CloudCodes.CLOUD_ROOT
+            } ?: continue
+            parentByMapped[m.cloudFolderId] = parent.id
+        }
+        if (parentByMapped.isEmpty()) return 0
+        val siblingsByParent = linkedMapOf<String, List<SameNamedCloudFolderHeal.Sibling>>()
+        for (parentId in parentByMapped.values.distinctBy { it.lowercase() }) {
+            siblingsByParent[parentId] = loadChildFolderSiblings(parentId)
+        }
+        val rows = mappings.map {
+            SameNamedCloudFolderHeal.MappingRow(it.cloudFolderId, it.localPath, it.cloudFolderName)
+        }
+        val remaps = SameNamedCloudFolderHeal.remapsForDuplicateNames(
+            mappings = rows,
+            siblingsByParent = siblingsByParent,
+            parentIdByMappedId = parentByMapped
+        )
+        if (remaps.isEmpty()) return 0
+        val healedRows = SameNamedCloudFolderHeal.applyRemaps(rows, remaps)
+        for (r in remaps) {
+            runCatching { metadataStore.clearMapping(r.fromId.replace("-", "")) }
+            android.util.Log.e(
+                "ProtoLinkSync",
+                "same-named heal remap ${r.fromId} → ${r.toId} (${r.folderName})"
+            )
+        }
+        val healed = healedRows.map {
+            CloudSyncMappingDto(it.cloudFolderId, it.localPath, it.cloudFolderName)
+        }
+        mappingStore.save(healed)
+        _state.update { it.copy(mappings = healed) }
+        return remaps.size
     }
 
     private suspend fun createCloudFolderUnder(parentId: String, name: String): String? {
@@ -2533,6 +2619,7 @@ class MainViewModel @Inject constructor(
                 }
                 return@launch
             }
+            runCatching { healDuplicateSameNamedMappings() }
             val mappings = mappingStore.load()
             if (mappings.isEmpty()) {
                 _state.update {
@@ -2802,6 +2889,10 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch {
             android.util.Log.e("ProtoLinkSync", "forceDownloadAllMappedNow start")
             withContext(Dispatchers.IO) { tokenRefresher.refreshBlocking() }
+            val healed = runCatching { healDuplicateSameNamedMappings() }.getOrDefault(0)
+            if (healed > 0) {
+                android.util.Log.e("ProtoLinkSync", "force download: healed $healed same-named duplicate map(s)")
+            }
             val ids = mappingStore.load().map { it.cloudFolderId }
             if (ids.isEmpty()) {
                 _state.update { it.copy(syncError = "No mapped folders for force download") }

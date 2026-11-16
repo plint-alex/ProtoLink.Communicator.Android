@@ -27,10 +27,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ru.protolink.communicator.util.MapLocalFolderStrings
+import ru.protolink.communicator.util.SameNamedCloudFolderHeal
 
 data class MapLocalFolderCandidate(
     val id: String,
-    val name: String
+    val name: String,
+    val creationTime: String? = null
 )
 
 data class MapLocalFolderWizardResult(
@@ -56,10 +58,22 @@ fun MapLocalFolderWizardDialog(
     onDismiss: () -> Unit,
     onConfirm: (MapLocalFolderWizardResult) -> Unit
 ) {
-    var createNew by remember { mutableStateOf(true) }
+    val sameNamePick = remember(suggestedName, candidates) {
+        SameNamedCloudFolderHeal.preferExistingSameName(
+            suggestedName,
+            candidates.map {
+                SameNamedCloudFolderHeal.Sibling(it.id, it.name, it.creationTime)
+            }
+        )
+    }
+    // Prefer pick-existing when suggested name already exists (avoid dual MyNotesFolder).
+    var createNew by remember(sameNamePick?.id) { mutableStateOf(sameNamePick == null) }
     var folderName by remember(suggestedName) { mutableStateOf(suggestedName) }
-    var selectedId by remember { mutableStateOf(candidates.firstOrNull()?.id) }
+    var selectedId by remember(sameNamePick?.id, candidates) {
+        mutableStateOf(sameNamePick?.id ?: candidates.firstOrNull()?.id)
+    }
     var error by remember { mutableStateOf<String?>(null) }
+    val candidateNames = remember(candidates) { candidates.map { it.name } }
 
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
@@ -141,7 +155,15 @@ fun MapLocalFolderWizardDialog(
                                     onClick = { selectedId = c.id },
                                     enabled = !busy
                                 )
-                                Text(c.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(
+                                    SameNamedCloudFolderHeal.displayLabel(
+                                        c.name,
+                                        c.id,
+                                        candidateNames
+                                    ),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
                             }
                         }
                     }
