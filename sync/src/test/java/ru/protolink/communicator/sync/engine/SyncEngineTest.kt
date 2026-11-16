@@ -429,6 +429,73 @@ class SyncEngineTest {
             .isEqualTo(ContentHashUtil.sha256Hex("FORCE-REMOTE".toByteArray()))
     }
 
+    /**
+     * FAIL class P1-20261116-reverify: null download of one remote (at-pc-summary.txt-class)
+     * must soft-fail and continue so sibling folders (films/…) still fill.
+     */
+    @Test
+    fun forcePull_nullDownload_softFailsAndContinuesSibling() = runTest {
+        val (store, fs, inner) = harness()
+        val filmsFolder = inner.addFolder("cloud-root", "films")
+        val filmsId = inner.addFile(filmsFolder, "index.html", "<p>Movie</p>".toByteArray(), "text/html")
+        val failId = inner.addFile("cloud-root", "at-pc-summary.txt", "pc".toByteArray(), "text/plain")
+        fs.createDirectory(root, "films")
+
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun downloadFile(entityId: String): ByteArray? =
+                if (entityId == failId) null else inner.downloadFile(entityId)
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(1)
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("<p>Movie</p>")
+        assertThat(store.getAll("m1").any { it.remoteId == filmsId }).isTrue()
+        assertThat(fs.exists(root, "at-pc-summary.txt")).isFalse()
+    }
+
+    /** Force download mirrors remote: local-without-cloud dirs/files are pruned. */
+    @Test
+    fun forcePull_prunesLocalAbsentFromRemote() = runTest {
+        val (store, fs, remote) = harness()
+        remote.seedFolder("films-f", "cloud-root", "films")
+        remote.seedFile("films-i", "films-f", "index.html", "movie".toByteArray())
+        fs.writeFile(root, "films/index.html", "stale".toByteArray())
+        fs.writeFile(root, "tor browser/readme.txt", "junk".toByteArray())
+        fs.createDirectory(root, "confluence")
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "ghost-meta",
+                parentRemoteId = "cloud-root",
+                relativePath = "tor browser",
+                isFolder = true,
+                sizeBytes = 0
+            )
+        )
+
+        SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
+        assertThat(fs.exists(root, "tor browser")).isFalse()
+        assertThat(fs.exists(root, "tor browser/readme.txt")).isFalse()
+        assertThat(fs.exists(root, "confluence")).isFalse()
+        assertThat(store.getAll("m1").none { it.relativePath.contains("tor") }).isTrue()
+    }
+
+    @Test
+    fun forcePull_emptyRemoteBytes_writesAndContinues() = runTest {
+        val (store, fs, remote) = harness()
+        remote.seedFile("empty-f", "cloud-root", "empty.txt", ByteArray(0))
+        remote.seedFile("ok-f", "cloud-root", "ok.txt", "ok".toByteArray())
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(2)
+        assertThat(fs.readFile(root, "empty.txt")).isEmpty()
+        assertThat(String(fs.readFile(root, "ok.txt"))).isEqualTo("ok")
+    }
+
     @Test
     fun localEdited_remoteUnchanged_writes() = runTest {
         val (store, fs, remote) = harness()
@@ -673,5 +740,34 @@ class SyncEngineTest {
         SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
 
         assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("from-cloud")
+        // Cloud-wins: junk absent from remote is pruned (not uploaded) on full Sync.
+        assertThat(fs.exists(root, "evidence-0.png")).isFalse()
+    }
+
+    /** Sync removes cloud-absent local dirs when remote tree is non-empty (delete-ghost). */
+    @Test
+    fun reconcile_prunesCloudAbsentLocalWhenRemoteNonEmpty() = runTest {
+        val (store, fs, remote) = harness()
+        remote.seedFolder("films-f", "cloud-root", "films")
+        remote.seedFile("films-i", "films-f", "index.html", "movie".toByteArray())
+        fs.writeFile(root, "tor browser/readme.txt", "junk".toByteArray())
+        fs.createDirectory(root, "confluence")
+
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
+        assertThat(fs.exists(root, "tor browser")).isFalse()
+        assertThat(fs.exists(root, "confluence")).isFalse()
+        assertThat(remote.childrenOf("cloud-root").none { it.name.equals("tor browser", true) }).isTrue()
+    }
+
+    /** Empty remote still allows local-only upload (first map / push path). */
+    @Test
+    fun reconcile_emptyRemote_stillUploadsLocalOnly() = runTest {
+        val (store, fs, remote) = harness()
+        fs.writeFile(root, "solo.txt", "only-local".toByteArray())
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+        assertThat(fs.exists(root, "solo.txt")).isTrue()
+        assertThat(remote.childrenOf("cloud-root").any { it.name.equals("solo.txt", true) }).isTrue()
     }
 }

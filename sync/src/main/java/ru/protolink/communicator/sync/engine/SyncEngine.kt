@@ -337,7 +337,14 @@ class SyncEngine(
         var applied = 0
         val remoteByPath = remoteInMapping.associateBy { PathUtil.normalize(it.relativePath) }
 
-        val adds = changes.filterIsInstance<LocalChange.Added>().sortedBy { it.entry.relativePath.count { c -> c == '/' } }
+        // Full reconcile (remote tree known): prune deepest-first. Local-only push: create parents first.
+        val adds = changes.filterIsInstance<LocalChange.Added>().let { list ->
+            if (remoteInMapping.isNotEmpty()) {
+                list.sortedByDescending { it.entry.relativePath.count { c -> c == '/' } }
+            } else {
+                list.sortedBy { it.entry.relativePath.count { c -> c == '/' } }
+            }
+        }
         val renames = changes.filterIsInstance<LocalChange.Renamed>()
         val updates = changes.filterIsInstance<LocalChange.Updated>()
         val removes = changes.filterIsInstance<LocalChange.Removed>()
@@ -466,6 +473,25 @@ class SyncEngine(
                 }
                 dirty.add(path)
                 applied++
+                continue
+            }
+            // Full reconcile with a non-empty remote tree: cloud-absent local = ghost.
+            // Delete local (cloud-wins structure); do not upload junk. Local-only push
+            // (remoteInMapping empty) still uploads new notes — Force Upload for full repair.
+            if (remoteInMapping.isNotEmpty()) {
+                try {
+                    if (fs.exists(mapping.localRootPath, a.entry.relativePath)) {
+                        fs.delete(mapping.localRootPath, a.entry.relativePath, a.entry.isFolder)
+                    }
+                    applied++
+                } catch (e: Exception) {
+                    SyncRemoteDownload.logMaterializeFailed(
+                        "ApplyLocalPhase.PruneCloudAbsent",
+                        path,
+                        "-",
+                        e.message ?: e.javaClass.simpleName
+                    )
+                }
                 continue
             }
             val parentPath = PathUtil.parentOf(a.entry.relativePath)
@@ -654,11 +680,21 @@ class SyncEngine(
                 is RemoteChange.Removed -> {
                     if (c.meta.mappingId != mapping.id) continue
                     if (cross.any { it.entry.id == c.meta.remoteId }) continue
-                    if (fs.exists(mapping.localRootPath, c.meta.relativePath)) {
-                        fs.delete(mapping.localRootPath, c.meta.relativePath, c.meta.isFolder)
+                    try {
+                        if (fs.exists(mapping.localRootPath, c.meta.relativePath)) {
+                            fs.delete(mapping.localRootPath, c.meta.relativePath, c.meta.isFolder)
+                        }
+                        store.delete(mapping.id, c.meta.relativePath)
+                        applied++
+                    } catch (e: Exception) {
+                        // NFR-SYNC-1: one gone/locked path must not abort cloud-delete converge.
+                        SyncRemoteDownload.logMaterializeFailed(
+                            "ApplyRemotePhase.Removed",
+                            c.meta.relativePath,
+                            c.meta.remoteId,
+                            e.message ?: e.javaClass.simpleName
+                        )
                     }
-                    store.delete(mapping.id, c.meta.relativePath)
-                    applied++
                 }
                 is RemoteChange.Updated -> {
                     // Size/time content sync already handled in applyComparePhase.
@@ -852,7 +888,11 @@ class SyncEngine(
         return files
     }
 
-    /** Overwrite local FS with all remote files; meta follows remote. Returns files downloaded. */
+    /**
+     * Overwrite local FS with all remote files; meta follows remote. Returns files downloaded.
+     * Null download soft-fails per item and continues (NFR-SYNC-1) — empty bytes are legitimate.
+     * After pull, local paths absent from remote are pruned (Force download = mirror).
+     */
     suspend fun forcePullMapping(mapping: SyncMapping): Int {
         val located = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
         walkRemote(mapping.cloudFolderId, mapping.id, "", located)
@@ -860,8 +900,10 @@ class SyncEngine(
             throw SyncException("Force download found no remote files in this folder.")
         }
         var files = 0
+        val remotePaths = mutableSetOf<String>()
         for (loc in located.sortedBy { it.relativePath.count { c -> c == '/' } }) {
             val path = PathUtil.normalize(loc.relativePath)
+            remotePaths.add(path)
             if (loc.entry.isFolder) {
                 if (!fs.exists(mapping.localRootPath, path)) {
                     fs.createDirectory(mapping.localRootPath, path)
@@ -880,30 +922,72 @@ class SyncEngine(
                 )
                 continue
             }
+            // null = failed/not-found → soft-fail this item; isEmpty() is legitimate empty content.
             val bytes = remote.downloadFile(loc.entry.id)
-                ?: throw SyncException("Force download failed: remote file missing.", relativePath = path)
-            if (bytes.isEmpty()) {
-                throw SyncException("Force download returned empty file.", relativePath = path)
+            if (bytes == null) {
+                SyncRemoteDownload.logFailed("ForcePullMapping", path, loc.entry.id)
+                continue
             }
-            fs.writeFile(mapping.localRootPath, path, bytes)
-            store.upsert(
-                SyncItemMeta(
-                    mappingId = mapping.id,
-                    remoteId = loc.entry.id,
-                    parentRemoteId = loc.entry.parentId,
-                    relativePath = path,
-                    isFolder = false,
-                    sizeBytes = bytes.size.toLong(),
-                    contentHash = ContentHashUtil.sha256Hex(bytes),
-                    remoteUpdateTime = loc.entry.updateTime ?: Instant.now()
+            try {
+                fs.writeFile(mapping.localRootPath, path, bytes)
+                store.upsert(
+                    SyncItemMeta(
+                        mappingId = mapping.id,
+                        remoteId = loc.entry.id,
+                        parentRemoteId = loc.entry.parentId,
+                        relativePath = path,
+                        isFolder = false,
+                        sizeBytes = bytes.size.toLong(),
+                        contentHash = ContentHashUtil.sha256Hex(bytes),
+                        remoteUpdateTime = loc.entry.updateTime ?: Instant.now()
+                    )
                 )
-            )
-            files++
+                files++
+            } catch (e: Exception) {
+                SyncRemoteDownload.logMaterializeFailed(
+                    "ForcePullMapping",
+                    path,
+                    loc.entry.id,
+                    e.message ?: e.javaClass.simpleName
+                )
+            }
         }
-        if (files == 0) {
+        pruneLocalAbsentFromRemote(mapping, remotePaths)
+        if (files == 0 && located.none { !it.entry.isFolder }) {
             throw SyncException("Force download processed 0 files (folders only).")
         }
         store.setLastSyncUtc(mapping.id, Instant.now())
         return files
+    }
+
+    /**
+     * Force download mirror: remove local files/folders (and meta) whose path is not in the
+     * remote walk — cloud-absent / Cloud-deleted ghosts leave the device.
+     */
+    private fun pruneLocalAbsentFromRemote(mapping: SyncMapping, remotePaths: Set<String>) {
+        val snap = fs.snapshot(mapping.localRootPath)
+            .sortedByDescending { PathUtil.normalize(it.relativePath).count { c -> c == '/' } }
+        for (entry in snap) {
+            val path = PathUtil.normalize(entry.relativePath)
+            if (path in remotePaths) continue
+            try {
+                if (fs.exists(mapping.localRootPath, path)) {
+                    fs.delete(mapping.localRootPath, path, entry.isFolder)
+                }
+                store.delete(mapping.id, path)
+            } catch (e: Exception) {
+                SyncRemoteDownload.logMaterializeFailed(
+                    "ForcePullMapping.Prune",
+                    path,
+                    "-",
+                    e.message ?: e.javaClass.simpleName
+                )
+            }
+        }
+        for (meta in store.getAll(mapping.id)) {
+            val path = PathUtil.normalize(meta.relativePath)
+            if (path in remotePaths) continue
+            store.delete(mapping.id, path)
+        }
     }
 }
