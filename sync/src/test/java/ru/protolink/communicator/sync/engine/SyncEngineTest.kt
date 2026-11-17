@@ -962,6 +962,99 @@ class SyncEngineTest {
         assertThat(String(fs.readFile(root, "Agents/note.html"))).isEqualTo("n")
     }
 
+    /**
+     * 1.0.54 slow-nodl class: waited for ALL name Ids before any downloadFile.
+     * Progressive BFS must download shallow files before deep Ids name resolve.
+     */
+    @Test
+    fun forcePull_progressive_downloadsBeforeDeepNames() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("films", "cloud-root", "Films")
+        inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
+        inner.seedFolder("d1", "cloud-root", "Deep")
+        inner.seedFolder("d2", "d1", "Nested")
+        inner.seedFile("deep", "d2", "file.txt", "x".toByteArray())
+
+        val deepNameResolved = java.util.concurrent.atomic.AtomicBoolean(false)
+        val filmsDownloadedBeforeDeepName = java.util.concurrent.atomic.AtomicBoolean(false)
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun getEntitiesByIds(
+                ids: List<String>,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                // Leaf under Nested — named one BFS wave after Films/index materialize.
+                if (includeValues && ids.contains("deep")) {
+                    deepNameResolved.set(true)
+                }
+                return inner.getEntitiesByIds(ids, includeValues)
+            }
+
+            override suspend fun downloadFile(entityId: String): ByteArray? {
+                if (entityId == "idx" && !deepNameResolved.get()) {
+                    filmsDownloadedBeforeDeepName.set(true)
+                }
+                return inner.downloadFile(entityId)
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(2)
+        assertThat(filmsDownloadedBeforeDeepName.get()).isTrue()
+        assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
+        assertThat(String(fs.readFile(root, "Deep/Nested/file.txt"))).isEqualTo("x")
+    }
+
+    /**
+     * Meta RelativePath leaf names seed ForceIdsNames — skip IncludeValues for known ids.
+     */
+    @Test
+    fun forcePull_metaNameCache_skipsIdsIncludeValues() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("films", "cloud-root", "Films")
+        inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
+        store.upsert(
+            ru.protolink.communicator.sync.model.SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "films",
+                parentRemoteId = "cloud-root",
+                relativePath = "Films",
+                isFolder = true,
+                sizeBytes = 0,
+                contentHash = "",
+                remoteUpdateTime = java.time.Instant.now()
+            )
+        )
+        store.upsert(
+            ru.protolink.communicator.sync.model.SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "idx",
+                parentRemoteId = "films",
+                relativePath = "Films/index.html",
+                isFolder = false,
+                sizeBytes = 5,
+                contentHash = "",
+                remoteUpdateTime = java.time.Instant.now()
+            )
+        )
+        val idsWithValues = java.util.concurrent.atomic.AtomicInteger(0)
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun getEntitiesByIds(
+                ids: List<String>,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                if (includeValues) idsWithValues.incrementAndGet()
+                return inner.getEntitiesByIds(ids, includeValues)
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(1)
+        assertThat(idsWithValues.get()).isEqualTo(0)
+        assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
+    }
+
     @Test
     fun localEdited_remoteUnchanged_writes() = runTest {
         val (store, fs, remote) = harness()

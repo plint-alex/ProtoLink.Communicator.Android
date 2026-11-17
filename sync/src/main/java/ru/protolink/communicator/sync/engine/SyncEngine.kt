@@ -35,17 +35,19 @@ class SyncEngine(
 
         /**
          * Ids IncludeValues batch size for Force name resolve.
-         * Live 1.0.53: concurrent batches of 200 hit HTTP 504 Gateway Time-out (~90s)
-         * before downloadFile — smaller pages finish under the gateway budget.
+         * Live 1.0.53: concurrent batches of 200 hit HTTP 504 Gateway Time-out (~90s).
+         * 1.0.54 used 25 (safe but too slow — mid-name GE past 28m). 50 stays under the
+         * gateway budget while cutting name-pass wall ~2× vs 25.
          */
-        const val FORCE_NAME_BATCH = 25
+        const val FORCE_NAME_BATCH = 50
 
         /**
-         * Parallel Ids IncludeValues name resolve. Keep far below [WALK_REMOTE_CONCURRENCY]:
-         * 24×200 Values smashed Api/gateway (ForceIdsNames 504 class). Structure MatchAny
-         * stays on the walk semaphore; names use this dedicated gate.
+         * Parallel Ids IncludeValues name resolve. Keep below [WALK_REMOTE_CONCURRENCY]:
+         * 24×200 Values smashed Api/gateway (ForceIdsNames 504 class). 1.0.54 used 2 and
+         * never reached downloadFile on ~15–20k edges (~10 ids/s). 8 × batch 50 ≈80 ids/s
+         * keeps half-split on 5xx (NFR-SYNC-1).
          */
-        const val FORCE_NAME_CONCURRENCY = 2
+        const val FORCE_NAME_CONCURRENCY = 8
 
         /**
          * Force structure inventory: parents per GetEntities ParentIdsMatchAny call.
@@ -787,7 +789,7 @@ class SyncEngine(
      * Depth-first remote inventory with parallel sibling folder listings (Win WalkRemoteParallel parity).
      * When meta is non-empty: structure-only GetEntities when every child id is already known;
      * otherwise one IncludeValues re-list (Win values-light). Cold bootstrap (empty meta) still
-     * IncludeValues-lists. Force uses [walkRemoteForceInventory] instead (structure-first + Ids).
+     * IncludeValues-lists. Force uses structure-first + Ids name waves (progressive materialize).
      * [visitedIds]/[seenPaths] stop cycles.
      */
     private suspend fun walkRemote(
@@ -884,35 +886,34 @@ class SyncEngine(
 
     /**
      * Force inventory: structure-only BFS with batched ParentIdsMatchAny listings (heal-safe),
-     * then small Ids IncludeValues batches ([FORCE_NAME_BATCH]) at [FORCE_NAME_CONCURRENCY]
-     * for display names. Structure: one GE per [FORCE_PARENT_BATCH] parents. Names: avoid the
-     * live ForceIdsNames 504 class (24×200 IncludeValues).
+     * then Ids IncludeValues name waves ([FORCE_NAME_BATCH] × [FORCE_NAME_CONCURRENCY]) with
+     * meta name-cache. Prefer [forcePullMapping] progressive path (name wave → materialize)
+     * so downloadFile starts before the full name pass finishes.
      */
     private suspend fun walkRemoteForceInventory(
         rootFolderId: String,
         mappingId: String,
         out: MutableList<RemoteChangeClassifier.RemoteLocated>
     ) {
-        val edges = mutableListOf<StructureEdge>()
-        val visitedIds = mutableSetOf<String>()
-        val throttle = Semaphore(WALK_REMOTE_CONCURRENCY)
-        walkRemoteStructureBatched(
-            rootFolderId = rootFolderId,
-            out = edges,
-            visitedIds = visitedIds,
-            throttle = throttle
-        )
-
-        val ids = edges.map { it.id }.distinct()
-        // Dedicated low concurrency — do not reuse walk throttle (24) for IncludeValues.
-        val names = resolveDisplayNamesByIds(ids)
+        val edges = collectForceStructureEdges(rootFolderId)
+        val metaNames = forceMetaNameSeed(mappingId)
         val byParent = edges.groupBy { it.parentId }
+        val names = mutableMapOf<String, String>()
+        names.putAll(metaNames)
         val seenPaths = mutableSetOf<String>()
-        val queue = ArrayDeque<Pair<String, String>>()
-        queue.add(rootFolderId to "")
-        while (queue.isNotEmpty()) {
-            val (folderId, relativeParent) = queue.removeFirst()
-            for (kid in byParent[folderId].orEmpty()) {
+        var frontier = listOf(rootFolderId to "")
+        while (frontier.isNotEmpty()) {
+            val waveKids = frontier.flatMap { (folderId, relativeParent) ->
+                byParent[folderId].orEmpty().map { kid -> Triple(kid, folderId, relativeParent) }
+            }
+            val missing = waveKids.map { it.first.id }.filter { id ->
+                names[id].isNullOrEmpty()
+            }.distinct()
+            if (missing.isNotEmpty()) {
+                names.putAll(resolveDisplayNamesByIds(missing, seed = names))
+            }
+            val next = mutableListOf<Pair<String, String>>()
+            for ((kid, folderId, relativeParent) in waveKids) {
                 val name = names[kid.id] ?: continue
                 if (name.isEmpty()) continue
                 val rel = PathUtil.join(relativeParent, name)
@@ -929,10 +930,31 @@ class SyncEngine(
                         relativePath = rel
                     )
                 )
-                if (kid.isFolder) queue.add(kid.id to rel)
+                if (kid.isFolder) next.add(kid.id to rel)
             }
+            frontier = next
         }
     }
+
+    private suspend fun collectForceStructureEdges(rootFolderId: String): List<StructureEdge> {
+        val edges = mutableListOf<StructureEdge>()
+        val visitedIds = mutableSetOf<String>()
+        val throttle = Semaphore(WALK_REMOTE_CONCURRENCY)
+        walkRemoteStructureBatched(
+            rootFolderId = rootFolderId,
+            out = edges,
+            visitedIds = visitedIds,
+            throttle = throttle
+        )
+        return edges
+    }
+
+    /** RelativePath leaf names keyed by remoteId — skip IncludeValues when meta already knows. */
+    private fun forceMetaNameSeed(mappingId: String): Map<String, String> =
+        store.getAll(mappingId).mapNotNull { meta ->
+            val name = PathUtil.nameOf(meta.relativePath).trim()
+            if (name.isEmpty()) null else meta.remoteId to name
+        }.toMap()
 
     /**
      * Root listed alone (hard). Nested parents BFS-batched via [listChildrenOfParentsForceInventory]
@@ -1096,13 +1118,22 @@ class SyncEngine(
         throw last ?: SyncException("Force inventory batched GetEntities failed.")
     }
 
-    private suspend fun resolveDisplayNamesByIds(ids: List<String>): Map<String, String> {
+    private suspend fun resolveDisplayNamesByIds(
+        ids: List<String>,
+        seed: Map<String, String> = emptyMap()
+    ): Map<String, String> {
         if (ids.isEmpty()) return emptyMap()
         val names = mutableMapOf<String, String>()
+        for (id in ids) {
+            val seeded = seed[id]?.trim().orEmpty()
+            if (seeded.isNotEmpty()) names[id] = seeded
+        }
+        val missing = ids.filter { names[it].isNullOrEmpty() }.distinct()
+        if (missing.isEmpty()) return names
         val gate = Mutex()
         val throttle = Semaphore(FORCE_NAME_CONCURRENCY)
         coroutineScope {
-            ids.chunked(FORCE_NAME_BATCH).map { chunk ->
+            missing.chunked(FORCE_NAME_BATCH).map { chunk ->
                 async {
                     val rows = throttle.withPermit {
                         getEntitiesByIdsForceInventory(chunk)
@@ -1402,67 +1433,98 @@ class SyncEngine(
      * After pull, local paths absent from remote are pruned (Force download = mirror).
      */
     suspend fun forcePullMapping(mapping: SyncMapping): Int {
-        val located = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
-        // Structure-first inventory + batch Ids IncludeValues for names (heal-safe).
-        // Cold IncludeValues×folder never reached fill on live ~3.5k MyNotesFolder.
-        walkRemoteForceInventory(mapping.cloudFolderId, mapping.id, located)
-        if (located.isEmpty()) {
+        // Structure-first (MatchAny), then BFS name waves → materialize each wave before
+        // naming deeper edges. Live 1.0.54 waited for ALL IncludeValues names first →
+        // downloadFile=0 past 28m; progressive fill reaches AC folders in daily-use.
+        val edges = collectForceStructureEdges(mapping.cloudFolderId)
+        if (edges.isEmpty()) {
             throw SyncException("Force download found no remote files in this folder.")
         }
-        var files = 0
+        val byParent = edges.groupBy { it.parentId }
+        val names = forceMetaNameSeed(mapping.id).toMutableMap()
         val remotePaths = mutableSetOf<String>()
-        for (loc in located.sortedBy { it.relativePath.count { c -> c == '/' } }) {
-            val path = PathUtil.normalize(loc.relativePath)
-            remotePaths.add(path)
-            if (loc.entry.isFolder) {
-                try {
-                    if (!fs.exists(mapping.localRootPath, path)) {
-                        fs.createDirectory(mapping.localRootPath, path)
-                    }
-                    store.upsert(
-                        SyncItemMeta(
-                            mappingId = mapping.id,
-                            remoteId = loc.entry.id,
-                            parentRemoteId = loc.entry.parentId,
-                            relativePath = path,
-                            isFolder = true,
-                            sizeBytes = 0,
-                            contentHash = "",
-                            remoteUpdateTime = loc.entry.updateTime ?: Instant.now()
-                        )
-                    )
-                } catch (e: Exception) {
-                    // SAF SingleDocumentFile.listFiles used to abort whole Force here — soft-fail folder.
-                    SyncRemoteDownload.logMaterializeFailed(
-                        "ForcePullMapping",
-                        path,
-                        loc.entry.id,
-                        e.message ?: e.javaClass.simpleName
-                    )
-                }
-                continue
+        val seenPaths = mutableSetOf<String>()
+        var files = 0
+        var sawRemoteFile = false
+        var frontier = listOf(mapping.cloudFolderId to "")
+        while (frontier.isNotEmpty()) {
+            val waveKids = frontier.flatMap { (folderId, relativeParent) ->
+                byParent[folderId].orEmpty().map { kid -> Triple(kid, folderId, relativeParent) }
             }
-            // null = failed/not-found → soft-fail this item; isEmpty() is legitimate empty content.
-            val bytes = remote.downloadFile(loc.entry.id)
-            if (bytes == null) {
-                SyncRemoteDownload.logFailed("ForcePullMapping", path, loc.entry.id)
-                continue
+            val missing = waveKids.map { it.first.id }.filter { id ->
+                names[id].isNullOrEmpty()
+            }.distinct()
+            if (missing.isNotEmpty()) {
+                names.putAll(resolveDisplayNamesByIds(missing, seed = names))
             }
+            val next = mutableListOf<Pair<String, String>>()
+            val waveLocated = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
+            for ((kid, folderId, relativeParent) in waveKids) {
+                val name = names[kid.id] ?: continue
+                if (name.isEmpty()) continue
+                val rel = PathUtil.join(relativeParent, name)
+                val norm = PathUtil.normalize(rel)
+                if (!seenPaths.add(norm)) continue
+                if (!kid.isFolder) sawRemoteFile = true
+                waveLocated.add(
+                    RemoteChangeClassifier.RemoteLocated(
+                        entry = ru.protolink.communicator.sync.model.RemoteEntry(
+                            id = kid.id,
+                            parentId = folderId,
+                            name = name,
+                            isFolder = kid.isFolder
+                        ),
+                        mappingId = mapping.id,
+                        relativePath = rel
+                    )
+                )
+                if (kid.isFolder) next.add(kid.id to rel)
+            }
+            // Depth-sort within the wave so parents exist before nested paths in same wave.
+            for (loc in waveLocated.sortedBy { it.relativePath.count { c -> c == '/' } }) {
+                files += materializeForceLocated(mapping, loc, remotePaths)
+            }
+            frontier = next
+        }
+        if (remotePaths.isEmpty()) {
+            throw SyncException("Force download found no remote files in this folder.")
+        }
+        pruneLocalAbsentFromRemote(mapping, remotePaths)
+        if (files == 0 && !sawRemoteFile) {
+            throw SyncException("Force download processed 0 files (folders only).")
+        }
+        store.setLastSyncUtc(mapping.id, Instant.now())
+        return files
+    }
+
+    /**
+     * Create folder or download one Force entry. Soft-fail per item (NFR-SYNC-1).
+     * @return 1 when a file was written, else 0
+     */
+    private suspend fun materializeForceLocated(
+        mapping: SyncMapping,
+        loc: RemoteChangeClassifier.RemoteLocated,
+        remotePaths: MutableSet<String>
+    ): Int {
+        val path = PathUtil.normalize(loc.relativePath)
+        remotePaths.add(path)
+        if (loc.entry.isFolder) {
             try {
-                fs.writeFile(mapping.localRootPath, path, bytes)
+                if (!fs.exists(mapping.localRootPath, path)) {
+                    fs.createDirectory(mapping.localRootPath, path)
+                }
                 store.upsert(
                     SyncItemMeta(
                         mappingId = mapping.id,
                         remoteId = loc.entry.id,
                         parentRemoteId = loc.entry.parentId,
                         relativePath = path,
-                        isFolder = false,
-                        sizeBytes = bytes.size.toLong(),
-                        contentHash = ContentHashUtil.sha256Hex(bytes),
+                        isFolder = true,
+                        sizeBytes = 0,
+                        contentHash = "",
                         remoteUpdateTime = loc.entry.updateTime ?: Instant.now()
                     )
                 )
-                files++
             } catch (e: Exception) {
                 SyncRemoteDownload.logMaterializeFailed(
                     "ForcePullMapping",
@@ -1471,13 +1533,37 @@ class SyncEngine(
                     e.message ?: e.javaClass.simpleName
                 )
             }
+            return 0
         }
-        pruneLocalAbsentFromRemote(mapping, remotePaths)
-        if (files == 0 && located.none { !it.entry.isFolder }) {
-            throw SyncException("Force download processed 0 files (folders only).")
+        val bytes = remote.downloadFile(loc.entry.id)
+        if (bytes == null) {
+            SyncRemoteDownload.logFailed("ForcePullMapping", path, loc.entry.id)
+            return 0
         }
-        store.setLastSyncUtc(mapping.id, Instant.now())
-        return files
+        return try {
+            fs.writeFile(mapping.localRootPath, path, bytes)
+            store.upsert(
+                SyncItemMeta(
+                    mappingId = mapping.id,
+                    remoteId = loc.entry.id,
+                    parentRemoteId = loc.entry.parentId,
+                    relativePath = path,
+                    isFolder = false,
+                    sizeBytes = bytes.size.toLong(),
+                    contentHash = ContentHashUtil.sha256Hex(bytes),
+                    remoteUpdateTime = loc.entry.updateTime ?: Instant.now()
+                )
+            )
+            1
+        } catch (e: Exception) {
+            SyncRemoteDownload.logMaterializeFailed(
+                "ForcePullMapping",
+                path,
+                loc.entry.id,
+                e.message ?: e.javaClass.simpleName
+            )
+            0
+        }
     }
 
     /**
