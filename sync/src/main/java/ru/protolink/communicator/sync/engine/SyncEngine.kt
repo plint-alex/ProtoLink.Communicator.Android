@@ -33,8 +33,19 @@ class SyncEngine(
          */
         const val WALK_REMOTE_CONCURRENCY = 24
 
-        /** Ids IncludeValues batch size for Force name resolve (API take page). */
-        const val FORCE_NAME_BATCH = 200
+        /**
+         * Ids IncludeValues batch size for Force name resolve.
+         * Live 1.0.53: concurrent batches of 200 hit HTTP 504 Gateway Time-out (~90s)
+         * before downloadFile — smaller pages finish under the gateway budget.
+         */
+        const val FORCE_NAME_BATCH = 25
+
+        /**
+         * Parallel Ids IncludeValues name resolve. Keep far below [WALK_REMOTE_CONCURRENCY]:
+         * 24×200 Values smashed Api/gateway (ForceIdsNames 504 class). Structure MatchAny
+         * stays on the walk semaphore; names use this dedicated gate.
+         */
+        const val FORCE_NAME_CONCURRENCY = 2
 
         /**
          * Force structure inventory: parents per GetEntities ParentIdsMatchAny call.
@@ -852,8 +863,9 @@ class SyncEngine(
 
     /**
      * Force inventory: structure-only BFS with batched ParentIdsMatchAny listings (heal-safe),
-     * then batch Ids IncludeValues for display names. One GE per [FORCE_PARENT_BATCH] parents
-     * instead of 1 GE/folder — live MyNotesFolder ~3.5k×RTT never reached fill at 30m.
+     * then small Ids IncludeValues batches ([FORCE_NAME_BATCH]) at [FORCE_NAME_CONCURRENCY]
+     * for display names. Structure: one GE per [FORCE_PARENT_BATCH] parents. Names: avoid the
+     * live ForceIdsNames 504 class (24×200 IncludeValues).
      */
     private suspend fun walkRemoteForceInventory(
         rootFolderId: String,
@@ -871,7 +883,8 @@ class SyncEngine(
         )
 
         val ids = edges.map { it.id }.distinct()
-        val names = resolveDisplayNamesByIds(ids, throttle)
+        // Dedicated low concurrency — do not reuse walk throttle (24) for IncludeValues.
+        val names = resolveDisplayNamesByIds(ids)
         val byParent = edges.groupBy { it.parentId }
         val seenPaths = mutableSetOf<String>()
         val queue = ArrayDeque<Pair<String, String>>()
@@ -1062,13 +1075,11 @@ class SyncEngine(
         throw last ?: SyncException("Force inventory batched GetEntities failed.")
     }
 
-    private suspend fun resolveDisplayNamesByIds(
-        ids: List<String>,
-        throttle: Semaphore
-    ): Map<String, String> {
+    private suspend fun resolveDisplayNamesByIds(ids: List<String>): Map<String, String> {
         if (ids.isEmpty()) return emptyMap()
         val names = mutableMapOf<String, String>()
         val gate = Mutex()
+        val throttle = Semaphore(FORCE_NAME_CONCURRENCY)
         coroutineScope {
             ids.chunked(FORCE_NAME_BATCH).map { chunk ->
                 async {
@@ -1086,7 +1097,11 @@ class SyncEngine(
         return names
     }
 
-    /** Ids IncludeValues batch with same 5xx retry / soft-fail (names missing → edges skipped). */
+    /**
+     * Ids IncludeValues with 5xx retry; on exhaust, half-split once the chunk is >1 so a
+     * gateway 504 on a fat page does not soft-lose the whole name set (NFR-SYNC-1).
+     * Single-id exhaust → soft-fail empty (edge skipped).
+     */
     private suspend fun getEntitiesByIdsForceInventory(ids: List<String>): List<RemoteEntry> {
         if (ids.isEmpty()) return emptyList()
         val key = ids.firstOrNull().orEmpty() + if (ids.size > 1) "+${ids.size - 1}" else ""
@@ -1108,11 +1123,19 @@ class SyncEngine(
                 )
             }
         }
-        SyncInventoryFetch.logSoftFail(
-            "ForceIdsNames",
-            key,
-            last?.message ?: last?.javaClass?.simpleName ?: "exhausted"
-        )
+        val detail = last?.message ?: last?.javaClass?.simpleName ?: "exhausted"
+        if (ids.size > 1) {
+            val mid = ids.size / 2
+            SyncInventoryFetch.logRetry(
+                "ForceIdsNamesSplit",
+                key,
+                1,
+                "half-split after $detail"
+            )
+            return getEntitiesByIdsForceInventory(ids.subList(0, mid)) +
+                getEntitiesByIdsForceInventory(ids.subList(mid, ids.size))
+        }
+        SyncInventoryFetch.logSoftFail("ForceIdsNames", key, detail)
         return emptyList()
     }
 

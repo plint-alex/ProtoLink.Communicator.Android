@@ -867,6 +867,71 @@ class SyncEngineTest {
         assertThat(fs.exists(root, "confluence")).isFalse()
     }
 
+    /**
+     * ForceIdsNames must not fire fat IncludeValues pages (live 200 → HTTP 504).
+     * Chunks stay ≤ FORCE_NAME_BATCH so gateway budget is reachable.
+     */
+    @Test
+    fun forcePull_idsNames_usesSmallBatches() = runTest {
+        val (store, fs, inner) = harness()
+        val folderCount = SyncEngine.FORCE_NAME_BATCH + 10
+        for (i in 0 until folderCount) {
+            inner.seedFolder("f$i", "cloud-root", "Folder$i")
+            inner.seedFile("n$i", "f$i", "n.txt", "x".toByteArray())
+        }
+        val maxIdsChunk = java.util.concurrent.atomic.AtomicInteger(0)
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun getEntitiesByIds(
+                ids: List<String>,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                if (includeValues) {
+                    maxIdsChunk.accumulateAndGet(ids.size) { a, b -> maxOf(a, b) }
+                }
+                return inner.getEntitiesByIds(ids, includeValues)
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(folderCount)
+        assertThat(maxIdsChunk.get()).isAtMost(SyncEngine.FORCE_NAME_BATCH)
+        assertThat(maxIdsChunk.get()).isGreaterThan(0)
+        assertThat(fs.exists(root, "Folder0/n.txt")).isTrue()
+        assertThat(fs.exists(root, "Folder${folderCount - 1}/n.txt")).isTrue()
+    }
+
+    /**
+     * Live ForceIdsNames class: fat Ids IncludeValues → HTTP 504 → soft-fail empty names →
+     * no downloadFile. Half-split on exhausted 5xx must still recover names + fill.
+     */
+    @Test
+    fun forcePull_idsNames_http504_splitsAndFills() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("films", "cloud-root", "Films")
+        inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
+        inner.seedFolder("agents", "cloud-root", "Agents")
+        inner.seedFile("note", "agents", "note.html", "n".toByteArray())
+
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun getEntitiesByIds(
+                ids: List<String>,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                if (includeValues && ids.size > 1) {
+                    throw RuntimeException("HTTP 504 Gateway Time-out")
+                }
+                return inner.getEntitiesByIds(ids, includeValues)
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(2)
+        assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
+        assertThat(String(fs.readFile(root, "Agents/note.html"))).isEqualTo("n")
+    }
+
     @Test
     fun localEdited_remoteUnchanged_writes() = runTest {
         val (store, fs, remote) = harness()
