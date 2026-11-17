@@ -99,4 +99,55 @@ class SameNamedCloudFolderHealTest {
         assertThat(SameNamedCloudFolderHeal.displayLabel("Other", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", names))
             .isEqualTo("Other")
     }
+
+    @Test
+    fun mergeById_dedupesAndKeepsHigherChildCount() {
+        val a = SameNamedCloudFolderHeal.Sibling(dupId, "MyNotesFolder", "2026-10-28T12:00:00", 0)
+        val b = SameNamedCloudFolderHeal.Sibling(dupId, "MyNotesFolder", null, 75)
+        val c = SameNamedCloudFolderHeal.Sibling(winId, "MyNotesFolder", "2026-10-29T18:49:32", 306)
+        val merged = SameNamedCloudFolderHeal.mergeById(listOf(a), listOf(b, c))
+        assertThat(merged).hasSize(2)
+        assertThat(merged.first { it.id == dupId }.immediateChildCount).isEqualTo(75)
+        assertThat(merged.first { it.id == winId }.immediateChildCount).isEqualTo(306)
+    }
+
+    @Test
+    fun cloudRootIdsForDiscovery_includesMustDriveAndOldest() {
+        val androidRoot = "8aec679c-a389-46b9-8105-8a5b238ee979"
+        val driveRoot = "3e5a2d6e-27ca-4c8b-89e6-e3cb253c05d6"
+        val otherNew = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val roots = listOf(
+            SameNamedCloudFolderHeal.Sibling(otherNew, "Scratch", "2026-11-17T00:00:00"),
+            SameNamedCloudFolderHeal.Sibling(androidRoot, "", "2026-10-28T09:00:00"),
+            SameNamedCloudFolderHeal.Sibling(driveRoot, "Drive", "2026-02-28T16:35:14")
+        )
+        val picked = SameNamedCloudFolderHeal.cloudRootIdsForDiscovery(
+            cloudRoots = roots,
+            mustIncludeIds = listOf(androidRoot),
+            maxRoots = 16
+        )
+        assertThat(picked).contains(androidRoot)
+        assertThat(picked).contains(driveRoot)
+    }
+
+    @Test
+    fun remaps_crossCloudRootMergedSiblings_prefersPopulatedWin() {
+        // Live: 0bc549dd under Android CloudRoot; 898c1453 under Drive — merge surfaces both.
+        val androidRoot = "8aec679c-a389-46b9-8105-8a5b238ee979"
+        val underAndroid = listOf(
+            SameNamedCloudFolderHeal.Sibling(dupId, "MyNotesFolder", "2026-10-28T09:46:55", 75)
+        )
+        val underDrive = listOf(
+            SameNamedCloudFolderHeal.Sibling(winId, "MyNotesFolder", "2026-10-29T18:49:32", 306)
+        )
+        val merged = SameNamedCloudFolderHeal.mergeById(underAndroid, underDrive)
+        val remaps = SameNamedCloudFolderHeal.remapsForDuplicateNames(
+            mappings = listOf(SameNamedCloudFolderHeal.MappingRow(dupId, local, "MyNotesFolder")),
+            siblingsByParent = mapOf(androidRoot to merged),
+            parentIdByMappedId = mapOf(dupId to androidRoot)
+        )
+        assertThat(remaps).hasSize(1)
+        assertThat(remaps[0].fromId).isEqualTo(dupId)
+        assertThat(remaps[0].toId).isEqualTo(winId)
+    }
 }

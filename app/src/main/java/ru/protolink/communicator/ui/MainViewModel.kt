@@ -2440,9 +2440,13 @@ class MainViewModel @Inject constructor(
                         return@launch
                     }
                     // Never mint a second same-named CloudFolder (dual MyNotesFolder FAIL class).
+                    // Cross-CloudRoot: Win may already have the name under Drive while wizard is on Android root.
                     val existing = SameNamedCloudFolderHeal.preferExistingSameName(
                         name,
-                        loadChildFolderSiblings(parent)
+                        loadChildFolderSiblingsForDiscovery(
+                            parentId = parent,
+                            onlyNames = setOf(name.trim().lowercase())
+                        )
                     )
                     if (existing != null) {
                         folderId = existing.id
@@ -2495,7 +2499,7 @@ class MainViewModel @Inject constructor(
     }
 
     private suspend fun loadUnmappedChildFolders(parentId: String): List<MapLocalFolderCandidate> {
-        val siblings = loadChildFolderSiblings(parentId)
+        val siblings = loadChildFolderSiblingsForDiscovery(parentId)
         val mapped = mappingStore.load().map { it.cloudFolderId.lowercase() }.toSet()
         return siblings.mapNotNull { s ->
             if (mapped.contains(s.id.lowercase())) return@mapNotNull null
@@ -2505,36 +2509,128 @@ class MainViewModel @Inject constructor(
                 creationTime = s.creationTime,
                 immediateChildCount = s.immediateChildCount
             )
+        }.sortedWith(
+            compareByDescending<MapLocalFolderCandidate> { it.immediateChildCount }
+                .thenBy { it.creationTime.orEmpty() }
+                .thenBy { it.id }
+        )
+    }
+
+    /** Immediate children only (paged). No child-count enrich. */
+    private suspend fun loadChildFolderSiblingsRaw(parentId: String): List<SameNamedCloudFolderHeal.Sibling> {
+        if (parentId.isBlank() || CloudVirtualNodes.isVirtual(parentId)) return emptyList()
+        val out = mutableListOf<SameNamedCloudFolderHeal.Sibling>()
+        var skip = 0
+        val pageSize = 500
+        val maxSkip = 5_000
+        while (skip <= maxSkip) {
+            val children = api.getEntities(
+                GetEntitiesRequest(
+                    parentIds = listOf(parentId),
+                    includeValues = true,
+                    skip = skip,
+                    take = pageSize
+                )
+            )
+            if (children.isEmpty()) break
+            for (e in children) {
+                if (e.code != CloudCodes.CLOUD_FOLDER && e.code != CloudCodes.CLOUD_ROOT) continue
+                out.add(
+                    SameNamedCloudFolderHeal.Sibling(
+                        id = e.id,
+                        name = entityDisplayName(e),
+                        creationTime = e.creationTime
+                    )
+                )
+            }
+            if (children.size < pageSize) break
+            skip += pageSize
         }
+        return out
+    }
+
+    private suspend fun loadUserCloudRootsRaw(): List<SameNamedCloudFolderHeal.Sibling> {
+        val userId = auth.current()?.userId ?: return emptyList()
+        val out = mutableListOf<SameNamedCloudFolderHeal.Sibling>()
+        var skip = 0
+        val pageSize = 500
+        while (skip <= 5_000) {
+            val children = api.getEntities(
+                GetEntitiesRequest(
+                    parentIds = listOf(userId),
+                    includeValues = true,
+                    skip = skip,
+                    take = pageSize
+                )
+            )
+            if (children.isEmpty()) break
+            for (e in children) {
+                if (e.code != CloudCodes.CLOUD_ROOT) continue
+                out.add(
+                    SameNamedCloudFolderHeal.Sibling(
+                        id = e.id,
+                        name = entityDisplayName(e),
+                        creationTime = e.creationTime
+                    )
+                )
+            }
+            if (children.size < pageSize) break
+            skip += pageSize
+        }
+        return out
+    }
+
+    /**
+     * Immediate parent siblings merged with same-named folders under other CloudRoots
+     * (Drive / oldest), so dual MyNotesFolder across Android root vs Win Drive remaps.
+     */
+    private suspend fun loadChildFolderSiblingsForDiscovery(
+        parentId: String,
+        mustIncludeRootIds: Collection<String> = emptyList(),
+        onlyNames: Set<String>? = null
+    ): List<SameNamedCloudFolderHeal.Sibling> {
+        val local = loadChildFolderSiblingsRaw(parentId)
+        val roots = runCatching { loadUserCloudRootsRaw() }.getOrElse { emptyList() }
+        val must = buildList {
+            addAll(mustIncludeRootIds)
+            if (parentId.isNotBlank()) add(parentId)
+        }
+        val rootIds = SameNamedCloudFolderHeal.cloudRootIdsForDiscovery(
+            cloudRoots = roots,
+            mustIncludeIds = must,
+            maxRoots = 16
+        )
+        val fromRoots = mutableListOf<SameNamedCloudFolderHeal.Sibling>()
+        for (rootId in rootIds) {
+            if (rootId.equals(parentId, ignoreCase = true)) continue
+            fromRoots += runCatching { loadChildFolderSiblingsRaw(rootId) }.getOrElse { emptyList() }
+        }
+        val merged = SameNamedCloudFolderHeal.mergeById(local, fromRoots)
+        return enrichDuplicateSiblingChildCounts(merged, onlyNames)
     }
 
     private suspend fun loadChildFolderSiblings(parentId: String): List<SameNamedCloudFolderHeal.Sibling> {
-        val children = api.getEntities(
-            GetEntitiesRequest(parentIds = listOf(parentId), includeValues = true, take = 500)
-        )
-        val base = children.mapNotNull { e ->
-            if (e.code != CloudCodes.CLOUD_FOLDER && e.code != CloudCodes.CLOUD_ROOT) return@mapNotNull null
-            SameNamedCloudFolderHeal.Sibling(
-                id = e.id,
-                name = entityDisplayName(e),
-                creationTime = e.creationTime
-            )
-        }
-        return enrichDuplicateSiblingChildCounts(base)
+        return enrichDuplicateSiblingChildCounts(loadChildFolderSiblingsRaw(parentId))
     }
 
     /**
      * When same-named folders collide, load immediate child counts so canonical pick
      * prefers the populated Win/AC id over an older empty duplicate.
+     * [onlyNames] limits enrich API calls (heal/wizard pass mapped or desired name).
      */
     private suspend fun enrichDuplicateSiblingChildCounts(
-        siblings: List<SameNamedCloudFolderHeal.Sibling>
+        siblings: List<SameNamedCloudFolderHeal.Sibling>,
+        onlyNames: Set<String>? = null
     ): List<SameNamedCloudFolderHeal.Sibling> {
         if (siblings.size < 2) return siblings
         val dupNames = siblings
             .groupBy { it.name.trim().lowercase() }
             .filter { it.key.isNotEmpty() && it.value.size >= 2 }
             .keys
+            .let { keys ->
+                if (onlyNames == null || onlyNames.isEmpty()) keys
+                else keys.filter { it in onlyNames }.toSet()
+            }
         if (dupNames.isEmpty()) return siblings
         return siblings.map { s ->
             if (s.name.trim().lowercase() !in dupNames) return@map s
@@ -2554,11 +2650,13 @@ class MainViewModel @Inject constructor(
     /**
      * Remap Notes/Cloud mappings that point at a duplicate same-named CloudFolder
      * onto the canonical sibling (populated preferred, then oldest CreationTime).
+     * Discovers same-named folders across CloudRoots (Android root vs Win Drive).
      */
     private suspend fun healDuplicateSameNamedMappings(): Int {
         val mappings = mappingStore.load()
         if (mappings.isEmpty()) return 0
         val parentByMapped = linkedMapOf<String, String>()
+        val ancestorRootByMapped = linkedMapOf<String, String>()
         for (m in mappings) {
             val parents = runCatching {
                 api.getEntities(
@@ -2569,15 +2667,40 @@ class MainViewModel @Inject constructor(
                     )
                 )
             }.getOrElse { emptyList() }
-            val parent = parents.firstOrNull {
-                it.code == CloudCodes.CLOUD_FOLDER || it.code == CloudCodes.CLOUD_ROOT
-            } ?: continue
+            val mainParentId = runCatching {
+                api.getEntity(m.cloudFolderId).mainParentId
+            }.getOrNull()
+            val parent = CloudMainParent.pickParent(mainParentId, parents)
+                ?.takeIf { CloudMainParent.isCloudFolderOrRoot(it.code) }
+                ?: continue
             parentByMapped[m.cloudFolderId] = parent.id
+            val rootId = parents.firstOrNull { it.code == CloudCodes.CLOUD_ROOT }?.id
+                ?: parent.id.takeIf { parent.code == CloudCodes.CLOUD_ROOT }
+            if (!rootId.isNullOrBlank()) {
+                ancestorRootByMapped[m.cloudFolderId] = rootId
+            }
         }
         if (parentByMapped.isEmpty()) return 0
+        val mustRoots = ancestorRootByMapped.values.distinctBy { it.lowercase() }
+        val mappedNames = mappings
+            .map { it.cloudFolderName.trim().lowercase() }
+            .filter { it.isNotEmpty() }
+            .toSet()
         val siblingsByParent = linkedMapOf<String, List<SameNamedCloudFolderHeal.Sibling>>()
         for (parentId in parentByMapped.values.distinctBy { it.lowercase() }) {
-            siblingsByParent[parentId] = loadChildFolderSiblings(parentId)
+            val siblings = loadChildFolderSiblingsForDiscovery(
+                parentId = parentId,
+                mustIncludeRootIds = mustRoots,
+                onlyNames = mappedNames
+            )
+            siblingsByParent[parentId] = siblings
+            val nameHits = mappedNames.associateWith { n ->
+                siblings.count { it.name.trim().equals(n, ignoreCase = true) }
+            }
+            android.util.Log.e(
+                "ProtoLinkSync",
+                "same-named heal discover parent=$parentId siblings=${siblings.size} nameHits=$nameHits"
+            )
         }
         val rows = mappings.map {
             SameNamedCloudFolderHeal.MappingRow(it.cloudFolderId, it.localPath, it.cloudFolderName)

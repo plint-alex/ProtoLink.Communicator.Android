@@ -129,6 +129,63 @@ object SameNamedCloudFolderHeal {
         return if (dup && id.isNotBlank()) "$n · ${id.take(8)}" else n
     }
 
+    /** Dedupe siblings by id (case-insensitive); keep richer childCount / name / creationTime. */
+    fun mergeById(vararg lists: List<Sibling>): List<Sibling> {
+        val map = linkedMapOf<String, Sibling>()
+        for (list in lists) {
+            for (s in list) {
+                if (s.id.isBlank()) continue
+                val key = s.id.lowercase()
+                val prev = map[key]
+                if (prev == null) {
+                    map[key] = s
+                    continue
+                }
+                map[key] = prev.copy(
+                    name = prev.name.ifBlank { s.name },
+                    creationTime = prev.creationTime?.takeIf { it.isNotBlank() } ?: s.creationTime,
+                    immediateChildCount = maxOf(prev.immediateChildCount, s.immediateChildCount)
+                )
+            }
+        }
+        return map.values.toList()
+    }
+
+    /**
+     * Pick CloudRoot ids to scan for cross-root same-named duplicates.
+     * Always includes [mustIncludeIds], then "Drive", then oldest roots — capped by [maxRoots].
+     *
+     * Live FAIL class: Android MyNotesFolder under CloudRoot A while Win/AC populated id
+     * lives under a different CloudRoot (Drive); same-parent discover alone never remaps.
+     */
+    fun cloudRootIdsForDiscovery(
+        cloudRoots: List<Sibling>,
+        mustIncludeIds: Collection<String>,
+        maxRoots: Int = 16
+    ): List<String> {
+        if (maxRoots <= 0) return emptyList()
+        val out = linkedMapOf<String, String>()
+        fun add(id: String?) {
+            val trimmed = id?.trim().orEmpty()
+            if (trimmed.isEmpty()) return
+            out.putIfAbsent(trimmed.lowercase(), trimmed)
+        }
+        for (id in mustIncludeIds) add(id)
+        for (r in cloudRoots) {
+            if (r.name.equals("Drive", ignoreCase = true)) add(r.id)
+        }
+        val oldestFirst = cloudRoots.sortedWith(
+            compareBy<Sibling> { r ->
+                r.creationTime?.trim()?.takeIf { it.isNotEmpty() } ?: "\uFFFF"
+            }.thenBy { it.id.lowercase() }
+        )
+        for (r in oldestFirst) {
+            if (out.size >= maxRoots) break
+            add(r.id)
+        }
+        return out.values.take(maxRoots)
+    }
+
     private val siblingCanonicalOrder = Comparator<Sibling> { a, b ->
         val childCmp = b.immediateChildCount.compareTo(a.immediateChildCount)
         if (childCmp != 0) return@Comparator childCmp
