@@ -69,6 +69,44 @@ class ApiRemoteCloud(private val api: ProtoLinkApi) : RemoteCloud {
         return all
     }
 
+    override suspend fun getEntitiesByIds(ids: List<String>, includeValues: Boolean): List<RemoteEntry> {
+        if (ids.isEmpty()) return emptyList()
+        val all = mutableListOf<RemoteEntry>()
+        val take = 200
+        for (chunk in ids.distinct().chunked(take)) {
+            var skip = 0
+            while (true) {
+                val page = api.getEntities(
+                    GetEntitiesRequest(
+                        ids = chunk,
+                        skip = skip,
+                        take = take,
+                        includeValues = includeValues
+                    )
+                )
+                for (e in page) {
+                    val isFolder = e.code == CloudCodes.CLOUD_FOLDER
+                    val isFile = e.code == CloudCodes.CLOUD_FILE
+                    if (!isFolder && !isFile) continue
+                    val name = EntityMeta.displayName(e)
+                    if (includeValues && EntityMeta.isSyntheticCloudFileDisplayName(e, name)) continue
+                    all.add(
+                        RemoteEntry(
+                            id = e.id,
+                            parentId = "",
+                            name = name,
+                            isFolder = isFolder,
+                            updateTime = parseTime(e.updateTime)
+                        )
+                    )
+                }
+                if (page.size < take) break
+                skip += take
+            }
+        }
+        return all
+    }
+
     override suspend fun addFolder(parentId: String, name: String): String {
         val res = api.addEntity(
             AddEntityRequest(

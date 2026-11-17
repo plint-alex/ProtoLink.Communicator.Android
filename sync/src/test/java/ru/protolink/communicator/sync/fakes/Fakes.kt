@@ -179,6 +179,19 @@ class InMemoryRemoteCloud : RemoteCloud {
             )
         }
 
+    override suspend fun getEntitiesByIds(ids: List<String>, includeValues: Boolean): List<RemoteEntry> =
+        ids.mapNotNull { id ->
+            val n = nodes[id] ?: return@mapNotNull null
+            RemoteEntry(
+                id = n.id,
+                parentId = n.parentId,
+                name = n.name,
+                isFolder = n.isFolder,
+                sizeBytes = n.bytes?.size?.toLong(),
+                updateTime = n.updateTime
+            )
+        }
+
     override suspend fun addFolder(parentId: String, name: String): String {
         val id = UUID.randomUUID().toString()
         nodes[id] = Node(id, parentId, name, true)

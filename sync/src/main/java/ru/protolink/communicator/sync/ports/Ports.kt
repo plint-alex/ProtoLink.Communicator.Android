@@ -33,6 +33,13 @@ interface RemoteCloud {
      * (ids+codes; names may be synthetic) for warm WalkRemote — Win values-light parity.
      */
     suspend fun listChildrenPaged(parentId: String, includeValues: Boolean = true): List<RemoteEntry>
+
+    /**
+     * Resolve entities by id (API Ids). Force inventory uses this after a structure-only
+     * parent walk to load display names in batches — avoids IncludeValues×folder cold walk.
+     */
+    suspend fun getEntitiesByIds(ids: List<String>, includeValues: Boolean = true): List<RemoteEntry>
+
     suspend fun addFolder(parentId: String, name: String): String
     suspend fun addFile(parentId: String, name: String, bytes: ByteArray, mimeType: String): String
     suspend fun uploadFile(entityId: String, name: String, bytes: ByteArray, mimeType: String)

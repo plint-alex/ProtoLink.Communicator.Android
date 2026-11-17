@@ -648,9 +648,12 @@ class SyncEngineTest {
         assertThat(withValues.get()).isEqualTo(0)
     }
 
-    /** Force after heal must cold-list (IncludeValues) even when stale meta exists — no double GE. */
+    /**
+     * Force after heal: structure-only parent walk (ignore stale meta) + Ids IncludeValues
+     * for names — never warm values-light double-list, never IncludeValues×folder cold walk.
+     */
     @Test
-    fun forcePull_withStaleMeta_listsWithValuesOnlyOncePerFolder() = runTest {
+    fun forcePull_withStaleMeta_structureFirstThenIdsNames() = runTest {
         val (store, fs, inner) = harness()
         inner.seedFolder("films", "cloud-root", "Films")
         inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
@@ -668,15 +671,27 @@ class SyncEngineTest {
             )
         )
 
-        val withValues = java.util.concurrent.atomic.AtomicInteger(0)
-        val withoutValues = java.util.concurrent.atomic.AtomicInteger(0)
+        val parentWithValues = java.util.concurrent.atomic.AtomicInteger(0)
+        val parentWithoutValues = java.util.concurrent.atomic.AtomicInteger(0)
+        val idsWithValues = java.util.concurrent.atomic.AtomicInteger(0)
         val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
             override suspend fun listChildrenPaged(
                 parentId: String,
                 includeValues: Boolean
             ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
-                if (includeValues) withValues.incrementAndGet() else withoutValues.incrementAndGet()
-                return inner.listChildrenPaged(parentId, includeValues)
+                if (includeValues) parentWithValues.incrementAndGet() else parentWithoutValues.incrementAndGet()
+                return inner.listChildrenPaged(parentId, includeValues).map {
+                    if (!includeValues) it.copy(name = if (it.isFolder) "folder-${it.id}" else "file-${it.id}")
+                    else it
+                }
+            }
+
+            override suspend fun getEntitiesByIds(
+                ids: List<String>,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                if (includeValues) idsWithValues.incrementAndGet()
+                return inner.getEntitiesByIds(ids, includeValues)
             }
         }
 
@@ -684,9 +699,13 @@ class SyncEngineTest {
 
         assertThat(count).isEqualTo(1)
         assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
-        // Cold Force: one IncludeValues list per folder (root + Films), never structure-only.
-        assertThat(withoutValues.get()).isEqualTo(0)
-        assertThat(withValues.get()).isEqualTo(2)
+        // Structure-first: parent listings are includeValues=false only (root + Films).
+        assertThat(parentWithoutValues.get()).isEqualTo(2)
+        assertThat(parentWithValues.get()).isEqualTo(0)
+        // Names come from Ids IncludeValues batches — not per-folder Values re-list.
+        assertThat(idsWithValues.get()).isAtLeast(1)
+        // Ghost meta path must not remain after Force prune.
+        assertThat(fs.exists(root, "confluence")).isFalse()
     }
 
     @Test

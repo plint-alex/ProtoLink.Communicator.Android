@@ -26,10 +26,13 @@ class SyncEngine(
     companion object {
         /**
          * Parallel GetEntities for folder walk. Align with Windows
-         * GetEntitiesThrottlingHandler.SyncLaneConcurrency (24). Cap 8 + IncludeValues
-         * still left MyNotesFolder (~3.5k folders) Force mid-walk after ~33m.
+         * GetEntitiesThrottlingHandler.SyncLaneConcurrency (24). Must pair with OkHttp
+         * maxRequestsPerHost ≥ this (default 5 capped live Force to ~140–180 GE/min).
          */
         const val WALK_REMOTE_CONCURRENCY = 24
+
+        /** Ids IncludeValues batch size for Force name resolve (API take page). */
+        const val FORCE_NAME_BATCH = 200
     }
     data class Result(
         val localChanges: Int,
@@ -739,29 +742,24 @@ class SyncEngine(
 
     /**
      * Depth-first remote inventory with parallel sibling folder listings (Win WalkRemoteParallel parity).
-     * When [valuesLight] and meta is non-empty: structure-only GetEntities when every child id is
-     * already known; otherwise one IncludeValues re-list (Win values-light). Force passes
-     * valuesLight=false — after heal, wrong-tree meta would otherwise double-list every folder.
+     * When meta is non-empty: structure-only GetEntities when every child id is already known;
+     * otherwise one IncludeValues re-list (Win values-light). Cold bootstrap (empty meta) still
+     * IncludeValues-lists. Force uses [walkRemoteForceInventory] instead (structure-first + Ids).
      * [visitedIds]/[seenPaths] stop cycles.
      */
     private suspend fun walkRemote(
         folderId: String,
         mappingId: String,
         relativeParent: String,
-        out: MutableList<RemoteChangeClassifier.RemoteLocated>,
-        valuesLight: Boolean = true
+        out: MutableList<RemoteChangeClassifier.RemoteLocated>
     ) {
         val visitedIds = mutableSetOf<String>()
         val seenPaths = mutableSetOf<String>()
         val gate = Mutex()
         val throttle = Semaphore(WALK_REMOTE_CONCURRENCY)
-        val metaByRemoteId = if (valuesLight) {
-            store.getAll(mappingId)
-                .groupBy { it.remoteId }
-                .mapValues { (_, items) -> items.first() }
-        } else {
-            emptyMap()
-        }
+        val metaByRemoteId = store.getAll(mappingId)
+            .groupBy { it.remoteId }
+            .mapValues { (_, items) -> items.first() }
         walkRemoteParallel(
             folderId, mappingId, relativeParent, out, visitedIds, seenPaths, gate, throttle,
             metaByRemoteId
@@ -779,7 +777,7 @@ class SyncEngine(
         throttle: Semaphore,
         metaByRemoteId: Map<String, SyncItemMeta>
     ) {
-        // Cold (empty meta / Force): IncludeValues listing per folder.
+        // Cold (empty meta): IncludeValues listing per folder.
         // Warm reconcile: structure-only first; if every child is already in meta, reuse
         // RelativePath names. Any unknown child → one IncludeValues re-list for that folder.
         val warm = metaByRemoteId.isNotEmpty()
@@ -835,6 +833,110 @@ class SyncEngine(
         }
     }
 
+    private data class StructureEdge(
+        val id: String,
+        val parentId: String,
+        val isFolder: Boolean
+    )
+
+    /**
+     * Force inventory: structure-only parent walk (heal-safe, no stale-meta trust) then batch
+     * Ids IncludeValues for display names. Avoids cold IncludeValues×~3.5k folder listings that
+     * never reached fill on live MyNotesFolder even at Semaphore(24).
+     */
+    private suspend fun walkRemoteForceInventory(
+        rootFolderId: String,
+        mappingId: String,
+        out: MutableList<RemoteChangeClassifier.RemoteLocated>
+    ) {
+        val edges = mutableListOf<StructureEdge>()
+        val visitedIds = mutableSetOf<String>()
+        val gate = Mutex()
+        val throttle = Semaphore(WALK_REMOTE_CONCURRENCY)
+        walkRemoteStructureParallel(rootFolderId, edges, visitedIds, gate, throttle)
+
+        val ids = edges.map { it.id }.distinct()
+        val names = resolveDisplayNamesByIds(ids, throttle)
+        val byParent = edges.groupBy { it.parentId }
+        val seenPaths = mutableSetOf<String>()
+        val queue = ArrayDeque<Pair<String, String>>()
+        queue.add(rootFolderId to "")
+        while (queue.isNotEmpty()) {
+            val (folderId, relativeParent) = queue.removeFirst()
+            for (kid in byParent[folderId].orEmpty()) {
+                val name = names[kid.id] ?: continue
+                if (name.isEmpty()) continue
+                val rel = PathUtil.join(relativeParent, name)
+                if (!seenPaths.add(PathUtil.normalize(rel))) continue
+                out.add(
+                    RemoteChangeClassifier.RemoteLocated(
+                        entry = ru.protolink.communicator.sync.model.RemoteEntry(
+                            id = kid.id,
+                            parentId = folderId,
+                            name = name,
+                            isFolder = kid.isFolder
+                        ),
+                        mappingId = mappingId,
+                        relativePath = rel
+                    )
+                )
+                if (kid.isFolder) queue.add(kid.id to rel)
+            }
+        }
+    }
+
+    private suspend fun walkRemoteStructureParallel(
+        folderId: String,
+        out: MutableList<StructureEdge>,
+        visitedIds: MutableSet<String>,
+        gate: Mutex,
+        throttle: Semaphore
+    ) {
+        val children = throttle.withPermit {
+            remote.listChildrenPaged(folderId, includeValues = false)
+        }
+        val subfolders = mutableListOf<String>()
+        gate.withLock {
+            for (child in children) {
+                if (!visitedIds.add(child.id)) continue
+                out.add(StructureEdge(child.id, folderId, child.isFolder))
+                if (child.isFolder) subfolders.add(child.id)
+            }
+        }
+        if (subfolders.isEmpty()) return
+        coroutineScope {
+            subfolders.map { id ->
+                async {
+                    walkRemoteStructureParallel(id, out, visitedIds, gate, throttle)
+                }
+            }.awaitAll()
+        }
+    }
+
+    private suspend fun resolveDisplayNamesByIds(
+        ids: List<String>,
+        throttle: Semaphore
+    ): Map<String, String> {
+        if (ids.isEmpty()) return emptyMap()
+        val names = mutableMapOf<String, String>()
+        val gate = Mutex()
+        coroutineScope {
+            ids.chunked(FORCE_NAME_BATCH).map { chunk ->
+                async {
+                    val rows = throttle.withPermit {
+                        remote.getEntitiesByIds(chunk, includeValues = true)
+                    }
+                    gate.withLock {
+                        for (row in rows) {
+                            if (row.name.isNotEmpty()) names[row.id] = row.name
+                        }
+                    }
+                }
+            }.awaitAll()
+        }
+        return names
+    }
+
     private fun resolveParentId(mapping: SyncMapping, parentPath: String): String? {
         if (parentPath.isEmpty()) return mapping.cloudFolderId
         val existing = store.getAll(mapping.id)
@@ -888,8 +990,8 @@ class SyncEngine(
     suspend fun forcePullPath(mapping: SyncMapping, relativePath: String) {
         val path = PathUtil.normalize(relativePath)
         val located = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
-        // Cold IncludeValues: Force must not values-light against possibly-stale meta.
-        walkRemote(mapping.cloudFolderId, mapping.id, "", located, valuesLight = false)
+        // Structure-first + Ids names — heal-safe (no stale-meta warm trust).
+        walkRemoteForceInventory(mapping.cloudFolderId, mapping.id, located)
         val loc = located.firstOrNull {
             PathUtil.normalize(it.relativePath) == path && !it.entry.isFolder
         } ?: throw SyncException("Remote file missing for conflict resolve.", relativePath = path)
@@ -987,9 +1089,9 @@ class SyncEngine(
      */
     suspend fun forcePullMapping(mapping: SyncMapping): Int {
         val located = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
-        // Cold IncludeValues walk: after heal, wrong-tree meta would make values-light
-        // structure+Values double-list every folder (~2× GE). Concurrency 24 is the Force lever.
-        walkRemote(mapping.cloudFolderId, mapping.id, "", located, valuesLight = false)
+        // Structure-first inventory + batch Ids IncludeValues for names (heal-safe).
+        // Cold IncludeValues×folder never reached fill on live ~3.5k MyNotesFolder.
+        walkRemoteForceInventory(mapping.cloudFolderId, mapping.id, located)
         if (located.isEmpty()) {
             throw SyncException("Force download found no remote files in this folder.")
         }

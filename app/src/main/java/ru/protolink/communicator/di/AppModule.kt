@@ -78,7 +78,13 @@ object AppModule {
             }
             resp
         }
+        // Default maxRequestsPerHost=5 capped Force walkRemote Semaphore(24) to ~5 in-flight
+        // GetEntities — live ~140–180 GE/min on 898c1453 (≈ concurrency-8 band). Match walk.
+        val dispatcher = okhttp3.Dispatcher().apply {
+            maxRequestsPerHost = ru.protolink.communicator.sync.engine.SyncEngine.WALK_REMOTE_CONCURRENCY
+        }
         return OkHttpClient.Builder()
+            .dispatcher(dispatcher)
             .addInterceptor(auth)
             .addInterceptor(messengerLog)
             .addInterceptor(HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC })
