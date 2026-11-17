@@ -376,6 +376,8 @@ class SyncEngine(
         val changes = localClassifier.classify(snap, meta)
         var applied = 0
         val remoteByPath = remoteInMapping.associateBy { PathUtil.normalize(it.relativePath) }
+        // Parent→children cache for match-before-create (push / walk miss).
+        val siblingCache = mutableMapOf<String, List<RemoteEntry>>()
 
         // Full reconcile (remote tree known): prune deepest-first. Local-only push: create parents first.
         val adds = changes.filterIsInstance<LocalChange.Added>().let { list ->
@@ -537,14 +539,33 @@ class SyncEngine(
             val parentPath = PathUtil.parentOf(a.entry.relativePath)
             val parentId = resolveParentId(mapping, parentPath) ?: mapping.cloudFolderId
             val name = PathUtil.nameOf(a.entry.relativePath)
+            val (reuse, listingOk) = resolveExistingSibling(
+                parentId, name, a.entry.isFolder, remoteInMapping, siblingCache
+            )
+            if (reuse == null && !listingOk) {
+                android.util.Log.w(
+                    "ProtoLinkSync",
+                    "skip create $path: sibling listing failed under $parentId"
+                )
+                continue
+            }
             val id: String
-            if (a.entry.isFolder) {
+            if (reuse != null) {
+                id = reuse.id
+                if (!a.entry.isFolder) {
+                    val bytes = fs.readFile(mapping.localRootPath, a.entry.relativePath)
+                    if (bytes.isEmpty()) continue
+                    remote.uploadFile(id, name, bytes, mimeOf(name))
+                }
+            } else if (a.entry.isFolder) {
                 id = remote.addFolder(parentId, name)
+                rememberSibling(siblingCache, parentId, id, name, isFolder = true)
             } else {
                 val bytes = fs.readFile(mapping.localRootPath, a.entry.relativePath)
                 // Never push an empty / editor stub when we are about to adopt cloud content.
                 if (bytes.isEmpty()) continue
                 id = remote.addFile(parentId, name, bytes, mimeOf(name))
+                rememberSibling(siblingCache, parentId, id, name, isFolder = false)
             }
             store.upsert(
                 SyncItemMeta(
@@ -1146,6 +1167,63 @@ class SyncEngine(
         return existing?.remoteId
     }
 
+    /**
+     * Match-before-create: walk list first, then live parent listChildren (cached).
+     * Match null + listingOk false → soft-fail (do not create a possible duplicate).
+     */
+    private suspend fun resolveExistingSibling(
+        parentId: String,
+        displayName: String,
+        isFolder: Boolean,
+        remoteInMapping: List<RemoteChangeClassifier.RemoteLocated>,
+        siblingCache: MutableMap<String, List<RemoteEntry>>
+    ): Pair<RemoteEntry?, Boolean> {
+        val fromWalk = SameNamedCloudSibling.preferExisting(
+            parentId,
+            displayName,
+            isFolder,
+            remoteInMapping.map { it.entry }
+        )
+        if (fromWalk != null) return fromWalk to true
+
+        val cachedKey = siblingCache.keys.firstOrNull { it.equals(parentId, ignoreCase = true) }
+        if (cachedKey != null) {
+            val kids = siblingCache.getValue(cachedKey)
+            return SameNamedCloudSibling.preferExisting(parentId, displayName, isFolder, kids) to true
+        }
+
+        return try {
+            val kids = remote.listChildrenPaged(parentId, includeValues = true)
+                .filter { it.name.isNotBlank() }
+            siblingCache[parentId] = kids
+            SameNamedCloudSibling.preferExisting(parentId, displayName, isFolder, kids) to true
+        } catch (e: Exception) {
+            android.util.Log.w(
+                "ProtoLinkSync",
+                "sibling list failed parent=$parentId: ${e.message ?: e.javaClass.simpleName}"
+            )
+            null to false
+        }
+    }
+
+    private fun rememberSibling(
+        siblingCache: MutableMap<String, List<RemoteEntry>>,
+        parentId: String,
+        id: String,
+        name: String,
+        isFolder: Boolean
+    ) {
+        val key = siblingCache.keys.firstOrNull { it.equals(parentId, ignoreCase = true) } ?: parentId
+        val prev = siblingCache[key].orEmpty()
+        siblingCache[key] = prev + RemoteEntry(
+            id = id,
+            parentId = parentId,
+            name = name,
+            isFolder = isFolder,
+            updateTime = Instant.now()
+        )
+    }
+
     private fun mimeOf(name: String): String = when {
         name.endsWith(".html", true) -> "text/html"
         name.endsWith(".txt", true) -> "text/plain"
@@ -1168,11 +1246,23 @@ class SyncEngine(
         val name = PathUtil.nameOf(path)
         val existing = store.getAll(mapping.id)
             .firstOrNull { PathUtil.normalize(it.relativePath) == path && !it.isFolder }
+        val siblingCache = mutableMapOf<String, List<RemoteEntry>>()
         val remoteId = if (existing != null) {
             remote.uploadFile(existing.remoteId, name, bytes, mimeOf(name))
             existing.remoteId
         } else {
-            remote.addFile(parentId, name, bytes, mimeOf(name))
+            val (reuse, listingOk) = resolveExistingSibling(
+                parentId, name, isFolder = false, emptyList(), siblingCache
+            )
+            if (reuse == null && !listingOk) {
+                throw SyncException("Sibling listing failed; refused duplicate create.", relativePath = path)
+            }
+            if (reuse != null) {
+                remote.uploadFile(reuse.id, name, bytes, mimeOf(name))
+                reuse.id
+            } else {
+                remote.addFile(parentId, name, bytes, mimeOf(name))
+            }
         }
         store.upsert(
             SyncItemMeta(
@@ -1231,6 +1321,7 @@ class SyncEngine(
             )
         }
         var files = 0
+        val siblingCache = mutableMapOf<String, List<RemoteEntry>>()
         for (entry in snap) {
             val path = PathUtil.normalize(entry.relativePath)
             val parentPath = PathUtil.parentOf(path)
@@ -1240,7 +1331,17 @@ class SyncEngine(
                 .firstOrNull { PathUtil.normalize(it.relativePath) == path }
             if (entry.isFolder) {
                 if (existing != null) continue
-                val id = remote.addFolder(parentId, name)
+                val (reuseFolder, folderListingOk) = resolveExistingSibling(
+                    parentId, name, isFolder = true, emptyList(), siblingCache
+                )
+                if (reuseFolder == null && !folderListingOk) continue
+                val id = if (reuseFolder != null) {
+                    reuseFolder.id
+                } else {
+                    remote.addFolder(parentId, name).also {
+                        rememberSibling(siblingCache, parentId, it, name, isFolder = true)
+                    }
+                }
                 store.upsert(
                     SyncItemMeta(
                         mappingId = mapping.id,
@@ -1261,7 +1362,18 @@ class SyncEngine(
                 remote.uploadFile(existing.remoteId, name, bytes, mimeOf(name))
                 existing.remoteId
             } else {
-                remote.addFile(parentId, name, bytes, mimeOf(name))
+                val (reuseFile, fileListingOk) = resolveExistingSibling(
+                    parentId, name, isFolder = false, emptyList(), siblingCache
+                )
+                if (reuseFile == null && !fileListingOk) continue
+                if (reuseFile != null) {
+                    remote.uploadFile(reuseFile.id, name, bytes, mimeOf(name))
+                    reuseFile.id
+                } else {
+                    remote.addFile(parentId, name, bytes, mimeOf(name)).also {
+                        rememberSibling(siblingCache, parentId, it, name, isFolder = false)
+                    }
+                }
             }
             store.upsert(
                 SyncItemMeta(

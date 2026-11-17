@@ -415,6 +415,36 @@ class SyncEngineTest {
             .isEqualTo(ContentHashUtil.sha256Hex("FORCE-LOCAL".toByteArray()))
     }
 
+    /** Same-name Cloud sibling: ForcePush with empty meta must reuse existing file, not AddFile again. */
+    @Test
+    fun forcePush_existingSameNameFile_reusesId_noSecondEntity() = runTest {
+        val (store, fs, remote) = harness()
+        val existingId = remote.addFile(
+            "cloud-root", "index.html", "cloud-v1".toByteArray(), "text/html"
+        )
+        fs.writeFile(root, "index.html", "local-v2".toByteArray())
+        SyncEngine(store, fs, remote).forcePushMapping(mapping)
+        assertThat(remote.childrenOf("cloud-root").filter { !it.isFolder && it.name.equals("index.html", true) })
+            .hasSize(1)
+        assertThat(store.getAll("m1").first { it.relativePath == "index.html" }.remoteId)
+            .isEqualTo(existingId)
+        assertThat(String(remote.get(existingId)!!.bytes!!)).isEqualTo("local-v2")
+    }
+
+    /** Same-name Cloud sibling: ForcePush must reuse existing folder id. */
+    @Test
+    fun forcePush_existingSameNameFolder_reusesId_noSecondFolder() = runTest {
+        val (store, fs, remote) = harness()
+        val existingFolder = remote.addFolder("cloud-root", "Agents")
+        fs.createDirectory(root, "Agents")
+        fs.writeFile(root, "Agents/note.txt", "x".toByteArray())
+        SyncEngine(store, fs, remote).forcePushMapping(mapping)
+        assertThat(remote.childrenOf("cloud-root").filter { it.isFolder && it.name.equals("Agents", true) })
+            .hasSize(1)
+        assertThat(store.getAll("m1").first { it.relativePath == "agents" }.remoteId)
+            .isEqualTo(existingFolder)
+    }
+
     @Test
     fun forcePull_overwritesLocal() = runTest {
         val (store, fs, remote) = harness()
