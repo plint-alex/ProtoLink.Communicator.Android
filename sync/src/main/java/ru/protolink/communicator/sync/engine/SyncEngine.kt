@@ -36,6 +36,12 @@ class SyncEngine(
         /** Ids IncludeValues batch size for Force name resolve (API take page). */
         const val FORCE_NAME_BATCH = 200
 
+        /**
+         * Force structure inventory: parents per GetEntities ParentIdsMatchAny call.
+         * Cuts GE count ~batch vs 1/folder (live ~3.5k×RTT was still mid-walk at 30m).
+         */
+        const val FORCE_PARENT_BATCH = 48
+
         /** Force inventory GetEntities attempts (transient HTTP 5xx). */
         const val FORCE_INVENTORY_MAX_ATTEMPTS = SyncInventoryFetch.MAX_ATTEMPTS
     }
@@ -845,9 +851,9 @@ class SyncEngine(
     )
 
     /**
-     * Force inventory: structure-only parent walk (heal-safe, no stale-meta trust) then batch
-     * Ids IncludeValues for display names. Avoids cold IncludeValues×~3.5k folder listings that
-     * never reached fill on live MyNotesFolder even at Semaphore(24).
+     * Force inventory: structure-only BFS with batched ParentIdsMatchAny listings (heal-safe),
+     * then batch Ids IncludeValues for display names. One GE per [FORCE_PARENT_BATCH] parents
+     * instead of 1 GE/folder — live MyNotesFolder ~3.5k×RTT never reached fill at 30m.
      */
     private suspend fun walkRemoteForceInventory(
         rootFolderId: String,
@@ -856,16 +862,12 @@ class SyncEngine(
     ) {
         val edges = mutableListOf<StructureEdge>()
         val visitedIds = mutableSetOf<String>()
-        val gate = Mutex()
         val throttle = Semaphore(WALK_REMOTE_CONCURRENCY)
-        // Root listing hard-fails after retries (empty inventory would prune everything).
-        walkRemoteStructureParallel(
-            folderId = rootFolderId,
+        walkRemoteStructureBatched(
+            rootFolderId = rootFolderId,
             out = edges,
             visitedIds = visitedIds,
-            gate = gate,
-            throttle = throttle,
-            softFailOnExhausted = false
+            throttle = throttle
         )
 
         val ids = edges.map { it.id }.distinct()
@@ -898,41 +900,96 @@ class SyncEngine(
         }
     }
 
-    private suspend fun walkRemoteStructureParallel(
-        folderId: String,
+    /**
+     * Root listed alone (hard). Nested parents BFS-batched via [listChildrenOfParentsForceInventory]
+     * with MatchAny probe — falls back to 1/parent if deployed Api lacks ParentIdsMatchAny.
+     */
+    private suspend fun walkRemoteStructureBatched(
+        rootFolderId: String,
         out: MutableList<StructureEdge>,
         visitedIds: MutableSet<String>,
-        gate: Mutex,
-        throttle: Semaphore,
-        softFailOnExhausted: Boolean
+        throttle: Semaphore
     ) {
-        val children = throttle.withPermit {
-            listChildrenForceInventory(folderId, softFailOnExhausted)
+        val rootChildren = throttle.withPermit {
+            listChildrenForceInventory(rootFolderId, softFailOnExhausted = false)
         }
-        val subfolders = mutableListOf<String>()
-        gate.withLock {
+        val pending = ArrayDeque<String>()
+        for (child in rootChildren) {
+            if (!visitedIds.add(child.id)) continue
+            out.add(StructureEdge(child.id, rootFolderId, child.isFolder))
+            if (child.isFolder) pending.add(child.id)
+        }
+
+        // null = not probed yet; false = old Api (AND) — stay 1/parent for this Force pass.
+        var matchAnyEnabled: Boolean? = null
+        while (pending.isNotEmpty()) {
+            val batch = ArrayList<String>(FORCE_PARENT_BATCH)
+            while (pending.isNotEmpty() && batch.size < FORCE_PARENT_BATCH) {
+                batch.add(pending.removeFirst())
+            }
+            val children = when {
+                matchAnyEnabled == false || batch.size == 1 ->
+                    listChildrenForceInventoryParallel(batch, throttle)
+                else -> {
+                    var batched = try {
+                        throttle.withPermit {
+                            // Hard on exhaust so one 5xx does not soft-empty the whole batch
+                            // (siblings must still fill — fall back to per-parent soft-fail).
+                            listChildrenOfParentsForceInventory(batch, softFailOnExhausted = false)
+                        }
+                    } catch (t: Throwable) {
+                        if (SyncInventoryFetch.isHardClientError(t)) throw t
+                        if (!SyncInventoryFetch.isTransientServerError(t) &&
+                            t !is SyncException
+                        ) {
+                            throw t
+                        }
+                        SyncInventoryFetch.logSoftFail(
+                            "ForceStructureBatch",
+                            batch.first() + "+${batch.size - 1}",
+                            t.message ?: t.javaClass.simpleName
+                        )
+                        listChildrenForceInventoryParallel(batch, throttle)
+                    }
+                    if (matchAnyEnabled == null && batched.isEmpty() && batch.size > 1) {
+                        val single = throttle.withPermit {
+                            listChildrenForceInventory(batch[0], softFailOnExhausted = true)
+                        }
+                        if (single.isNotEmpty()) {
+                            System.err.println(
+                                "[SyncEngine] ParentIdsMatchAny unsupported (empty multi-parent " +
+                                    "batch, non-empty single) — Force falls back to 1 GE/parent"
+                            )
+                            matchAnyEnabled = false
+                            batched = listChildrenForceInventoryParallel(batch, throttle)
+                        } else {
+                            matchAnyEnabled = true
+                        }
+                    } else if (matchAnyEnabled == null) {
+                        matchAnyEnabled = true
+                    }
+                    batched
+                }
+            }
             for (child in children) {
                 if (!visitedIds.add(child.id)) continue
-                out.add(StructureEdge(child.id, folderId, child.isFolder))
-                if (child.isFolder) subfolders.add(child.id)
+                out.add(StructureEdge(child.id, child.parentId, child.isFolder))
+                if (child.isFolder) pending.add(child.id)
             }
         }
-        if (subfolders.isEmpty()) return
-        coroutineScope {
-            subfolders.map { id ->
-                async {
-                    // Nested parents: soft-fail after retries so one HTTP 500 does not cancel siblings.
-                    walkRemoteStructureParallel(
-                        folderId = id,
-                        out = out,
-                        visitedIds = visitedIds,
-                        gate = gate,
-                        throttle = throttle,
-                        softFailOnExhausted = true
-                    )
+    }
+
+    private suspend fun listChildrenForceInventoryParallel(
+        folderIds: List<String>,
+        throttle: Semaphore
+    ): List<RemoteEntry> = coroutineScope {
+        folderIds.map { id ->
+            async {
+                throttle.withPermit {
+                    listChildrenForceInventory(id, softFailOnExhausted = true)
                 }
-            }.awaitAll()
-        }
+            }
+        }.awaitAll().flatten()
     }
 
     /**
@@ -967,6 +1024,42 @@ class SyncEngine(
             return emptyList()
         }
         throw last ?: SyncException("Force inventory GetEntities failed for root folder.")
+    }
+
+    /** Batched ParentIdsMatchAny structure list with same 5xx retry / soft-fail. */
+    private suspend fun listChildrenOfParentsForceInventory(
+        folderIds: List<String>,
+        softFailOnExhausted: Boolean
+    ): List<RemoteEntry> {
+        if (folderIds.isEmpty()) return emptyList()
+        if (folderIds.size == 1) {
+            return listChildrenForceInventory(folderIds[0], softFailOnExhausted)
+        }
+        val key = folderIds.first() + "+${folderIds.size - 1}"
+        var last: Throwable? = null
+        for (attempt in 0 until SyncInventoryFetch.MAX_ATTEMPTS) {
+            val wait = SyncInventoryFetch.backoffMs(attempt)
+            if (wait > 0L) delay(wait)
+            try {
+                return remote.listChildrenOfParents(folderIds, includeValues = false)
+            } catch (t: Throwable) {
+                if (SyncInventoryFetch.isHardClientError(t)) throw t
+                if (!SyncInventoryFetch.isTransientServerError(t)) throw t
+                last = t
+                SyncInventoryFetch.logRetry(
+                    "ForceStructureBatch",
+                    key,
+                    attempt + 1,
+                    t.message ?: t.javaClass.simpleName
+                )
+            }
+        }
+        val detail = last?.message ?: last?.javaClass?.simpleName ?: "exhausted"
+        if (softFailOnExhausted) {
+            SyncInventoryFetch.logSoftFail("ForceStructureBatch", key, detail)
+            return emptyList()
+        }
+        throw last ?: SyncException("Force inventory batched GetEntities failed.")
     }
 
     private suspend fun resolveDisplayNamesByIds(

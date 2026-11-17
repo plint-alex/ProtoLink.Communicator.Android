@@ -35,6 +35,17 @@ interface RemoteCloud {
     suspend fun listChildrenPaged(parentId: String, includeValues: Boolean = true): List<RemoteEntry>
 
     /**
+     * List children of many parents in one GetEntities call (API ParentIdsMatchAny=OR).
+     * Each [RemoteEntry.parentId] is the matched folder (MainParentId). Default falls back
+     * to sequential [listChildrenPaged] so unit fakes / old servers keep working.
+     */
+    suspend fun listChildrenOfParents(
+        parentIds: List<String>,
+        includeValues: Boolean = true
+    ): List<RemoteEntry> =
+        parentIds.flatMap { listChildrenPaged(it, includeValues) }
+
+    /**
      * Resolve entities by id (API Ids). Force inventory uses this after a structure-only
      * parent walk to load display names in batches — avoids IncludeValues×folder cold walk.
      */

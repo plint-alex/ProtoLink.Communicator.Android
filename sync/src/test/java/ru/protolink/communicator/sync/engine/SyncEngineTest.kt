@@ -631,6 +631,13 @@ class SyncEngineTest {
                 }
                 return inner.listChildrenPaged(parentId, includeValues)
             }
+
+            // Must override: `by inner` would call InMemory default and skip this 500 hook.
+            override suspend fun listChildrenOfParents(
+                parentIds: List<String>,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> =
+                parentIds.flatMap { listChildrenPaged(it, includeValues) }
         }
 
         val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
@@ -657,6 +664,12 @@ class SyncEngineTest {
                 }
                 return inner.listChildrenPaged(parentId, includeValues)
             }
+
+            override suspend fun listChildrenOfParents(
+                parentIds: List<String>,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> =
+                parentIds.flatMap { listChildrenPaged(it, includeValues) }
         }
 
         val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
@@ -747,6 +760,51 @@ class SyncEngineTest {
         assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
         assertThat(withoutValues.get()).isAtLeast(1)
         assertThat(withValues.get()).isEqualTo(0)
+    }
+
+    /**
+     * FAIL class P1-20261117 inventory still unbounded: Force must batch many parents per
+     * GetEntities (ParentIdsMatchAny) so GE count ≪ folder count on wide trees.
+     */
+    @Test
+    fun forcePull_batchesParentListings_geCallsLessThanFolderCount() = runTest {
+        val (store, fs, inner) = harness()
+        val folderCount = 60
+        for (i in 0 until folderCount) {
+            inner.seedFolder("f$i", "cloud-root", "Folder$i")
+            inner.seedFile("file$i", "f$i", "n.txt", "x$i".toByteArray())
+        }
+
+        val parentBatchCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val singleParentCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun listChildrenPaged(
+                parentId: String,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                singleParentCalls.incrementAndGet()
+                return inner.listChildrenPaged(parentId, includeValues)
+            }
+
+            override suspend fun listChildrenOfParents(
+                parentIds: List<String>,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                parentBatchCalls.incrementAndGet()
+                return parentIds.flatMap { pid ->
+                    inner.listChildrenPaged(pid, includeValues)
+                }
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(folderCount)
+        // Root alone (1 single) + ≥1 batched multi-parent listing; never 1+60 singles for structure.
+        assertThat(parentBatchCalls.get()).isAtLeast(1)
+        assertThat(singleParentCalls.get()).isLessThan(folderCount)
+        assertThat(fs.exists(root, "Folder0/n.txt")).isTrue()
+        assertThat(fs.exists(root, "Folder59/n.txt")).isTrue()
     }
 
     /**

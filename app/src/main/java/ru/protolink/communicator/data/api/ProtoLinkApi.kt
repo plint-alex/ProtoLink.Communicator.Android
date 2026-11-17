@@ -54,6 +54,11 @@ data class GetEntitiesRequest(
     val take: Int? = 200,
     val includeValues: Boolean = true,
     val showHidden: Boolean = false,
+    /**
+     * When true with multiple parentIds, server ORs parents (Force batch inventory).
+     * Default false keeps AND (Contacts bag). Requires deployed Api that understands the flag.
+     */
+    val parentIdsMatchAny: Boolean = false,
     /** 1 id = self-chat; 2 ids = pair. Server filters sender:/receiver:, newest-first. */
     val conversationUserIds: List<String>? = null,
     /** S6 Shared with me: list caller's direct share roots (no parentIds). */
@@ -69,7 +74,9 @@ data class EntityDto(
     val values: List<EntityValueDto>? = null,
     val userWhoCreatedId: String? = null,
     /** Populated for Shared with me rows — effective CanWrite from the caller's direct grant(s). */
-    val canWrite: Boolean? = null
+    val canWrite: Boolean? = null,
+    /** Cloud folder parent axis — Force MatchAny batch attribution. */
+    val mainParentId: String? = null
 )
 
 /** Minimal GetEntity payload (share paste + MainParent axis AT-PC5). */

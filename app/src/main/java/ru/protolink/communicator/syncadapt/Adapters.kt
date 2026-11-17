@@ -30,16 +30,28 @@ import java.time.OffsetDateTime
 
 class ApiRemoteCloud(private val api: ProtoLinkApi) : RemoteCloud {
     override suspend fun listChildrenPaged(parentId: String, includeValues: Boolean): List<RemoteEntry> {
+        return listChildrenOfParents(listOf(parentId), includeValues)
+    }
+
+    override suspend fun listChildrenOfParents(
+        parentIds: List<String>,
+        includeValues: Boolean
+    ): List<RemoteEntry> {
+        val distinct = parentIds.distinct().filter { it.isNotEmpty() }
+        if (distinct.isEmpty()) return emptyList()
+        val parentSet = distinct.toSet()
+        val matchAny = distinct.size > 1
         val all = mutableListOf<RemoteEntry>()
         var skip = 0
         val take = 200
         while (true) {
             val page = api.getEntities(
                 GetEntitiesRequest(
-                    parentIds = listOf(parentId),
+                    parentIds = distinct,
                     skip = skip,
                     take = take,
-                    includeValues = includeValues
+                    includeValues = includeValues,
+                    parentIdsMatchAny = matchAny
                 )
             )
             for (e in page) {
@@ -53,6 +65,9 @@ class ApiRemoteCloud(private val api: ProtoLinkApi) : RemoteCloud {
                 // warm WalkRemote can match meta by id.
                 val name = EntityMeta.displayName(e)
                 if (includeValues && EntityMeta.isSyntheticCloudFileDisplayName(e, name)) continue
+                val parentId = e.mainParentId?.takeIf { it in parentSet }
+                    ?: distinct.singleOrNull()
+                    ?: continue
                 all.add(
                     RemoteEntry(
                         id = e.id,
