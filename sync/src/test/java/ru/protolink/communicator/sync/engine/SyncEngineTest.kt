@@ -1045,6 +1045,77 @@ class SyncEngineTest {
     }
 
     /**
+     * Live 1.0.58 FAIL: root-wave awaitAll downloaded all loose root files before prune —
+     * confluence ghosts stayed for ~28m. Prune must run before any root-file getFile.
+     */
+    @Test
+    fun forcePull_prunesRootGhostsBeforeRootFileDownloads() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("films", "cloud-root", "Films")
+        inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
+        repeat(12) { i ->
+            inner.seedFile("root$i", "cloud-root", "shot-$i.png", "img$i".toByteArray())
+        }
+        fs.createDirectory(root, "confluence")
+        fs.writeFile(root, "confluence/page.html", "ghost".toByteArray())
+        fs.createDirectory(root, "databases")
+
+        val ghostGoneBeforeRootFile = java.util.concurrent.atomic.AtomicBoolean(false)
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun downloadFile(entityId: String): ByteArray? {
+                if (entityId.startsWith("root") && !ghostGoneBeforeRootFile.get()) {
+                    ghostGoneBeforeRootFile.set(
+                        !fs.exists(root, "confluence") && !fs.exists(root, "databases")
+                    )
+                }
+                return inner.downloadFile(entityId)
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(13)
+        assertThat(ghostGoneBeforeRootFile.get()).isTrue()
+        assertThat(fs.exists(root, "confluence")).isFalse()
+        assertThat(fs.exists(root, "databases")).isFalse()
+        assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
+    }
+
+    /**
+     * Live 1.0.58 FAIL: films stuck at 1 while hundreds of root getFiles ran first.
+     * AC folder files must download before deferred mapping-root loose files.
+     */
+    @Test
+    fun forcePull_acFolderFilesBeforeDeferredRootFiles() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("films", "cloud-root", "Films")
+        inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
+        inner.seedFolder("atv", "cloud-root", "AgentTeamVerify")
+        inner.seedFile("t1", "atv", "a.txt", "a".toByteArray())
+        repeat(20) { i ->
+            inner.seedFile("root$i", "cloud-root", "shot-$i.png", "img$i".toByteArray())
+        }
+
+        val order = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun downloadFile(entityId: String): ByteArray? {
+                order.add(entityId)
+                return inner.downloadFile(entityId)
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(22)
+        val firstRoot = order.indexOfFirst { it.startsWith("root") }
+        assertThat(firstRoot).isGreaterThan(-1)
+        assertThat(order.indexOf("idx")).isLessThan(firstRoot)
+        assertThat(order.indexOf("t1")).isLessThan(firstRoot)
+        assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
+        assertThat(String(fs.readFile(root, "AgentTeamVerify/a.txt"))).isEqualTo("a")
+    }
+
+    /**
      * Live 1.0.57 FAIL: full collectForceStructureEdges before any getFile — MatchAny 5xx
      * kept Force pre-getFile for 23m+. Progressive structure must download root-wave files
      * before listing deeper parents.

@@ -1536,10 +1536,9 @@ class SyncEngine(
      * After pull, local paths absent from remote are pruned (Force download = mirror).
      */
     suspend fun forcePullMapping(mapping: SyncMapping): Int {
-        // Progressive BFS: structure-list → name → parallel materialize → early prune per wave.
-        // Live 1.0.57 still collected the FULL structure tree before any getFile; MatchAny 5xx
-        // retries kept Force pre-getFile for 23m+ until an uncaught UI 504 killed the process.
-        // Root / AC fill+ghost must start after the first wave, not after the whole inventory.
+        // Progressive BFS per wave: list → name → mkdir → early prune → deepen → file getFile.
+        // Root-level loose files defer while AC (prio 0/1) folders remain — live 1.0.58 still
+        // awaitAll'd hundreds of root getFiles before prune/Films deepen (~28m incomplete).
         val names = forceMetaNameSeed(mapping.id).toMutableMap()
         val remotePaths = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         val seenPaths = mutableSetOf<String>()
@@ -1553,6 +1552,10 @@ class SyncEngine(
         val structureCache = mutableMapOf<String, List<RemoteEntry>>()
         // Folder ids already materialized as a wave — breaks remote parent cycles.
         val visitedFolderIds = mutableSetOf<String>()
+        // Live 1.0.58: root-wave awaitAll downloaded hundreds of loose root files before
+        // prune/deepen — films stuck, root ghosts survived ~28m. Defer those until AC folders
+        // (prio 0/1) are drained so fill+ghost can land in daily-use.
+        val deferredRootFiles = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
 
         // Root listing is hard (empty inventory would prune everything).
         val rootKids = structureThrottle.withPermit {
@@ -1564,6 +1567,27 @@ class SyncEngine(
         structureCache[mapping.cloudFolderId] = rootKids
 
         while (frontier.isNotEmpty()) {
+            // After AC folders drain, pull deferred root files before deep prio-2 trees so
+            // Force-complete is not pushed behind the entire anova/Agents walk.
+            if (deferredRootFiles.isNotEmpty() &&
+                frontier.none { forcePathPriority(it.second) < 2 }
+            ) {
+                val orderedDeferred = deferredRootFiles.toList().sortedWith(
+                    compareBy<RemoteChangeClassifier.RemoteLocated> { forcePathPriority(it.relativePath) }
+                        .thenBy { it.relativePath.lowercase() }
+                )
+                deferredRootFiles.clear()
+                coroutineScope {
+                    orderedDeferred.map { loc ->
+                        async {
+                            downloadThrottle.withPermit {
+                                val n = materializeForceLocated(mapping, loc, remotePaths)
+                                if (n != 0) filesGate.withLock { files += n }
+                            }
+                        }
+                    }.awaitAll()
+                }
+            }
             // Root wave lists every immediate child (early prune all root ghosts). Deeper waves
             // take same-priority parents (AC-first) up to FORCE_PARENT_BATCH so Films getFile is
             // not blocked on lower-priority Deep GE, while MatchAny still batches peers.
@@ -1628,25 +1652,25 @@ class SyncEngine(
                 )
                 if (kid.isFolder && kid.id !in visitedFolderIds) next.add(kid.id to rel)
             }
-            // Folders first (mkdir), then AC-priority files — same-depth wave is sibling-safe.
-            val ordered = waveLocated.sortedWith(
-                compareBy<RemoteChangeClassifier.RemoteLocated> { if (it.entry.isFolder) 0 else 1 }
-                    .thenBy { forcePathPriority(it.relativePath) }
-                    .thenBy { it.relativePath.count { c -> c == '/' } }
-                    .thenBy { it.relativePath.lowercase() }
-            )
+
+            val folders = waveLocated
+                .filter { it.entry.isFolder }
+                .sortedWith(
+                    compareBy<RemoteChangeClassifier.RemoteLocated> { forcePathPriority(it.relativePath) }
+                        .thenBy { it.relativePath.count { c -> c == '/' } }
+                        .thenBy { it.relativePath.lowercase() }
+                )
+            // Mkdir without download semaphore — SAF createDirectory must not hold getFile slots.
             coroutineScope {
-                ordered.map { loc ->
+                folders.map { loc ->
                     async {
-                        downloadThrottle.withPermit {
-                            val n = materializeForceLocated(mapping, loc, remotePaths)
-                            if (n != 0) filesGate.withLock { files += n }
+                        structureThrottle.withPermit {
+                            materializeForceLocated(mapping, loc, remotePaths)
                         }
                     }
                 }.awaitAll()
             }
-            // Early ghost prune for every parent this wave fully enumerated (root ghosts die
-            // before deeper Agents downloads finish — daily-use AC).
+            // Early ghost prune as soon as remote children are named (before file getFile).
             val kidsByParentRel = waveLocated.groupBy {
                 PathUtil.parentOf(PathUtil.normalize(it.relativePath))
             }
@@ -1657,11 +1681,53 @@ class SyncEngine(
                     kids.map { PathUtil.normalize(it.relativePath) }.toSet()
                 )
             }
+            // Deepen AC folders before downloading this wave's files (esp. huge root loose set).
             frontier = (frontier + next).sortedWith(
                 compareBy<Pair<String, String>> { forcePathPriority(it.second) }
                     .thenBy { it.second.count { c -> c == '/' } }
                     .thenBy { it.second.lowercase() }
             )
+
+            val waveFiles = waveLocated
+                .filter { !it.entry.isFolder }
+                .sortedWith(
+                    compareBy<RemoteChangeClassifier.RemoteLocated> { forcePathPriority(it.relativePath) }
+                        .thenBy { it.relativePath.count { c -> c == '/' } }
+                        .thenBy { it.relativePath.lowercase() }
+                )
+            val acFrontierPending = frontier.any { forcePathPriority(it.second) < 2 }
+            val (downloadNow, defer) = waveFiles.partition { loc ->
+                val parentRel = PathUtil.parentOf(PathUtil.normalize(loc.relativePath))
+                // Defer mapping-root loose files while AC (prio 0/1) folders remain.
+                !(acFrontierPending && parentRel.isEmpty() && forcePathPriority(loc.relativePath) >= 2)
+            }
+            deferredRootFiles.addAll(defer)
+            coroutineScope {
+                downloadNow.map { loc ->
+                    async {
+                        downloadThrottle.withPermit {
+                            val n = materializeForceLocated(mapping, loc, remotePaths)
+                            if (n != 0) filesGate.withLock { files += n }
+                        }
+                    }
+                }.awaitAll()
+            }
+        }
+        if (deferredRootFiles.isNotEmpty()) {
+            val orderedDeferred = deferredRootFiles.sortedWith(
+                compareBy<RemoteChangeClassifier.RemoteLocated> { forcePathPriority(it.relativePath) }
+                    .thenBy { it.relativePath.lowercase() }
+            )
+            coroutineScope {
+                orderedDeferred.map { loc ->
+                    async {
+                        downloadThrottle.withPermit {
+                            val n = materializeForceLocated(mapping, loc, remotePaths)
+                            if (n != 0) filesGate.withLock { files += n }
+                        }
+                    }
+                }.awaitAll()
+            }
         }
         if (remotePaths.isEmpty()) {
             throw SyncException("Force download found no remote files in this folder.")
