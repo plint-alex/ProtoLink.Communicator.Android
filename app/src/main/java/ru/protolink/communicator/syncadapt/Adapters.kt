@@ -6,6 +6,7 @@ import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
 import ru.protolink.communicator.data.CloudCodes
 import ru.protolink.communicator.data.NotesTreeBuilder
+import ru.protolink.communicator.data.SafChildResolve
 import ru.protolink.communicator.data.SafTreeLister
 import ru.protolink.communicator.data.api.AddEntityRequest
 import ru.protolink.communicator.data.api.AddParentRequest
@@ -170,26 +171,25 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
         val n = relativePath.replace('\\', '/').trim('/')
         if (n.isEmpty()) return root(rootPath)
 
-        // Prefer DocumentsContract ids — DocumentFile.listFiles misses leaf files on some OEMs.
+        // Prefer DocumentsContract ids — DocumentFile.listFiles misses leaf files on some OEMs
+        // and SingleDocumentFile.listFiles throws UnsupportedOperationException (Force abort after heal).
         val docId = NotesTreeBuilder.folderDocumentId(tree, n)
         val byId = DocumentFile.fromSingleUri(context, SafTreeLister.documentUri(tree, docId))
         if (byId != null && byId.exists()) return byId
 
-        var cur: DocumentFile? = root(rootPath)
+        var curId = SafTreeLister.treeDocumentId(tree)
         for (part in n.split('/').filter { it.isNotEmpty() }) {
-            val listed = cur?.let { parent ->
-                val parentId = runCatching { DocumentsContract.getDocumentId(parent.uri) }.getOrNull()
-                if (parentId != null) {
-                    SafTreeLister.listChildren(context, tree, parentId)
-                        .firstOrNull { it.name.equals(part, true) }
-                        ?.let { DocumentFile.fromSingleUri(context, it.uri) }
-                } else null
-            }
-            cur = listed
-                ?: cur?.listFiles()?.firstOrNull { it.name?.equals(part, true) == true }
-            if (cur == null) return null
+            val listed = SafTreeLister.listChildren(context, tree, curId)
+                .map { it.name to it.documentId }
+            val nextId = SafChildResolve.nextChildDocumentId(listed, part, curId) { guessId ->
+                val uri = SafTreeLister.documentUri(tree, guessId)
+                val doc = DocumentFile.fromSingleUri(context, uri)
+                doc != null && doc.exists()
+            } ?: return null
+            curId = nextId
         }
-        return cur
+        return DocumentFile.fromSingleUri(context, SafTreeLister.documentUri(tree, curId))
+            ?.takeIf { it.exists() }
     }
 
     override fun snapshot(rootPath: String): List<FsEntry> {
@@ -390,14 +390,10 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
     private fun copyTree(from: DocumentFile, toRel: String, rootPath: String) {
         val tree = treeUri(rootPath)
         val fromId = runCatching { DocumentsContract.getDocumentId(from.uri) }.getOrNull()
-        val children = if (fromId != null) {
-            SafTreeLister.listChildren(context, tree, fromId).map { it.name to (it.isDirectory to it.uri) }
-        } else {
-            from.listFiles().mapNotNull { c ->
-                val name = c.name ?: return@mapNotNull null
-                name to (c.isDirectory to c.uri)
-            }
-        }
+            ?: return
+        // Never DocumentFile.listFiles — SingleDocumentFile throws UnsupportedOperationException.
+        val children = SafTreeLister.listChildren(context, tree, fromId)
+            .map { it.name to (it.isDirectory to it.uri) }
         for ((name, pair) in children) {
             val (isDir, uri) = pair
             val dest = PathUtil.join(toRel, name)
@@ -410,26 +406,23 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
             }
         }
         // Leaf index omitted from listing
-        if (fromId != null) {
-            val listedNames = children.map { it.first.lowercase() }.toSet()
-            if ("index.html" !in listedNames && "index.htm" !in listedNames) {
-                SafTreeLister.findIndexHtmlByGuess(context, tree, fromId)?.let { indexUri ->
-                    val bytes = context.contentResolver.openInputStream(indexUri)!!.use { it.readBytes() }
-                    writeFile(rootPath, PathUtil.join(toRel, "index.html"), bytes)
-                }
+        val listedNames = children.map { it.first.lowercase() }.toSet()
+        if ("index.html" !in listedNames && "index.htm" !in listedNames) {
+            SafTreeLister.findIndexHtmlByGuess(context, tree, fromId)?.let { indexUri ->
+                val bytes = context.contentResolver.openInputStream(indexUri)!!.use { it.readBytes() }
+                writeFile(rootPath, PathUtil.join(toRel, "index.html"), bytes)
             }
         }
     }
 
-    override fun exists(rootPath: String, relativePath: String): Boolean {
-        if (find(rootPath, relativePath) != null) return true
-        val tree = treeUri(rootPath)
-        val n = relativePath.replace('\\', '/').trim('/')
-        val uri = SafTreeLister.documentUri(tree, NotesTreeBuilder.folderDocumentId(tree, n))
-        return runCatching {
+    override fun exists(rootPath: String, relativePath: String): Boolean =
+        runCatching {
+            if (find(rootPath, relativePath) != null) return@runCatching true
+            val tree = treeUri(rootPath)
+            val n = relativePath.replace('\\', '/').trim('/')
+            val uri = SafTreeLister.documentUri(tree, NotesTreeBuilder.folderDocumentId(tree, n))
             context.contentResolver.openInputStream(uri)?.use { true } ?: false
         }.getOrDefault(false)
-    }
 
     private fun mimeForName(name: String): String = when {
         name.endsWith(".html", true) || name.endsWith(".htm", true) -> "text/html"

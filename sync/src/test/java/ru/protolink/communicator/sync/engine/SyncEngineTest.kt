@@ -496,6 +496,33 @@ class SyncEngineTest {
         assertThat(String(fs.readFile(root, "ok.txt"))).isEqualTo("ok")
     }
 
+    /**
+     * FAIL class P1-20261117: SAF SingleDocumentFile.listFiles → exists threw and aborted Force.
+     * Folder exists/create must soft-fail so sibling files still fill.
+     */
+    @Test
+    fun forcePull_existsThrowsOnFolder_softFailsAndContinuesFiles() = runTest {
+        val (store, innerFs, remote) = harness()
+        remote.seedFolder("films-f", "cloud-root", "films")
+        remote.seedFile("films-i", "films-f", "index.html", "movie".toByteArray())
+        remote.seedFile("ok-f", "cloud-root", "ok.txt", "ok".toByteArray())
+
+        val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
+            override fun exists(rootPath: String, relativePath: String): Boolean {
+                if (PathUtil.normalize(relativePath) == "films") {
+                    throw UnsupportedOperationException("SingleDocumentFile.listFiles")
+                }
+                return innerFs.exists(rootPath, relativePath)
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(2)
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
+        assertThat(String(fs.readFile(root, "ok.txt"))).isEqualTo("ok")
+    }
+
     @Test
     fun localEdited_remoteUnchanged_writes() = runTest {
         val (store, fs, remote) = harness()

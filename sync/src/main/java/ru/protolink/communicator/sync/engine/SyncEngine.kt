@@ -905,21 +905,31 @@ class SyncEngine(
             val path = PathUtil.normalize(loc.relativePath)
             remotePaths.add(path)
             if (loc.entry.isFolder) {
-                if (!fs.exists(mapping.localRootPath, path)) {
-                    fs.createDirectory(mapping.localRootPath, path)
-                }
-                store.upsert(
-                    SyncItemMeta(
-                        mappingId = mapping.id,
-                        remoteId = loc.entry.id,
-                        parentRemoteId = loc.entry.parentId,
-                        relativePath = path,
-                        isFolder = true,
-                        sizeBytes = 0,
-                        contentHash = "",
-                        remoteUpdateTime = loc.entry.updateTime ?: Instant.now()
+                try {
+                    if (!fs.exists(mapping.localRootPath, path)) {
+                        fs.createDirectory(mapping.localRootPath, path)
+                    }
+                    store.upsert(
+                        SyncItemMeta(
+                            mappingId = mapping.id,
+                            remoteId = loc.entry.id,
+                            parentRemoteId = loc.entry.parentId,
+                            relativePath = path,
+                            isFolder = true,
+                            sizeBytes = 0,
+                            contentHash = "",
+                            remoteUpdateTime = loc.entry.updateTime ?: Instant.now()
+                        )
                     )
-                )
+                } catch (e: Exception) {
+                    // SAF SingleDocumentFile.listFiles used to abort whole Force here — soft-fail folder.
+                    SyncRemoteDownload.logMaterializeFailed(
+                        "ForcePullMapping",
+                        path,
+                        loc.entry.id,
+                        e.message ?: e.javaClass.simpleName
+                    )
+                }
                 continue
             }
             // null = failed/not-found → soft-fail this item; isEmpty() is legitimate empty content.
