@@ -3,12 +3,14 @@ package ru.protolink.communicator.sync.engine
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import ru.protolink.communicator.sync.model.LocalChange
 import ru.protolink.communicator.sync.model.RemoteChange
+import ru.protolink.communicator.sync.model.RemoteEntry
 import ru.protolink.communicator.sync.model.SyncItemMeta
 import ru.protolink.communicator.sync.model.SyncMapping
 import ru.protolink.communicator.sync.ports.LocalFileSystem
@@ -33,6 +35,9 @@ class SyncEngine(
 
         /** Ids IncludeValues batch size for Force name resolve (API take page). */
         const val FORCE_NAME_BATCH = 200
+
+        /** Force inventory GetEntities attempts (transient HTTP 5xx). */
+        const val FORCE_INVENTORY_MAX_ATTEMPTS = SyncInventoryFetch.MAX_ATTEMPTS
     }
     data class Result(
         val localChanges: Int,
@@ -853,7 +858,15 @@ class SyncEngine(
         val visitedIds = mutableSetOf<String>()
         val gate = Mutex()
         val throttle = Semaphore(WALK_REMOTE_CONCURRENCY)
-        walkRemoteStructureParallel(rootFolderId, edges, visitedIds, gate, throttle)
+        // Root listing hard-fails after retries (empty inventory would prune everything).
+        walkRemoteStructureParallel(
+            folderId = rootFolderId,
+            out = edges,
+            visitedIds = visitedIds,
+            gate = gate,
+            throttle = throttle,
+            softFailOnExhausted = false
+        )
 
         val ids = edges.map { it.id }.distinct()
         val names = resolveDisplayNamesByIds(ids, throttle)
@@ -890,10 +903,11 @@ class SyncEngine(
         out: MutableList<StructureEdge>,
         visitedIds: MutableSet<String>,
         gate: Mutex,
-        throttle: Semaphore
+        throttle: Semaphore,
+        softFailOnExhausted: Boolean
     ) {
         val children = throttle.withPermit {
-            remote.listChildrenPaged(folderId, includeValues = false)
+            listChildrenForceInventory(folderId, softFailOnExhausted)
         }
         val subfolders = mutableListOf<String>()
         gate.withLock {
@@ -907,10 +921,52 @@ class SyncEngine(
         coroutineScope {
             subfolders.map { id ->
                 async {
-                    walkRemoteStructureParallel(id, out, visitedIds, gate, throttle)
+                    // Nested parents: soft-fail after retries so one HTTP 500 does not cancel siblings.
+                    walkRemoteStructureParallel(
+                        folderId = id,
+                        out = out,
+                        visitedIds = visitedIds,
+                        gate = gate,
+                        throttle = throttle,
+                        softFailOnExhausted = true
+                    )
                 }
             }.awaitAll()
         }
+    }
+
+    /**
+     * Structure-only GetEntities with backoff/retry on transient HTTP 5xx.
+     * Soft-fail returns empty children (skip subtree); hard client errors and non-5xx rethrow.
+     */
+    private suspend fun listChildrenForceInventory(
+        folderId: String,
+        softFailOnExhausted: Boolean
+    ): List<RemoteEntry> {
+        var last: Throwable? = null
+        for (attempt in 0 until SyncInventoryFetch.MAX_ATTEMPTS) {
+            val wait = SyncInventoryFetch.backoffMs(attempt)
+            if (wait > 0L) delay(wait)
+            try {
+                return remote.listChildrenPaged(folderId, includeValues = false)
+            } catch (t: Throwable) {
+                if (SyncInventoryFetch.isHardClientError(t)) throw t
+                if (!SyncInventoryFetch.isTransientServerError(t)) throw t
+                last = t
+                SyncInventoryFetch.logRetry(
+                    "ForceStructure",
+                    folderId,
+                    attempt + 1,
+                    t.message ?: t.javaClass.simpleName
+                )
+            }
+        }
+        val detail = last?.message ?: last?.javaClass?.simpleName ?: "exhausted"
+        if (softFailOnExhausted) {
+            SyncInventoryFetch.logSoftFail("ForceStructure", folderId, detail)
+            return emptyList()
+        }
+        throw last ?: SyncException("Force inventory GetEntities failed for root folder.")
     }
 
     private suspend fun resolveDisplayNamesByIds(
@@ -924,7 +980,7 @@ class SyncEngine(
             ids.chunked(FORCE_NAME_BATCH).map { chunk ->
                 async {
                     val rows = throttle.withPermit {
-                        remote.getEntitiesByIds(chunk, includeValues = true)
+                        getEntitiesByIdsForceInventory(chunk)
                     }
                     gate.withLock {
                         for (row in rows) {
@@ -935,6 +991,36 @@ class SyncEngine(
             }.awaitAll()
         }
         return names
+    }
+
+    /** Ids IncludeValues batch with same 5xx retry / soft-fail (names missing → edges skipped). */
+    private suspend fun getEntitiesByIdsForceInventory(ids: List<String>): List<RemoteEntry> {
+        if (ids.isEmpty()) return emptyList()
+        val key = ids.firstOrNull().orEmpty() + if (ids.size > 1) "+${ids.size - 1}" else ""
+        var last: Throwable? = null
+        for (attempt in 0 until SyncInventoryFetch.MAX_ATTEMPTS) {
+            val wait = SyncInventoryFetch.backoffMs(attempt)
+            if (wait > 0L) delay(wait)
+            try {
+                return remote.getEntitiesByIds(ids, includeValues = true)
+            } catch (t: Throwable) {
+                if (SyncInventoryFetch.isHardClientError(t)) throw t
+                if (!SyncInventoryFetch.isTransientServerError(t)) throw t
+                last = t
+                SyncInventoryFetch.logRetry(
+                    "ForceIdsNames",
+                    key,
+                    attempt + 1,
+                    t.message ?: t.javaClass.simpleName
+                )
+            }
+        }
+        SyncInventoryFetch.logSoftFail(
+            "ForceIdsNames",
+            key,
+            last?.message ?: last?.javaClass?.simpleName ?: "exhausted"
+        )
+        return emptyList()
     }
 
     private fun resolveParentId(mapping: SyncMapping, parentPath: String): String? {

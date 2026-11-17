@@ -590,6 +590,107 @@ class SyncEngineTest {
         assertThat(SyncEngine.WALK_REMOTE_CONCURRENCY).isEqualTo(24)
     }
 
+    @Test
+    fun inventoryFetch_detectsHttp500AsTransient_not401() {
+        assertThat(
+            SyncInventoryFetch.isTransientServerError(
+                RuntimeException("HTTP 500 Internal Server Error")
+            )
+        ).isTrue()
+        assertThat(
+            SyncInventoryFetch.isTransientServerError(
+                RuntimeException("retrofit2.HttpException: HTTP 503 Service Unavailable")
+            )
+        ).isTrue()
+        assertThat(
+            SyncInventoryFetch.isHardClientError(RuntimeException("HTTP 401 Unauthorized"))
+        ).isTrue()
+        assertThat(
+            SyncInventoryFetch.isTransientServerError(RuntimeException("HTTP 401 Unauthorized"))
+        ).isFalse()
+    }
+
+    /**
+     * FAIL class P1-20261117 structure-first HTTP 500: one mid-walk GetEntities 500 must
+     * retry then succeed (or soft-fail that branch) — whole Force must still fill siblings.
+     */
+    @Test
+    fun forcePull_listChildrenHttp500Once_retriesAndFills() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("films", "cloud-root", "films")
+        inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
+
+        val filmsFailsLeft = java.util.concurrent.atomic.AtomicInteger(1)
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun listChildrenPaged(
+                parentId: String,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                if (parentId == "films" && filmsFailsLeft.getAndDecrement() > 0) {
+                    throw RuntimeException("HTTP 500 Internal Server Error")
+                }
+                return inner.listChildrenPaged(parentId, includeValues)
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(1)
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
+    }
+
+    @Test
+    fun forcePull_listChildrenHttp500ExhaustedOnBranch_softFailsContinuesSibling() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("bad", "cloud-root", "bad")
+        inner.seedFolder("films", "cloud-root", "films")
+        inner.seedFile("leaf-bad", "bad", "gone.txt", "x".toByteArray())
+        inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
+
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun listChildrenPaged(
+                parentId: String,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                if (parentId == "bad") {
+                    throw RuntimeException("HTTP 500 Internal Server Error")
+                }
+                return inner.listChildrenPaged(parentId, includeValues)
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(1)
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
+        assertThat(fs.exists(root, "bad/gone.txt")).isFalse()
+    }
+
+    @Test
+    fun forcePull_listChildrenHttp401_stillAborts() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFile("ok", "cloud-root", "ok.txt", "ok".toByteArray())
+
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun listChildrenPaged(
+                parentId: String,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                if (parentId == "cloud-root") {
+                    throw RuntimeException("HTTP 401 Unauthorized")
+                }
+                return inner.listChildrenPaged(parentId, includeValues)
+            }
+        }
+
+        try {
+            SyncEngine(store, fs, remote).forcePullMapping(mapping)
+            throw AssertionError("expected HTTP 401 to abort Force")
+        } catch (t: Throwable) {
+            assertThat(t.message.orEmpty()).contains("401")
+        }
+    }
+
     /**
      * Warm WalkRemote (Win values-light): reconcile with every child id already in meta must
      * reuse structure-only listings (includeValues=false) — no Values re-list. Force stays cold.
