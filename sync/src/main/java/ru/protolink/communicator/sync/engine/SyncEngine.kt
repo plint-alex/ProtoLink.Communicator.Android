@@ -4,6 +4,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
@@ -17,6 +18,7 @@ import ru.protolink.communicator.sync.ports.LocalFileSystem
 import ru.protolink.communicator.sync.ports.MetadataStore
 import ru.protolink.communicator.sync.ports.RemoteCloud
 import java.time.Instant
+import kotlin.coroutines.coroutineContext
 
 class SyncEngine(
     private val store: MetadataStore,
@@ -92,6 +94,7 @@ class SyncEngine(
         val dirtyByMapping = mutableMapOf<String, MutableSet<String>>()
 
         for (mapping in mappings) {
+            coroutineContext.ensureActive()
             val meta = store.getAll(mapping.id)
             // Empty store OR folders-only (partial bootstrap died after mkdir) → pull remote files.
             if (meta.isEmpty() || meta.none { !it.isFolder }) {
@@ -102,6 +105,7 @@ class SyncEngine(
         // Build remote trees once
         val remoteLocated = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
         for (mapping in mappings) {
+            coroutineContext.ensureActive()
             walkRemote(mapping.cloudFolderId, mapping.id, "", remoteLocated)
         }
 
@@ -110,6 +114,7 @@ class SyncEngine(
         // Always hash-compare every mapped file so all devices converge to the same bytes.
         val enrichedRemote = remoteLocated
         for (mapping in mappings) {
+            coroutineContext.ensureActive()
             val dirty = mutableSetOf<String>()
             val (writes, reads) = applyComparePhase(mapping, enrichedRemote, dirty)
             localCount += writes
@@ -119,6 +124,7 @@ class SyncEngine(
         // Cloud materialize before local upload so polluted Notes trees (local junk) cannot
         // starve / timeout the pass before missing remote children are filled (cloud-wins).
         for (mapping in mappings) {
+            coroutineContext.ensureActive()
             remoteCount += applyRemotePhase(
                 mapping,
                 byId,
@@ -128,6 +134,7 @@ class SyncEngine(
             )
         }
         for (mapping in mappings) {
+            coroutineContext.ensureActive()
             val dirty = dirtyByMapping[mapping.id] ?: mutableSetOf()
             val remoteForMapping = enrichedRemote.filter { it.mappingId == mapping.id }
             localCount += applyLocalPhase(mapping, dirty, skipSizeUpdates = true, remoteForMapping)

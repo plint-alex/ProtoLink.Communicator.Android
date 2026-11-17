@@ -12,6 +12,9 @@ import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import ru.protolink.communicator.data.MappingStore
 import ru.protolink.communicator.sync.engine.SyncEngine
 import ru.protolink.communicator.sync.model.SyncMapping
@@ -40,23 +43,38 @@ class SyncWorker @AssistedInject constructor(
             Log.i(TAG, "No mappings; skip")
             return Result.success()
         }
+        if (SyncFlight.forcePreferred.get()) {
+            SyncFlight.deferredFull.set(true)
+            Log.i(TAG, "Skip; Force preferred (deferred full)")
+            return Result.success()
+        }
         if (!SyncFlight.mutex.tryLock()) {
             SyncFlight.deferredFull.set(true)
             Log.i(TAG, "Skip; another sync is already running (deferred full)")
             return Result.success()
         }
+        val job = currentCoroutineContext()[Job]
+        if (job != null) SyncFlight.bindExclusiveJob(job)
         return try {
             do {
+                if (SyncFlight.forcePreferred.get()) {
+                    Log.i(TAG, "Stop reconcile; Force preferred")
+                    break
+                }
                 SyncFlight.deferredFull.set(false)
                 Log.i(TAG, "Reconcile ${mappings.size} mapping(s)")
                 val result = SyncEngine(metadataStore, localFs, remote).reconcileAll(mappings)
                 Log.i(TAG, "Done local=${result.localChanges} remote=${result.remoteChanges}")
-            } while (SyncFlight.deferredFull.getAndSet(false))
+            } while (SyncFlight.deferredFull.getAndSet(false) && !SyncFlight.forcePreferred.get())
             Result.success()
+        } catch (e: CancellationException) {
+            Log.i(TAG, "Reconcile cancelled (Force preempt)")
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Sync failed", e)
             Result.retry()
         } finally {
+            if (job != null) SyncFlight.clearExclusiveJob(job)
             SyncFlight.mutex.unlock()
         }
     }

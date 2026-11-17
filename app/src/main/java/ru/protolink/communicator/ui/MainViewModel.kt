@@ -93,8 +93,10 @@ import android.net.Uri
 import android.util.Log
 import android.webkit.MimeTypeMap
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
@@ -489,7 +491,12 @@ class MainViewModel @Inject constructor(
                 refreshNotesTree()
             }
             if (commandType.equals("data_changed", ignoreCase = true)) {
-                requestFullSync()
+                // Force owns the sync lane — coalesce; do not start reconcile during heal/Force wait.
+                if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) {
+                    SyncFlight.deferredFull.set(true)
+                } else {
+                    requestFullSync()
+                }
             }
             _state.update { it.copy(status = "Live update${commandType?.let { t -> " ($t)" } ?: ""}") }
         }
@@ -2783,7 +2790,17 @@ class MainViewModel @Inject constructor(
                 }
                 return@launch
             }
+            if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) {
+                SyncFlight.deferredFull.set(true)
+                _state.update { it.copy(status = "Full sync queued…") }
+                return@launch
+            }
             runCatching { healDuplicateSameNamedMappings() }
+            if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) {
+                SyncFlight.deferredFull.set(true)
+                _state.update { it.copy(status = "Full sync queued…") }
+                return@launch
+            }
             val mappings = mappingStore.load()
             if (mappings.isEmpty()) {
                 _state.update {
@@ -2799,11 +2816,14 @@ class MainViewModel @Inject constructor(
                 _state.update { it.copy(status = "Full sync queued…") }
                 return@launch
             }
+            val exclusive = currentCoroutineContext()[Job]
+            if (exclusive != null) SyncFlight.bindExclusiveJob(exclusive)
             _state.update { it.copy(status = "Syncing ${mappings.size} folder(s)…", syncing = true) }
             try {
                 var lastLocal = 0
                 var lastRemote = 0
                 do {
+                    if (SyncFlight.forcePreferred.get()) break
                     SyncFlight.deferredFull.set(false)
                     val currentMappings = mappingStore.load()
                     val result = withContext(Dispatchers.IO) {
@@ -2820,18 +2840,28 @@ class MainViewModel @Inject constructor(
                     lastLocal = result.localChanges
                     lastRemote = result.remoteChanges
                     currentFolderId?.let { loadCloudFolder(it) }
-                } while (SyncFlight.deferredFull.getAndSet(false))
-                _state.update {
-                    it.copy(
-                        status = "Sync complete (local $lastLocal, remote $lastRemote)",
-                        syncing = false,
-                        mappings = mappingStore.load()
-                    )
+                } while (
+                    SyncFlight.deferredFull.getAndSet(false) && !SyncFlight.forcePreferred.get()
+                )
+                if (SyncFlight.forcePreferred.get()) {
+                    _state.update { it.copy(syncing = false, status = "Sync yielded to Force") }
+                } else {
+                    _state.update {
+                        it.copy(
+                            status = "Sync complete (local $lastLocal, remote $lastRemote)",
+                            syncing = false,
+                            mappings = mappingStore.load()
+                        )
+                    }
                 }
+            } catch (e: CancellationException) {
+                _state.update { it.copy(syncing = false, status = "Sync cancelled") }
+                throw e
             } catch (e: Exception) {
                 Log.e("ProtoLinkSync", "sync failed", e)
                 handleSyncFailure(e)
             } finally {
+                if (exclusive != null) SyncFlight.clearExclusiveJob(exclusive)
                 if (SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
             }
         }
@@ -2886,11 +2916,8 @@ class MainViewModel @Inject constructor(
             }
             var locked = false
             try {
-                if (!SyncFlight.mutex.tryLock()) {
-                    val acquired = withTimeoutOrNull(120_000) { SyncFlight.mutex.lock() } != null
-                    if (!acquired) throw IllegalStateException("Timed out waiting for sync lock")
-                }
-                locked = true
+                locked = SyncFlight.acquireForForce(120_000)
+                if (!locked) throw IllegalStateException("Timed out waiting for sync lock")
                 withContext(Dispatchers.IO) {
                     val engineMapping = SyncMapping(
                         id = mapping.cloudFolderId.replace("-", ""),
@@ -2912,6 +2939,8 @@ class MainViewModel @Inject constructor(
                         else "Phone version uploaded to server"
                     )
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e("ProtoLinkSync", "conflict resolve failed", e)
                 _state.update {
@@ -2924,6 +2953,7 @@ class MainViewModel @Inject constructor(
                 return@launch
             } finally {
                 if (locked && SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
+                SyncFlight.clearForcePreferred()
             }
             // Continue sync — may hit another conflict file.
             requestFullSync()
@@ -2935,9 +2965,12 @@ class MainViewModel @Inject constructor(
     private fun requestLocalPush() {
         viewModelScope.launch {
             if (!auth.isAuthenticated) return@launch
+            if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) return@launch
             val mappings = mappingStore.load()
             if (mappings.isEmpty()) return@launch
             if (_state.value.syncing || !SyncFlight.mutex.tryLock()) return@launch
+            val exclusive = currentCoroutineContext()[Job]
+            if (exclusive != null) SyncFlight.bindExclusiveJob(exclusive)
             _state.update { it.copy(status = "Uploading local changes…", syncing = true) }
             try {
                 val applied = withContext(Dispatchers.IO) {
@@ -2956,7 +2989,9 @@ class MainViewModel @Inject constructor(
                     currentFolderId?.let { loadCloudFolder(it) }
                 }
                 // Drain deferred full sync requested while we held the lock.
-                while (SyncFlight.deferredFull.getAndSet(false)) {
+                while (
+                    SyncFlight.deferredFull.getAndSet(false) && !SyncFlight.forcePreferred.get()
+                ) {
                     val currentMappings = mappingStore.load()
                     withContext(Dispatchers.IO) {
                         val engineMappings = currentMappings.map {
@@ -2978,10 +3013,14 @@ class MainViewModel @Inject constructor(
                         mappings = mappingStore.load()
                     )
                 }
+            } catch (e: CancellationException) {
+                _state.update { it.copy(syncing = false) }
+                throw e
             } catch (e: Exception) {
                 Log.e("ProtoLinkSync", "local push failed", e)
                 handleSyncFailure(e)
             } finally {
+                if (exclusive != null) SyncFlight.clearExclusiveJob(exclusive)
                 if (SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
             }
         }
@@ -3030,6 +3069,8 @@ class MainViewModel @Inject constructor(
      */
     fun forceDownloadAllMappedNow() {
         viewModelScope.launch {
+            // Claim lane before heal so SignalR/startup reconcile cannot grab SyncFlight for 10m+.
+            SyncFlight.preemptExclusiveForForce()
             try {
                 android.util.Log.e("ProtoLinkSync", "forceDownloadAllMappedNow start")
                 withContext(Dispatchers.IO) { tokenRefresher.refreshBlocking() }
@@ -3044,11 +3085,13 @@ class MainViewModel @Inject constructor(
                     return@launch
                 }
                 for (id in ids) {
-                    // runForceMapping launches its own job; await by calling body inline sequentially
-                    runForceMappingAndAwait(id, push = false)
+                    // Outer owns forcePreferred for the whole batch (heal + all maps).
+                    runForceMappingAndAwait(id, push = false, managePreferred = false)
                 }
                 refreshNotesTree()
                 android.util.Log.e("ProtoLinkSync", "forceDownloadAllMappedNow finished status=${_state.value.status}")
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e("ProtoLinkSync", "forceDownloadAllMappedNow failed", e)
                 _state.update {
@@ -3058,6 +3101,9 @@ class MainViewModel @Inject constructor(
                         syncError = e.message ?: e.javaClass.simpleName
                     )
                 }
+            } finally {
+                SyncFlight.clearForcePreferred()
+                if (SyncFlight.deferredFull.get()) requestFullSync()
             }
         }
     }
@@ -3073,10 +3119,18 @@ class MainViewModel @Inject constructor(
     }
 
     private fun runForceMapping(cloudFolderId: String, push: Boolean) {
-        viewModelScope.launch { runForceMappingAndAwait(cloudFolderId, push) }
+        viewModelScope.launch { runForceMappingAndAwait(cloudFolderId, push, managePreferred = true) }
     }
 
-    private suspend fun runForceMappingAndAwait(cloudFolderId: String, push: Boolean) {
+    /**
+     * @param managePreferred when true (UI Force), claim/clear forcePreferred around this map.
+     *   Batch adb Force sets preferred outside and passes false so heal+maps stay exclusive.
+     */
+    private suspend fun runForceMappingAndAwait(
+        cloudFolderId: String,
+        push: Boolean,
+        managePreferred: Boolean
+    ) {
         val mapping = mappingStore.load().firstOrNull { it.cloudFolderId == cloudFolderId }
         if (mapping == null) {
             _state.update { it.copy(syncError = "Mapped folder not found") }
@@ -3090,6 +3144,7 @@ class MainViewModel @Inject constructor(
             _state.update { it.copy(syncError = "Force sync already running") }
             return
         }
+        if (managePreferred) SyncFlight.preemptExclusiveForForce()
         _state.update {
             it.copy(
                 forceRunning = true,
@@ -3097,16 +3152,20 @@ class MainViewModel @Inject constructor(
             )
         }
         var locked = false
+        val exclusive = currentCoroutineContext()[Job]
         try {
             if (!SyncFlight.mutex.tryLock()) {
                 _state.update { it.copy(status = "Waiting for sync lock…") }
-                // Force pull of a large Notes tree can wait behind startup sync.
-                val acquired = withTimeoutOrNull(600_000) { SyncFlight.mutex.lock() } != null
-                if (!acquired) {
+                // Preempt holder (startup/SignalR/SyncWorker) — do not sit 600s behind reconcile.
+                locked = SyncFlight.acquireForForce(120_000)
+                if (!locked) {
                     throw IllegalStateException("Timed out waiting for sync lock")
                 }
+            } else {
+                SyncFlight.forcePreferred.set(true)
+                locked = true
             }
-            locked = true
+            if (exclusive != null) SyncFlight.bindExclusiveJob(exclusive)
             android.util.Log.e("ProtoLinkSync", "force ${if (push) "upload" else "download"} locked, pulling…")
             val count = withContext(Dispatchers.IO) {
                 val engineMapping = SyncMapping(
@@ -3135,6 +3194,8 @@ class MainViewModel @Inject constructor(
                     syncSuccess = msg
                 )
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e("ProtoLinkSync", "force sync failed", e)
             runCatching {
@@ -3149,7 +3210,12 @@ class MainViewModel @Inject constructor(
                 )
             }
         } finally {
+            if (exclusive != null) SyncFlight.clearExclusiveJob(exclusive)
             if (locked && SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
+            if (managePreferred) {
+                SyncFlight.clearForcePreferred()
+                if (SyncFlight.deferredFull.get()) requestFullSync()
+            }
         }
     }
 
