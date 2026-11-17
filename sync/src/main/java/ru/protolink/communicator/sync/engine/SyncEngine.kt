@@ -141,8 +141,15 @@ class SyncEngine(
      * Mappings with empty metadata are fully reconciled first (never blind-create remote entities).
      */
     suspend fun pushLocalChanges(mappings: List<SyncMapping>): Int {
-        val needFull = mappings.filter { store.getAll(it.id).isEmpty() }
-        val ready = mappings.filter { store.getAll(it.id).isNotEmpty() }
+        // Empty OR folders-only (partial mkdir bootstrap) → full reconcile before push.
+        val needFull = mappings.filter {
+            val meta = store.getAll(it.id)
+            meta.isEmpty() || meta.none { m -> !m.isFolder }
+        }
+        val ready = mappings.filter {
+            val meta = store.getAll(it.id)
+            meta.isNotEmpty() && meta.any { m -> !m.isFolder }
+        }
         if (needFull.isNotEmpty()) {
             reconcileAll(needFull)
         }
@@ -276,19 +283,6 @@ class SyncEngine(
                             remoteUpdateTime = located.entry.updateTime ?: meta.remoteUpdateTime
                         )
                     )
-                }
-                SyncDirectionDecide.Action.Conflict -> {
-                    // DecideByHash no longer returns Conflict (cloud-wins Read); keep as Read.
-                    fs.writeFile(mapping.localRootPath, meta.relativePath, remoteBytes)
-                    store.upsert(
-                        meta.copy(
-                            sizeBytes = remoteBytes.size.toLong(),
-                            contentHash = remoteHash,
-                            remoteUpdateTime = located.entry.updateTime ?: Instant.now()
-                        )
-                    )
-                    dirty.add(path)
-                    reads++
                 }
             }
         }
@@ -515,9 +509,8 @@ class SyncEngine(
                             )
                         }
                         SyncDirectionDecide.Action.Read,
-                        SyncDirectionDecide.Action.Skip,
-                        SyncDirectionDecide.Action.Conflict -> {
-                            // Conflict(legacy) → same as Read: adopt cloud when hashes differ.
+                        SyncDirectionDecide.Action.Skip -> {
+                            // Read / Skip → adopt cloud when hashes differ (cloud-wins).
                             if (!localHash.equals(remoteHash, ignoreCase = true)) {
                                 fs.writeFile(mapping.localRootPath, a.entry.relativePath, cloud)
                             }

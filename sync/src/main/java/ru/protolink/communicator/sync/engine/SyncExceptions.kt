@@ -25,12 +25,3 @@ open class SyncException(
         }
     }
 }
-
-class SyncConflictException(
-    relativePath: String,
-    localHash: String,
-    remoteHash: String,
-    metaHash: String?,
-    reason: String,
-    val mappingId: String? = null
-) : SyncException(reason, relativePath, localHash, remoteHash, metaHash)

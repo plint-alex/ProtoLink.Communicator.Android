@@ -2838,28 +2838,7 @@ class MainViewModel @Inject constructor(
     }
 
     private fun handleSyncFailure(e: Exception) {
-        val conflict = e as? ru.protolink.communicator.sync.engine.SyncConflictException
-        if (conflict != null && !conflict.relativePath.isNullOrBlank()) {
-            val path = conflict.relativePath!!
-            val mappingId = conflict.mappingId
-            val dto = mappingStore.load().firstOrNull { m ->
-                mappingId != null && m.cloudFolderId.replace("-", "").equals(mappingId, ignoreCase = true)
-            } ?: mappingStore.load().singleOrNull()
-            if (dto != null) {
-                _state.update {
-                    it.copy(
-                        status = "Sync conflict: $path",
-                        syncing = false,
-                        pendingConflict = PendingConflict(
-                            cloudFolderId = dto.cloudFolderId,
-                            relativePath = path
-                        ),
-                        syncError = null
-                    )
-                }
-                return
-            }
-        }
+        // Decide/cloud-wins — SyncConflictException removed (D-LEGACY-CONFLICT). Failures surface as status.
         val detail = e.message ?: e.javaClass.simpleName
         _state.update {
             it.copy(

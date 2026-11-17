@@ -7,7 +7,7 @@ import java.time.Instant
  * and decide whether to upload (Write) or download (Read).
  */
 internal object SyncDirectionDecide {
-    enum class Action { Write, Read, Skip, Conflict }
+    enum class Action { Write, Read, Skip }
 
     fun decide(
         localSize: Long?,

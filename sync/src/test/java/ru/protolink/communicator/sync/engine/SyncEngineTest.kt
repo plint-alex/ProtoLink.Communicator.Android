@@ -1466,6 +1466,31 @@ class SyncEngineTest {
         assertThat(String(fs.readFile(root, "agentteamverify/probe-test.txt"))).isEqualTo("fixture")
     }
 
+    /** D-PUSH-FOLDERS: timer push must upgrade folders-only meta to full reconcile (not skip). */
+    @Test
+    fun pushLocal_foldersOnlyMeta_upgradesToFullReconcile() = runTest {
+        val (store, fs, remote) = harness()
+        remote.seedFolder("films-f", "cloud-root", "films")
+        remote.seedFile("films-i", "films-f", "index.html", "push-heal".toByteArray())
+
+        fs.createDirectory(root, "films")
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "films-f",
+                parentRemoteId = "cloud-root",
+                relativePath = "films",
+                isFolder = true,
+                sizeBytes = 0
+            )
+        )
+
+        SyncEngine(store, fs, remote).pushLocalChanges(listOf(mapping))
+
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("push-heal")
+        assertThat(store.getAll("m1").any { !it.isFolder && it.remoteId == "films-i" }).isTrue()
+    }
+
     /** Bootstrap must not call full-tree snapshot once per remote item (O(n²) on polluted roots). */
     @Test
     fun bootstrap_doesNotSnapshotWholeTreePerRemoteItem() = runTest {
