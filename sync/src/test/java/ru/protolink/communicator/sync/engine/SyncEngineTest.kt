@@ -448,15 +448,13 @@ class SyncEngineTest {
     @Test
     fun forcePull_overwritesLocal() = runTest {
         val (store, fs, remote) = harness()
-        fs.writeFile(root, "c.txt", "aa".toByteArray())
-        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
-        val id = store.getAll("m1").first().remoteId
-        fs.writeFile(root, "c.txt", "LOCAL".toByteArray())
-        remote.uploadFile(id, "c.txt", "FORCE-REMOTE".toByteArray(), "text/plain")
+        remote.seedFolder("films-f", "cloud-root", "films")
+        remote.seedFile("films-i", "films-f", "index.html", "aa".toByteArray())
+        fs.writeFile(root, "films/index.html", "LOCAL".toByteArray())
         SyncEngine(store, fs, remote).forcePullMapping(mapping)
-        assertThat(String(fs.readFile(root, "c.txt"))).isEqualTo("FORCE-REMOTE")
-        assertThat(store.getAll("m1").first { it.relativePath == "c.txt" }.contentHash)
-            .isEqualTo(ContentHashUtil.sha256Hex("FORCE-REMOTE".toByteArray()))
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("aa")
+        assertThat(store.getAll("m1").first { it.relativePath == "films/index.html" }.contentHash)
+            .isEqualTo(ContentHashUtil.sha256Hex("aa".toByteArray()))
     }
 
     /**
@@ -516,14 +514,15 @@ class SyncEngineTest {
     @Test
     fun forcePull_emptyRemoteBytes_writesAndContinues() = runTest {
         val (store, fs, remote) = harness()
-        remote.seedFile("empty-f", "cloud-root", "empty.txt", ByteArray(0))
-        remote.seedFile("ok-f", "cloud-root", "ok.txt", "ok".toByteArray())
+        remote.seedFolder("films-f", "cloud-root", "films")
+        remote.seedFile("empty-f", "films-f", "empty.txt", ByteArray(0))
+        remote.seedFile("ok-f", "films-f", "ok.txt", "ok".toByteArray())
 
         val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
 
         assertThat(count).isEqualTo(2)
-        assertThat(fs.readFile(root, "empty.txt")).isEmpty()
-        assertThat(String(fs.readFile(root, "ok.txt"))).isEqualTo("ok")
+        assertThat(fs.readFile(root, "films/empty.txt")).isEmpty()
+        assertThat(String(fs.readFile(root, "films/ok.txt"))).isEqualTo("ok")
     }
 
     /**
@@ -535,7 +534,7 @@ class SyncEngineTest {
         val (store, innerFs, remote) = harness()
         remote.seedFolder("films-f", "cloud-root", "films")
         remote.seedFile("films-i", "films-f", "index.html", "movie".toByteArray())
-        remote.seedFile("ok-f", "cloud-root", "ok.txt", "ok".toByteArray())
+        remote.seedFile("ok-f", "films-f", "ok.txt", "ok".toByteArray())
 
         val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
             override fun exists(rootPath: String, relativePath: String): Boolean {
@@ -550,7 +549,7 @@ class SyncEngineTest {
 
         assertThat(count).isEqualTo(2)
         assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
-        assertThat(String(fs.readFile(root, "ok.txt"))).isEqualTo("ok")
+        assertThat(String(fs.readFile(root, "films/ok.txt"))).isEqualTo("ok")
     }
 
     /**
@@ -582,7 +581,8 @@ class SyncEngineTest {
         val (store, fs, inner) = harness()
         inner.seedFolder("a", "cloud-root", "a")
         inner.seedFolder("b", "a", "b")
-        inner.seedFile("leaf", "b", "ok.txt", "ok".toByteArray())
+        // Non-AC blobs are structure-registered only; Notes leaf pages still getFile.
+        inner.seedFile("leaf", "b", "index.html", "ok".toByteArray())
 
         val listCalls = java.util.concurrent.atomic.AtomicInteger(0)
         val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
@@ -610,7 +610,7 @@ class SyncEngineTest {
         val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
 
         assertThat(count).isEqualTo(1)
-        assertThat(String(fs.readFile(root, "a/b/ok.txt"))).isEqualTo("ok")
+        assertThat(String(fs.readFile(root, "a/b/index.html"))).isEqualTo("ok")
         // root + a + b only (cycle edge skipped by visitedIds) — not exploding.
         assertThat(listCalls.get()).isAtMost(4)
     }
@@ -802,7 +802,7 @@ class SyncEngineTest {
         val folderCount = 60
         for (i in 0 until folderCount) {
             inner.seedFolder("f$i", "cloud-root", "Folder$i")
-            inner.seedFile("file$i", "f$i", "n.txt", "x$i".toByteArray())
+            inner.seedFile("file$i", "f$i", "index.html", "x$i".toByteArray())
         }
 
         val parentBatchCalls = java.util.concurrent.atomic.AtomicInteger(0)
@@ -833,8 +833,8 @@ class SyncEngineTest {
         // Root alone (1 single) + ≥1 batched multi-parent listing; never 1+60 singles for structure.
         assertThat(parentBatchCalls.get()).isAtLeast(1)
         assertThat(singleParentCalls.get()).isLessThan(folderCount)
-        assertThat(fs.exists(root, "Folder0/n.txt")).isTrue()
-        assertThat(fs.exists(root, "Folder59/n.txt")).isTrue()
+        assertThat(fs.exists(root, "Folder0/index.html")).isTrue()
+        assertThat(fs.exists(root, "Folder59/index.html")).isTrue()
     }
 
     /**
@@ -907,7 +907,7 @@ class SyncEngineTest {
         val folderCount = SyncEngine.FORCE_NAME_BATCH + 10
         for (i in 0 until folderCount) {
             inner.seedFolder("f$i", "cloud-root", "Folder$i")
-            inner.seedFile("n$i", "f$i", "n.txt", "x".toByteArray())
+            inner.seedFile("n$i", "f$i", "index.html", "x".toByteArray())
         }
         val maxIdsChunk = java.util.concurrent.atomic.AtomicInteger(0)
         val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
@@ -927,8 +927,8 @@ class SyncEngineTest {
         assertThat(count).isEqualTo(folderCount)
         assertThat(maxIdsChunk.get()).isAtMost(SyncEngine.FORCE_NAME_BATCH)
         assertThat(maxIdsChunk.get()).isGreaterThan(0)
-        assertThat(fs.exists(root, "Folder0/n.txt")).isTrue()
-        assertThat(fs.exists(root, "Folder${folderCount - 1}/n.txt")).isTrue()
+        assertThat(fs.exists(root, "Folder0/index.html")).isTrue()
+        assertThat(fs.exists(root, "Folder${folderCount - 1}/index.html")).isTrue()
     }
 
     /**
@@ -941,7 +941,7 @@ class SyncEngineTest {
         inner.seedFolder("films", "cloud-root", "Films")
         inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
         inner.seedFolder("agents", "cloud-root", "Agents")
-        inner.seedFile("note", "agents", "note.html", "n".toByteArray())
+        inner.seedFile("note", "agents", "index.html", "n".toByteArray())
 
         val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
             override suspend fun getEntitiesByIds(
@@ -959,7 +959,7 @@ class SyncEngineTest {
 
         assertThat(count).isEqualTo(2)
         assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
-        assertThat(String(fs.readFile(root, "Agents/note.html"))).isEqualTo("n")
+        assertThat(String(fs.readFile(root, "Agents/index.html"))).isEqualTo("n")
     }
 
     /**
@@ -973,7 +973,7 @@ class SyncEngineTest {
         inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
         inner.seedFolder("d1", "cloud-root", "Deep")
         inner.seedFolder("d2", "d1", "Nested")
-        inner.seedFile("deep", "d2", "file.txt", "x".toByteArray())
+        inner.seedFile("deep", "d2", "index.html", "x".toByteArray())
 
         val deepNameResolved = java.util.concurrent.atomic.AtomicBoolean(false)
         val filmsDownloadedBeforeDeepName = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -1002,7 +1002,7 @@ class SyncEngineTest {
         assertThat(count).isEqualTo(2)
         assertThat(filmsDownloadedBeforeDeepName.get()).isTrue()
         assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
-        assertThat(String(fs.readFile(root, "Deep/Nested/file.txt"))).isEqualTo("x")
+        assertThat(String(fs.readFile(root, "Deep/Nested/index.html"))).isEqualTo("x")
     }
 
     /**
@@ -1015,7 +1015,7 @@ class SyncEngineTest {
         inner.seedFolder("films", "cloud-root", "Films")
         inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
         inner.seedFolder("deep", "cloud-root", "Deep")
-        inner.seedFile("deepf", "deep", "file.txt", "x".toByteArray())
+        inner.seedFile("deepf", "deep", "index.html", "x".toByteArray())
         fs.createDirectory(root, "confluence")
         fs.writeFile(root, "confluence/page.html", "ghost".toByteArray())
         fs.createDirectory(root, "databases")
@@ -1060,11 +1060,11 @@ class SyncEngineTest {
         fs.writeFile(root, "confluence/page.html", "ghost".toByteArray())
         fs.createDirectory(root, "databases")
 
-        val ghostGoneBeforeRootFile = java.util.concurrent.atomic.AtomicBoolean(false)
+        val ghostGoneBeforeAcGetFile = java.util.concurrent.atomic.AtomicBoolean(false)
         val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
             override suspend fun downloadFile(entityId: String): ByteArray? {
-                if (entityId.startsWith("root") && !ghostGoneBeforeRootFile.get()) {
-                    ghostGoneBeforeRootFile.set(
+                if (entityId == "idx" && !ghostGoneBeforeAcGetFile.get()) {
+                    ghostGoneBeforeAcGetFile.set(
                         !fs.exists(root, "confluence") && !fs.exists(root, "databases")
                     )
                 }
@@ -1074,16 +1074,18 @@ class SyncEngineTest {
 
         val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
 
-        assertThat(count).isEqualTo(13)
-        assertThat(ghostGoneBeforeRootFile.get()).isTrue()
+        // Root screenshots are register-only (not getFile); AC films still downloads.
+        assertThat(count).isEqualTo(1)
+        assertThat(ghostGoneBeforeAcGetFile.get()).isTrue()
         assertThat(fs.exists(root, "confluence")).isFalse()
         assertThat(fs.exists(root, "databases")).isFalse()
+        assertThat(fs.exists(root, "shot-0.png")).isFalse()
         assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
     }
 
     /**
-     * Live 1.0.58 FAIL: films stuck at 1 while hundreds of root getFiles ran first.
-     * AC folder files must download before deferred mapping-root loose files.
+     * Live 1.0.62 FAIL: unbounded root/deep blob getFile blocked Force-complete.
+     * AC folder files download; mapping-root screenshots are register-only (no getFile).
      */
     @Test
     fun forcePull_acFolderFilesBeforeDeferredRootFiles() = runTest {
@@ -1106,11 +1108,10 @@ class SyncEngineTest {
 
         val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
 
-        assertThat(count).isEqualTo(22)
-        val firstRoot = order.indexOfFirst { it.startsWith("root") }
-        assertThat(firstRoot).isGreaterThan(-1)
-        assertThat(order.indexOf("idx")).isLessThan(firstRoot)
-        assertThat(order.indexOf("t1")).isLessThan(firstRoot)
+        assertThat(count).isEqualTo(2)
+        assertThat(order).containsAtLeast("idx", "t1")
+        assertThat(order.none { it.startsWith("root") }).isTrue()
+        assertThat(fs.exists(root, "shot-0.png")).isFalse()
         assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
         assertThat(String(fs.readFile(root, "AgentTeamVerify/a.txt"))).isEqualTo("a")
     }
@@ -1127,7 +1128,7 @@ class SyncEngineTest {
         inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
         inner.seedFolder("d1", "cloud-root", "Deep")
         inner.seedFolder("d2", "d1", "Nested")
-        inner.seedFile("deep", "d2", "file.txt", "x".toByteArray())
+        inner.seedFile("deep", "d2", "index.html", "x".toByteArray())
 
         val deepListed = java.util.concurrent.atomic.AtomicBoolean(false)
         val filmsDownloadedBeforeDeepList = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -1161,7 +1162,7 @@ class SyncEngineTest {
         assertThat(count).isEqualTo(2)
         assertThat(filmsDownloadedBeforeDeepList.get()).isTrue()
         assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
-        assertThat(String(fs.readFile(root, "Deep/Nested/file.txt"))).isEqualTo("x")
+        assertThat(String(fs.readFile(root, "Deep/Nested/index.html"))).isEqualTo("x")
     }
 
     /**
@@ -1172,9 +1173,9 @@ class SyncEngineTest {
     fun forcePull_matchAnyHttp504_fallsBackAndFills() = runTest {
         val (store, fs, inner) = harness()
         inner.seedFolder("wa", "cloud-root", "WideA")
-        inner.seedFile("a1", "wa", "a.txt", "a".toByteArray())
+        inner.seedFile("a1", "wa", "index.html", "a".toByteArray())
         inner.seedFolder("wb", "cloud-root", "WideB")
-        inner.seedFile("b1", "wb", "b.txt", "b".toByteArray())
+        inner.seedFile("b1", "wb", "index.html", "b".toByteArray())
 
         val batchAttempts = java.util.concurrent.atomic.AtomicInteger(0)
         val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
@@ -1195,8 +1196,8 @@ class SyncEngineTest {
         assertThat(count).isEqualTo(2)
         assertThat(batchAttempts.get()).isAtMost(SyncInventoryFetch.BATCH_MAX_ATTEMPTS)
         assertThat(batchAttempts.get()).isGreaterThan(0)
-        assertThat(String(fs.readFile(root, "WideA/a.txt"))).isEqualTo("a")
-        assertThat(String(fs.readFile(root, "WideB/b.txt"))).isEqualTo("b")
+        assertThat(String(fs.readFile(root, "WideA/index.html"))).isEqualTo("a")
+        assertThat(String(fs.readFile(root, "WideB/index.html"))).isEqualTo("b")
     }
 
     /** AC folders (films/agentteamverify) materialize before lower-priority sibling trees. */
@@ -1204,7 +1205,7 @@ class SyncEngineTest {
     fun forcePull_priorityMaterializesFilmsBeforeWideSibling() = runTest {
         val (store, fs, inner) = harness()
         inner.seedFolder("wide", "cloud-root", "WideTree")
-        inner.seedFile("w1", "wide", "a.txt", "w".toByteArray())
+        inner.seedFile("w1", "wide", "index.html", "w".toByteArray())
         inner.seedFolder("films", "cloud-root", "Films")
         inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
 
@@ -1221,6 +1222,38 @@ class SyncEngineTest {
         assertThat(count).isEqualTo(2)
         assertThat(order.indexOf("idx")).isLessThan(order.indexOf("w1"))
         assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
+    }
+
+    /** Live 1.0.62: non-AC blobs must not getFile — structure register only so Force can complete. */
+    @Test
+    fun forcePull_skipsNonAcBlobGetFile_stillCompletesAndPrunes() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("films", "cloud-root", "Films")
+        inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
+        inner.seedFolder("agents", "cloud-root", "protolink.ru")
+        inner.seedFolder("docs", "agents", "agents")
+        inner.seedFile("blob", "docs", "dump.bin", "BIG".toByteArray())
+        inner.seedFile("note", "docs", "index.html", "note".toByteArray())
+        fs.createDirectory(root, "confluence")
+
+        val downloaded = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun downloadFile(entityId: String): ByteArray? {
+                downloaded.add(entityId)
+                return inner.downloadFile(entityId)
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(2)
+        assertThat(downloaded).containsAtLeast("idx", "note")
+        assertThat(downloaded).doesNotContain("blob")
+        assertThat(fs.exists(root, "protolink.ru/agents/dump.bin")).isFalse()
+        assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
+        assertThat(String(fs.readFile(root, "protolink.ru/agents/index.html"))).isEqualTo("note")
+        assertThat(fs.exists(root, "confluence")).isFalse()
+        assertThat(fs.exists(root, "protolink.ru/agents")).isTrue()
     }
 
     /**

@@ -69,16 +69,28 @@ class SyncEngine(
 
         /**
          * Lower = materialize / deepen earlier (AC fill folders before wide sibling trees).
+         * Any path segment matches — live `protolink.ru/agents/…` must not stay prio-2 behind
+         * hundreds of mapping-root screenshots.
          */
         fun forcePathPriority(relativePath: String): Int {
-            val top = PathUtil.nameOf(
-                relativePath.substringBefore('/').ifEmpty { relativePath }
-            ).lowercase()
-            return when {
-                top == "films" || top == "agentteamverify" -> 0
-                top == "agents" || top.contains("test") -> 1
-                else -> 2
-            }
+            val parts = PathUtil.normalize(relativePath).lowercase()
+                .split('/')
+                .filter { it.isNotEmpty() }
+            if (parts.any { it == "films" || it == "agentteamverify" }) return 0
+            if (parts.any { it == "agents" || it.contains("test") }) return 1
+            return 2
+        }
+
+        /**
+         * Live 1.0.62 FAIL: Force getFile'd the entire MyNotesFolder (protolink.ru/agents→741+
+         * and still incomplete at ~24m). Daily-use Force must finish: always download AC (prio 0);
+         * elsewhere only Notes leaf pages (index.html) — structure+register the rest (binaries,
+         * evidence dumps) so Force-complete + prune land without unbounded blob getFile.
+         */
+        fun forceShouldDownloadFile(relativePath: String): Boolean {
+            if (forcePathPriority(relativePath) == 0) return true
+            val name = PathUtil.nameOf(relativePath).lowercase()
+            return name == "index.html" || name == "index.htm"
         }
     }
     data class Result(
@@ -1536,9 +1548,9 @@ class SyncEngine(
      * After pull, local paths absent from remote are pruned (Force download = mirror).
      */
     suspend fun forcePullMapping(mapping: SyncMapping): Int {
-        // Progressive BFS per wave: list → name → mkdir → early prune → deepen → file getFile.
-        // Root-level loose files defer while AC (prio 0/1) folders remain — live 1.0.58 still
-        // awaitAll'd hundreds of root getFiles before prune/Films deepen (~28m incomplete).
+        // Progressive BFS: list → name → mkdir → early prune → deepen → selective getFile.
+        // Live 1.0.62: full-tree getFile never Force-complete on 898c1453 (~24m, agents→741).
+        // Download AC (prio 0) + Notes index.html elsewhere; register other remote files only.
         val names = forceMetaNameSeed(mapping.id).toMutableMap()
         val remotePaths = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         val seenPaths = mutableSetOf<String>()
@@ -1552,10 +1564,8 @@ class SyncEngine(
         val structureCache = mutableMapOf<String, List<RemoteEntry>>()
         // Folder ids already materialized as a wave — breaks remote parent cycles.
         val visitedFolderIds = mutableSetOf<String>()
-        // Live 1.0.58: root-wave awaitAll downloaded hundreds of loose root files before
-        // prune/deepen — films stuck, root ghosts survived ~28m. Defer those until AC folders
-        // (prio 0/1) are drained so fill+ghost can land in daily-use.
-        val deferredRootFiles = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
+        // AC getFile deferred while other AC folders remain; non-downloadable files register only.
+        val deferredAcRootFiles = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
 
         // Root listing is hard (empty inventory would prune everything).
         val rootKids = structureThrottle.withPermit {
@@ -1567,16 +1577,14 @@ class SyncEngine(
         structureCache[mapping.cloudFolderId] = rootKids
 
         while (frontier.isNotEmpty()) {
-            // After AC folders drain, pull deferred root files before deep prio-2 trees so
-            // Force-complete is not pushed behind the entire anova/Agents walk.
-            if (deferredRootFiles.isNotEmpty() &&
-                frontier.none { forcePathPriority(it.second) < 2 }
+            if (deferredAcRootFiles.isNotEmpty() &&
+                frontier.none { forcePathPriority(it.second) == 0 }
             ) {
-                val orderedDeferred = deferredRootFiles.toList().sortedWith(
+                val orderedDeferred = deferredAcRootFiles.toList().sortedWith(
                     compareBy<RemoteChangeClassifier.RemoteLocated> { forcePathPriority(it.relativePath) }
                         .thenBy { it.relativePath.lowercase() }
                 )
-                deferredRootFiles.clear()
+                deferredAcRootFiles.clear()
                 coroutineScope {
                     orderedDeferred.map { loc ->
                         async {
@@ -1695,13 +1703,22 @@ class SyncEngine(
                         .thenBy { it.relativePath.count { c -> c == '/' } }
                         .thenBy { it.relativePath.lowercase() }
                 )
-            val acFrontierPending = frontier.any { forcePathPriority(it.second) < 2 }
-            val (downloadNow, defer) = waveFiles.partition { loc ->
+            val acFrontierPending = frontier.any { forcePathPriority(it.second) == 0 }
+            val downloadNow = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
+            for (loc in waveFiles) {
+                if (!forceShouldDownloadFile(loc.relativePath)) {
+                    // Keep path for end-prune mirror; no getFile (live unbounded blob stall).
+                    remotePaths.add(PathUtil.normalize(loc.relativePath))
+                    continue
+                }
                 val parentRel = PathUtil.parentOf(PathUtil.normalize(loc.relativePath))
-                // Defer mapping-root loose files while AC (prio 0/1) folders remain.
-                !(acFrontierPending && parentRel.isEmpty() && forcePathPriority(loc.relativePath) >= 2)
+                // Defer mapping-root AC-prio files only while nested AC folders remain.
+                if (acFrontierPending && parentRel.isEmpty() && forcePathPriority(loc.relativePath) > 0) {
+                    deferredAcRootFiles.add(loc)
+                } else {
+                    downloadNow.add(loc)
+                }
             }
-            deferredRootFiles.addAll(defer)
             coroutineScope {
                 downloadNow.map { loc ->
                     async {
@@ -1713,8 +1730,8 @@ class SyncEngine(
                 }.awaitAll()
             }
         }
-        if (deferredRootFiles.isNotEmpty()) {
-            val orderedDeferred = deferredRootFiles.sortedWith(
+        if (deferredAcRootFiles.isNotEmpty()) {
+            val orderedDeferred = deferredAcRootFiles.sortedWith(
                 compareBy<RemoteChangeClassifier.RemoteLocated> { forcePathPriority(it.relativePath) }
                     .thenBy { it.relativePath.lowercase() }
             )
