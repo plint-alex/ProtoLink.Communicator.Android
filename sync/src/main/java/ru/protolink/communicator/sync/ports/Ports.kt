@@ -28,7 +28,11 @@ interface LocalFileSystem {
 }
 
 interface RemoteCloud {
-    suspend fun listChildrenPaged(parentId: String): List<RemoteEntry>
+    /**
+     * List CloudFolder/CloudFile children. [includeValues]=false is structure-only
+     * (ids+codes; names may be synthetic) for warm WalkRemote — Win values-light parity.
+     */
+    suspend fun listChildrenPaged(parentId: String, includeValues: Boolean = true): List<RemoteEntry>
     suspend fun addFolder(parentId: String, name: String): String
     suspend fun addFile(parentId: String, name: String, bytes: ByteArray, mimeType: String): String
     suspend fun uploadFile(entityId: String, name: String, bytes: ByteArray, mimeType: String)

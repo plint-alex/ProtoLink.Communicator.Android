@@ -26,10 +26,10 @@ class SyncEngine(
     companion object {
         /**
          * Parallel GetEntities for folder walk. Align with Windows
-         * GetEntitiesThrottlingHandler.SyncLaneConcurrency — sequential DFS left
-         * MyNotesFolder (~3.5k folders) Force outside the daily-use window.
+         * GetEntitiesThrottlingHandler.SyncLaneConcurrency (24). Cap 8 + IncludeValues
+         * still left MyNotesFolder (~3.5k folders) Force mid-walk after ~33m.
          */
-        const val WALK_REMOTE_CONCURRENCY = 8
+        const val WALK_REMOTE_CONCURRENCY = 24
     }
     data class Result(
         val localChanges: Int,
@@ -739,20 +739,32 @@ class SyncEngine(
 
     /**
      * Depth-first remote inventory with parallel sibling folder listings (Win WalkRemoteParallel parity).
-     * [visitedIds]/[seenPaths] stop cycles / alias dupes that would otherwise unbounded-walk.
+     * When [valuesLight] and meta is non-empty: structure-only GetEntities when every child id is
+     * already known; otherwise one IncludeValues re-list (Win values-light). Force passes
+     * valuesLight=false — after heal, wrong-tree meta would otherwise double-list every folder.
+     * [visitedIds]/[seenPaths] stop cycles.
      */
     private suspend fun walkRemote(
         folderId: String,
         mappingId: String,
         relativeParent: String,
-        out: MutableList<RemoteChangeClassifier.RemoteLocated>
+        out: MutableList<RemoteChangeClassifier.RemoteLocated>,
+        valuesLight: Boolean = true
     ) {
         val visitedIds = mutableSetOf<String>()
         val seenPaths = mutableSetOf<String>()
         val gate = Mutex()
         val throttle = Semaphore(WALK_REMOTE_CONCURRENCY)
+        val metaByRemoteId = if (valuesLight) {
+            store.getAll(mappingId)
+                .groupBy { it.remoteId }
+                .mapValues { (_, items) -> items.first() }
+        } else {
+            emptyMap()
+        }
         walkRemoteParallel(
-            folderId, mappingId, relativeParent, out, visitedIds, seenPaths, gate, throttle
+            folderId, mappingId, relativeParent, out, visitedIds, seenPaths, gate, throttle,
+            metaByRemoteId
         )
     }
 
@@ -764,18 +776,43 @@ class SyncEngine(
         visitedIds: MutableSet<String>,
         seenPaths: MutableSet<String>,
         gate: Mutex,
-        throttle: Semaphore
+        throttle: Semaphore,
+        metaByRemoteId: Map<String, SyncItemMeta>
     ) {
-        val children = throttle.withPermit { remote.listChildrenPaged(folderId) }
+        // Cold (empty meta / Force): IncludeValues listing per folder.
+        // Warm reconcile: structure-only first; if every child is already in meta, reuse
+        // RelativePath names. Any unknown child → one IncludeValues re-list for that folder.
+        val warm = metaByRemoteId.isNotEmpty()
+        var children = throttle.withPermit {
+            remote.listChildrenPaged(folderId, includeValues = !warm)
+        }
+        var useMetaNames = false
+        if (warm) {
+            val allKnown = children.isEmpty() || children.all { metaByRemoteId.containsKey(it.id) }
+            if (allKnown) {
+                useMetaNames = true
+            } else {
+                children = throttle.withPermit {
+                    remote.listChildrenPaged(folderId, includeValues = true)
+                }
+            }
+        }
         val subfolders = mutableListOf<Pair<String, String>>()
         gate.withLock {
             for (child in children) {
                 if (!visitedIds.add(child.id)) continue
-                val rel = PathUtil.join(relativeParent, child.name)
+                val name = if (useMetaNames) {
+                    val known = metaByRemoteId[child.id]
+                    if (known != null) PathUtil.nameOf(known.relativePath) else child.name
+                } else {
+                    child.name
+                }
+                if (name.isEmpty()) continue
+                val rel = PathUtil.join(relativeParent, name)
                 if (!seenPaths.add(PathUtil.normalize(rel))) continue
                 out.add(
                     RemoteChangeClassifier.RemoteLocated(
-                        entry = child.copy(parentId = folderId),
+                        entry = child.copy(parentId = folderId, name = name),
                         mappingId = mappingId,
                         relativePath = rel
                     )
@@ -790,7 +827,8 @@ class SyncEngine(
             subfolders.map { (id, rel) ->
                 async {
                     walkRemoteParallel(
-                        id, mappingId, rel, out, visitedIds, seenPaths, gate, throttle
+                        id, mappingId, rel, out, visitedIds, seenPaths, gate, throttle,
+                        metaByRemoteId
                     )
                 }
             }.awaitAll()
@@ -850,7 +888,8 @@ class SyncEngine(
     suspend fun forcePullPath(mapping: SyncMapping, relativePath: String) {
         val path = PathUtil.normalize(relativePath)
         val located = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
-        walkRemote(mapping.cloudFolderId, mapping.id, "", located)
+        // Cold IncludeValues: Force must not values-light against possibly-stale meta.
+        walkRemote(mapping.cloudFolderId, mapping.id, "", located, valuesLight = false)
         val loc = located.firstOrNull {
             PathUtil.normalize(it.relativePath) == path && !it.entry.isFolder
         } ?: throw SyncException("Remote file missing for conflict resolve.", relativePath = path)
@@ -948,7 +987,9 @@ class SyncEngine(
      */
     suspend fun forcePullMapping(mapping: SyncMapping): Int {
         val located = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
-        walkRemote(mapping.cloudFolderId, mapping.id, "", located)
+        // Cold IncludeValues walk: after heal, wrong-tree meta would make values-light
+        // structure+Values double-list every folder (~2× GE). Concurrency 24 is the Force lever.
+        walkRemote(mapping.cloudFolderId, mapping.id, "", located, valuesLight = false)
         if (located.isEmpty()) {
             throw SyncException("Force download found no remote files in this folder.")
         }

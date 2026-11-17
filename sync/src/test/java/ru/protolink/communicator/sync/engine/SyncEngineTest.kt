@@ -556,9 +556,12 @@ class SyncEngineTest {
 
         val listCalls = java.util.concurrent.atomic.AtomicInteger(0)
         val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
-            override suspend fun listChildrenPaged(parentId: String): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+            override suspend fun listChildrenPaged(
+                parentId: String,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
                 listCalls.incrementAndGet()
-                val kids = inner.listChildrenPaged(parentId).toMutableList()
+                val kids = inner.listChildrenPaged(parentId, includeValues).toMutableList()
                 // Cycle edge: listing b also returns already-visited folder a.
                 if (parentId == "b") {
                     kids.add(
@@ -584,7 +587,106 @@ class SyncEngineTest {
 
     @Test
     fun walkRemote_concurrencyConstant_matchesWindowsSyncLane() {
-        assertThat(SyncEngine.WALK_REMOTE_CONCURRENCY).isEqualTo(8)
+        assertThat(SyncEngine.WALK_REMOTE_CONCURRENCY).isEqualTo(24)
+    }
+
+    /**
+     * Warm WalkRemote (Win values-light): reconcile with every child id already in meta must
+     * reuse structure-only listings (includeValues=false) — no Values re-list. Force stays cold.
+     */
+    @Test
+    fun reconcile_warmMeta_usesStructureOnlyListings() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("films", "cloud-root", "Films")
+        inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
+        // Prior sync meta: warm path reuses RelativePath names from structure-only lists.
+        store.upsert(
+            ru.protolink.communicator.sync.model.SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "films",
+                parentRemoteId = "cloud-root",
+                relativePath = "Films",
+                isFolder = true,
+                sizeBytes = 0,
+                contentHash = "",
+                remoteUpdateTime = java.time.Instant.now()
+            )
+        )
+        store.upsert(
+            ru.protolink.communicator.sync.model.SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "idx",
+                parentRemoteId = "films",
+                relativePath = "Films/index.html",
+                isFolder = false,
+                sizeBytes = 5,
+                contentHash = "x",
+                remoteUpdateTime = java.time.Instant.now()
+            )
+        )
+        fs.writeFile(root, "Films/index.html", "movie".toByteArray())
+
+        val withValues = java.util.concurrent.atomic.AtomicInteger(0)
+        val withoutValues = java.util.concurrent.atomic.AtomicInteger(0)
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun listChildrenPaged(
+                parentId: String,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                if (includeValues) withValues.incrementAndGet() else withoutValues.incrementAndGet()
+                return inner.listChildrenPaged(parentId, includeValues).map {
+                    if (!includeValues) it.copy(name = if (it.isFolder) "folder-${it.id}" else "file-${it.id}")
+                    else it
+                }
+            }
+        }
+
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
+        assertThat(withoutValues.get()).isAtLeast(1)
+        assertThat(withValues.get()).isEqualTo(0)
+    }
+
+    /** Force after heal must cold-list (IncludeValues) even when stale meta exists — no double GE. */
+    @Test
+    fun forcePull_withStaleMeta_listsWithValuesOnlyOncePerFolder() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("films", "cloud-root", "Films")
+        inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
+        // Wrong-tree ghost meta (heal class): ids not on the new cloud folder.
+        store.upsert(
+            ru.protolink.communicator.sync.model.SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "ghost-confluence",
+                parentRemoteId = "cloud-root",
+                relativePath = "confluence",
+                isFolder = true,
+                sizeBytes = 0,
+                contentHash = "",
+                remoteUpdateTime = java.time.Instant.now()
+            )
+        )
+
+        val withValues = java.util.concurrent.atomic.AtomicInteger(0)
+        val withoutValues = java.util.concurrent.atomic.AtomicInteger(0)
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun listChildrenPaged(
+                parentId: String,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                if (includeValues) withValues.incrementAndGet() else withoutValues.incrementAndGet()
+                return inner.listChildrenPaged(parentId, includeValues)
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(1)
+        assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
+        // Cold Force: one IncludeValues list per folder (root + Films), never structure-only.
+        assertThat(withoutValues.get()).isEqualTo(0)
+        assertThat(withValues.get()).isEqualTo(2)
     }
 
     @Test
@@ -633,8 +735,8 @@ class SyncEngineTest {
         val (store, fs, inner) = harness()
         // Production API listings omit sizeBytes; fileSize() still returns Content-Length.
         val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
-            override suspend fun listChildrenPaged(parentId: String) =
-                inner.listChildrenPaged(parentId).map { it.copy(sizeBytes = null) }
+            override suspend fun listChildrenPaged(parentId: String, includeValues: Boolean) =
+                inner.listChildrenPaged(parentId, includeValues).map { it.copy(sizeBytes = null) }
         }
         inner.seedFolder("films-folder", "cloud-root", "Films")
         inner.seedFile("films-idx", "films-folder", "index.html", "<p>Movie notes</p>".toByteArray())
@@ -657,8 +759,8 @@ class SyncEngineTest {
         val (store, fs, inner) = harness()
         // Listing and fileSize() both omit size — decide must still Read empty stubs.
         val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
-            override suspend fun listChildrenPaged(parentId: String) =
-                inner.listChildrenPaged(parentId).map { it.copy(sizeBytes = null) }
+            override suspend fun listChildrenPaged(parentId: String, includeValues: Boolean) =
+                inner.listChildrenPaged(parentId, includeValues).map { it.copy(sizeBytes = null) }
             override suspend fun fileSize(entityId: String): Long? = null
         }
         inner.seedFolder("films-folder", "cloud-root", "Films")

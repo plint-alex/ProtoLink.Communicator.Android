@@ -167,7 +167,7 @@ class InMemoryRemoteCloud : RemoteCloud {
 
     fun childrenOf(parentId: String): List<Node> = nodes.values.filter { it.parentId == parentId }
 
-    override suspend fun listChildrenPaged(parentId: String): List<RemoteEntry> =
+    override suspend fun listChildrenPaged(parentId: String, includeValues: Boolean): List<RemoteEntry> =
         childrenOf(parentId).map {
             RemoteEntry(
                 id = it.id,

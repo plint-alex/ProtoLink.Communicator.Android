@@ -29,13 +29,18 @@ import java.time.Instant
 import java.time.OffsetDateTime
 
 class ApiRemoteCloud(private val api: ProtoLinkApi) : RemoteCloud {
-    override suspend fun listChildrenPaged(parentId: String): List<RemoteEntry> {
+    override suspend fun listChildrenPaged(parentId: String, includeValues: Boolean): List<RemoteEntry> {
         val all = mutableListOf<RemoteEntry>()
         var skip = 0
         val take = 200
         while (true) {
             val page = api.getEntities(
-                GetEntitiesRequest(parentIds = listOf(parentId), skip = skip, take = take, includeValues = true)
+                GetEntitiesRequest(
+                    parentIds = listOf(parentId),
+                    skip = skip,
+                    take = take,
+                    includeValues = includeValues
+                )
             )
             for (e in page) {
                 val isFolder = e.code == CloudCodes.CLOUD_FOLDER
@@ -43,9 +48,11 @@ class ApiRemoteCloud(private val api: ProtoLinkApi) : RemoteCloud {
                 if (!isFolder && !isFile) continue
                 // Same name resolver as Cloud UI (EntityMeta). Old adapter returned null and
                 // skipped — Sync never walked folders Cloud listed → mapped ghosts (NFR-SYNC-1 /
-                // #android-mapped-missing-local). Only skip synthetic unnamed CloudFiles (Win parity).
+                // #android-mapped-missing-local). Only skip synthetic unnamed CloudFiles when
+                // Values were requested (Win parity). Structure-only lists keep synthetics so
+                // warm WalkRemote can match meta by id.
                 val name = EntityMeta.displayName(e)
-                if (EntityMeta.isSyntheticCloudFileDisplayName(e, name)) continue
+                if (includeValues && EntityMeta.isSyntheticCloudFileDisplayName(e, name)) continue
                 all.add(
                     RemoteEntry(
                         id = e.id,
