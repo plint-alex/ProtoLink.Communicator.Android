@@ -26,8 +26,8 @@ android {
         applicationId = "ru.protolink.communicator"
         minSdk = 28
         targetSdk = 34
-        versionCode = 58
-        versionName = "1.0.57"
+        versionCode = 59
+        versionName = "1.0.58"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "API_BASE_URL", "\"${project.findProperty("PROTOLINK_API_BASE_URL") ?: "http://protolink.ru/"}\"")
     }

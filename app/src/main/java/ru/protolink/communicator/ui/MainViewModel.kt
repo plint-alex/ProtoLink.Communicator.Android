@@ -774,29 +774,41 @@ class MainViewModel @Inject constructor(
     fun loadCloudFolder(folderId: String, statusAfterLoad: String? = null) = viewModelScope.launch {
         currentFolderId = folderId
         clearCloudFileOpen()
-        val lang = uiLang()
-        if (folderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true)) {
-            ensurePhotosLibraryId()
+        // Live 1.0.57: uncaught GetEntities HTTP 504 on Main FATAL'd Force mid-inventory.
+        if (_state.value.forceRunning && !CloudVirtualNodes.isVirtual(folderId)) {
+            _state.update { it.copy(status = "Force sync in progress…") }
+            return@launch
         }
-        val items = when {
-            folderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true) -> buildHubListing(lang)
-            folderId.equals(CloudVirtualNodes.SHARED_WITH_ME_ID, ignoreCase = true) ->
-                loadSharedWithMeListing(lang)
-            folderId.equals(CloudVirtualNodes.SHARED_BY_ME_ID, ignoreCase = true) ->
-                loadSharedByMeListing(lang)
-            folderId.equals(CloudVirtualNodes.RECENT_ID, ignoreCase = true) ->
-                loadRecentListing()
-            else -> {
-                val children = api.getEntities(
-                    GetEntitiesRequest(parentIds = listOf(folderId), includeValues = true, take = 500)
-                )
-                children.mapNotNull { e -> cloudChildItem(e) }
+        val lang = uiLang()
+        try {
+            if (folderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true)) {
+                ensurePhotosLibraryId()
+            }
+            val items = when {
+                folderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true) -> buildHubListing(lang)
+                folderId.equals(CloudVirtualNodes.SHARED_WITH_ME_ID, ignoreCase = true) ->
+                    loadSharedWithMeListing(lang)
+                folderId.equals(CloudVirtualNodes.SHARED_BY_ME_ID, ignoreCase = true) ->
+                    loadSharedByMeListing(lang)
+                folderId.equals(CloudVirtualNodes.RECENT_ID, ignoreCase = true) ->
+                    loadRecentListing()
+                else -> {
+                    val children = api.getEntities(
+                        GetEntitiesRequest(parentIds = listOf(folderId), includeValues = true, take = 500)
+                    )
+                    children.mapNotNull { e -> cloudChildItem(e) }
+                }
+            }
+            _state.update {
+                it.copy(cloudItems = items, status = CloudListingStatus.afterReload(statusAfterLoad))
+            }
+            refreshFolderTree()
+        } catch (e: Exception) {
+            Log.e("ProtoLinkCloud", "loadCloudFolder failed id=$folderId", e)
+            _state.update {
+                it.copy(status = "Cloud load failed: ${e.message ?: e.javaClass.simpleName}")
             }
         }
-        _state.update {
-            it.copy(cloudItems = items, status = CloudListingStatus.afterReload(statusAfterLoad))
-        }
-        refreshFolderTree()
     }
 
     private suspend fun ensurePhotosLibraryId() {
@@ -1195,6 +1207,7 @@ class MainViewModel @Inject constructor(
             try {
                 // Yield so Loading glyph paints before network (change-then-wait).
                 kotlinx.coroutines.yield()
+                if (_state.value.forceRunning) return@launch
                 ensureFolderTreeChildrenLoaded(folderId)
                 val kids = folderTreeChildren.entries
                     .firstOrNull { it.key.equals(folderId, ignoreCase = true) }
@@ -1202,6 +1215,9 @@ class MainViewModel @Inject constructor(
                 if (kids != null && kids.isNotEmpty()) {
                     folderTreeExpanded.add(folderId)
                 }
+            } catch (e: Exception) {
+                // try/finally alone rethrows — HTTP 504 on Main FATAL (1.0.57 Force FAIL class).
+                Log.e("ProtoLinkCloud", "folderTreeExpand failed id=$folderId", e)
             } finally {
                 folderTreeLoading.removeAll { it.equals(folderId, ignoreCase = true) }
                 rebuildFolderTreeRows()
@@ -1464,6 +1480,7 @@ class MainViewModel @Inject constructor(
                 clearFolderTree()
                 return@launch
             }
+            if (_state.value.forceRunning) return@launch
             ensurePhotosLibraryId()
             val crumbMeta = _state.value.breadcrumb.map { pair ->
                 val id = pair.first
@@ -3037,24 +3054,35 @@ class MainViewModel @Inject constructor(
      */
     fun forceDownloadAllMappedNow() {
         viewModelScope.launch {
-            android.util.Log.e("ProtoLinkSync", "forceDownloadAllMappedNow start")
-            withContext(Dispatchers.IO) { tokenRefresher.refreshBlocking() }
-            val healed = runCatching { healDuplicateSameNamedMappings() }.getOrDefault(0)
-            if (healed > 0) {
-                android.util.Log.e("ProtoLinkSync", "force download: healed $healed same-named duplicate map(s)")
+            try {
+                android.util.Log.e("ProtoLinkSync", "forceDownloadAllMappedNow start")
+                withContext(Dispatchers.IO) { tokenRefresher.refreshBlocking() }
+                val healed = runCatching { healDuplicateSameNamedMappings() }.getOrDefault(0)
+                if (healed > 0) {
+                    android.util.Log.e("ProtoLinkSync", "force download: healed $healed same-named duplicate map(s)")
+                }
+                val ids = mappingStore.load().map { it.cloudFolderId }
+                if (ids.isEmpty()) {
+                    _state.update { it.copy(syncError = "No mapped folders for force download") }
+                    android.util.Log.e("ProtoLinkSync", "force download: no mapped folders")
+                    return@launch
+                }
+                for (id in ids) {
+                    // runForceMapping launches its own job; await by calling body inline sequentially
+                    runForceMappingAndAwait(id, push = false)
+                }
+                refreshNotesTree()
+                android.util.Log.e("ProtoLinkSync", "forceDownloadAllMappedNow finished status=${_state.value.status}")
+            } catch (e: Exception) {
+                Log.e("ProtoLinkSync", "forceDownloadAllMappedNow failed", e)
+                _state.update {
+                    it.copy(
+                        forceRunning = false,
+                        status = "Force sync failed",
+                        syncError = e.message ?: e.javaClass.simpleName
+                    )
+                }
             }
-            val ids = mappingStore.load().map { it.cloudFolderId }
-            if (ids.isEmpty()) {
-                _state.update { it.copy(syncError = "No mapped folders for force download") }
-                android.util.Log.e("ProtoLinkSync", "force download: no mapped folders")
-                return@launch
-            }
-            for (id in ids) {
-                // runForceMapping launches its own job; await by calling body inline sequentially
-                runForceMappingAndAwait(id, push = false)
-            }
-            refreshNotesTree()
-            android.util.Log.e("ProtoLinkSync", "forceDownloadAllMappedNow finished status=${_state.value.status}")
         }
     }
 

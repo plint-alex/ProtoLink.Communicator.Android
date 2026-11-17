@@ -1044,6 +1044,90 @@ class SyncEngineTest {
         assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
     }
 
+    /**
+     * Live 1.0.57 FAIL: full collectForceStructureEdges before any getFile — MatchAny 5xx
+     * kept Force pre-getFile for 23m+. Progressive structure must download root-wave files
+     * before listing deeper parents.
+     */
+    @Test
+    fun forcePull_progressiveStructure_downloadsBeforeDeepList() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("films", "cloud-root", "Films")
+        inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
+        inner.seedFolder("d1", "cloud-root", "Deep")
+        inner.seedFolder("d2", "d1", "Nested")
+        inner.seedFile("deep", "d2", "file.txt", "x".toByteArray())
+
+        val deepListed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val filmsDownloadedBeforeDeepList = java.util.concurrent.atomic.AtomicBoolean(false)
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun listChildrenPaged(
+                parentId: String,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                if (parentId == "d1" || parentId == "d2") deepListed.set(true)
+                return inner.listChildrenPaged(parentId, includeValues)
+            }
+
+            override suspend fun listChildrenOfParents(
+                parentIds: List<String>,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                if (parentIds.any { it == "d1" || it == "d2" }) deepListed.set(true)
+                return inner.listChildrenOfParents(parentIds, includeValues)
+            }
+
+            override suspend fun downloadFile(entityId: String): ByteArray? {
+                if (entityId == "idx" && !deepListed.get()) {
+                    filmsDownloadedBeforeDeepList.set(true)
+                }
+                return inner.downloadFile(entityId)
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(2)
+        assertThat(filmsDownloadedBeforeDeepList.get()).isTrue()
+        assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
+        assertThat(String(fs.readFile(root, "Deep/Nested/file.txt"))).isEqualTo("x")
+    }
+
+    /**
+     * MatchAny batch HTTP 504 must fall back after BATCH_MAX_ATTEMPTS (1) and still fill.
+     * Same-priority peers (WideA/WideB) are batched together after AC folders.
+     */
+    @Test
+    fun forcePull_matchAnyHttp504_fallsBackAndFills() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("wa", "cloud-root", "WideA")
+        inner.seedFile("a1", "wa", "a.txt", "a".toByteArray())
+        inner.seedFolder("wb", "cloud-root", "WideB")
+        inner.seedFile("b1", "wb", "b.txt", "b".toByteArray())
+
+        val batchAttempts = java.util.concurrent.atomic.AtomicInteger(0)
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun listChildrenOfParents(
+                parentIds: List<String>,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                if (parentIds.size > 1) {
+                    batchAttempts.incrementAndGet()
+                    throw RuntimeException("HTTP 504 Gateway Time-out")
+                }
+                return inner.listChildrenOfParents(parentIds, includeValues)
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(2)
+        assertThat(batchAttempts.get()).isAtMost(SyncInventoryFetch.BATCH_MAX_ATTEMPTS)
+        assertThat(batchAttempts.get()).isGreaterThan(0)
+        assertThat(String(fs.readFile(root, "WideA/a.txt"))).isEqualTo("a")
+        assertThat(String(fs.readFile(root, "WideB/b.txt"))).isEqualTo("b")
+    }
+
     /** AC folders (films/agentteamverify) materialize before lower-priority sibling trees. */
     @Test
     fun forcePull_priorityMaterializesFilmsBeforeWideSibling() = runTest {

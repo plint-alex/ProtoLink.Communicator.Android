@@ -1010,9 +1010,13 @@ class SyncEngine(
                 else -> {
                     var batched = try {
                         throttle.withPermit {
-                            // Hard on exhaust so one 5xx does not soft-empty the whole batch
-                            // (siblings must still fill — fall back to per-parent soft-fail).
-                            listChildrenOfParentsForceInventory(batch, softFailOnExhausted = false)
+                            // One 5xx → throw → per-parent soft-fail (BATCH_MAX_ATTEMPTS).
+                            // Do not burn 4×gateway timeouts on a fat MatchAny page.
+                            listChildrenOfParentsForceInventory(
+                                batch,
+                                softFailOnExhausted = false,
+                                maxAttempts = SyncInventoryFetch.BATCH_MAX_ATTEMPTS
+                            )
                         }
                     } catch (t: Throwable) {
                         if (SyncInventoryFetch.isHardClientError(t)) throw t
@@ -1106,15 +1110,17 @@ class SyncEngine(
     /** Batched ParentIdsMatchAny structure list with same 5xx retry / soft-fail. */
     private suspend fun listChildrenOfParentsForceInventory(
         folderIds: List<String>,
-        softFailOnExhausted: Boolean
+        softFailOnExhausted: Boolean,
+        maxAttempts: Int = SyncInventoryFetch.MAX_ATTEMPTS
     ): List<RemoteEntry> {
         if (folderIds.isEmpty()) return emptyList()
         if (folderIds.size == 1) {
             return listChildrenForceInventory(folderIds[0], softFailOnExhausted)
         }
+        val attempts = maxAttempts.coerceAtLeast(1)
         val key = folderIds.first() + "+${folderIds.size - 1}"
         var last: Throwable? = null
-        for (attempt in 0 until SyncInventoryFetch.MAX_ATTEMPTS) {
+        for (attempt in 0 until attempts) {
             val wait = SyncInventoryFetch.backoffMs(attempt)
             if (wait > 0L) delay(wait)
             try {
@@ -1137,6 +1143,82 @@ class SyncEngine(
             return emptyList()
         }
         throw last ?: SyncException("Force inventory batched GetEntities failed.")
+    }
+
+    /**
+     * Structure-list one Force BFS wave of parents (MatchAny batches + 5xx → per-parent soft-fail).
+     * Returns children keyed by parent id. [matchAnyEnabled] null = probe, false = 1 GE/parent.
+     */
+    private suspend fun listChildrenForceWaveByParent(
+        parentIds: List<String>,
+        throttle: Semaphore,
+        matchAnyEnabled: Boolean?
+    ): Pair<Map<String, List<RemoteEntry>>, Boolean?> {
+        if (parentIds.isEmpty()) return emptyMap<String, List<RemoteEntry>>() to matchAnyEnabled
+        val distinct = parentIds.distinct()
+        val byParent = linkedMapOf<String, MutableList<RemoteEntry>>()
+        fun remember(entries: List<RemoteEntry>, fallbackParent: String?) {
+            for (e in entries) {
+                val pid = e.parentId.takeIf { it.isNotBlank() }
+                    ?: fallbackParent
+                    ?: continue
+                byParent.getOrPut(pid) { mutableListOf() }.add(e)
+            }
+        }
+        var matchAny = matchAnyEnabled
+        for (batch in distinct.chunked(FORCE_PARENT_BATCH)) {
+            val children = when {
+                matchAny == false || batch.size == 1 ->
+                    listChildrenForceInventoryParallel(batch, throttle)
+                else -> {
+                    var batched = try {
+                        throttle.withPermit {
+                            listChildrenOfParentsForceInventory(
+                                batch,
+                                softFailOnExhausted = false,
+                                maxAttempts = SyncInventoryFetch.BATCH_MAX_ATTEMPTS
+                            )
+                        }
+                    } catch (t: Throwable) {
+                        if (SyncInventoryFetch.isHardClientError(t)) throw t
+                        if (!SyncInventoryFetch.isTransientServerError(t) &&
+                            t !is SyncException
+                        ) {
+                            throw t
+                        }
+                        SyncInventoryFetch.logSoftFail(
+                            "ForceStructureWave",
+                            batch.first() + "+${batch.size - 1}",
+                            t.message ?: t.javaClass.simpleName
+                        )
+                        listChildrenForceInventoryParallel(batch, throttle)
+                    }
+                    if (matchAny == null && batched.isEmpty() && batch.size > 1) {
+                        val single = throttle.withPermit {
+                            listChildrenForceInventory(batch[0], softFailOnExhausted = true)
+                        }
+                        if (single.isNotEmpty()) {
+                            System.err.println(
+                                "[SyncEngine] ParentIdsMatchAny unsupported (empty multi-parent " +
+                                    "batch, non-empty single) — Force wave falls back to 1 GE/parent"
+                            )
+                            matchAny = false
+                            batched = listChildrenForceInventoryParallel(batch, throttle)
+                        } else {
+                            matchAny = true
+                        }
+                    } else if (matchAny == null) {
+                        matchAny = true
+                    }
+                    batched
+                }
+            }
+            // Parallel path returns entries with correct parentId; MatchAny too.
+            // If parentId blank (Ids-only), attribute to sole batch parent.
+            val sole = batch.singleOrNull()
+            remember(children, sole)
+        }
+        return byParent.mapValues { it.value.toList() } to matchAny
     }
 
     private suspend fun resolveDisplayNamesByIds(
@@ -1454,15 +1536,10 @@ class SyncEngine(
      * After pull, local paths absent from remote are pruned (Force download = mirror).
      */
     suspend fun forcePullMapping(mapping: SyncMapping): Int {
-        // Structure-first (MatchAny), then BFS name waves → materialize each wave before
-        // naming deeper edges. Live 1.0.56 started getFile but stayed sequential (~12/min) with
-        // end-only prune — never Force-complete in daily-use. This path: parallel getFile,
-        // AC-priority frontier, early per-parent ghost prune after each named wave.
-        val edges = collectForceStructureEdges(mapping.cloudFolderId)
-        if (edges.isEmpty()) {
-            throw SyncException("Force download found no remote files in this folder.")
-        }
-        val byParent = edges.groupBy { it.parentId }
+        // Progressive BFS: structure-list → name → parallel materialize → early prune per wave.
+        // Live 1.0.57 still collected the FULL structure tree before any getFile; MatchAny 5xx
+        // retries kept Force pre-getFile for 23m+ until an uncaught UI 504 killed the process.
+        // Root / AC fill+ghost must start after the first wave, not after the whole inventory.
         val names = forceMetaNameSeed(mapping.id).toMutableMap()
         val remotePaths = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         val seenPaths = mutableSetOf<String>()
@@ -1471,9 +1548,56 @@ class SyncEngine(
         var sawRemoteFile = false
         var frontier = listOf(mapping.cloudFolderId to "")
         val downloadThrottle = Semaphore(FORCE_DOWNLOAD_CONCURRENCY)
+        val structureThrottle = Semaphore(WALK_REMOTE_CONCURRENCY)
+        var matchAnyEnabled: Boolean? = null
+        val structureCache = mutableMapOf<String, List<RemoteEntry>>()
+        // Folder ids already materialized as a wave — breaks remote parent cycles.
+        val visitedFolderIds = mutableSetOf<String>()
+
+        // Root listing is hard (empty inventory would prune everything).
+        val rootKids = structureThrottle.withPermit {
+            listChildrenForceInventory(mapping.cloudFolderId, softFailOnExhausted = false)
+        }
+        if (rootKids.isEmpty()) {
+            throw SyncException("Force download found no remote files in this folder.")
+        }
+        structureCache[mapping.cloudFolderId] = rootKids
+
         while (frontier.isNotEmpty()) {
-            val waveKids = frontier.flatMap { (folderId, relativeParent) ->
-                byParent[folderId].orEmpty().map { kid -> Triple(kid, folderId, relativeParent) }
+            // Root wave lists every immediate child (early prune all root ghosts). Deeper waves
+            // take same-priority parents (AC-first) up to FORCE_PARENT_BATCH so Films getFile is
+            // not blocked on lower-priority Deep GE, while MatchAny still batches peers.
+            val pending = frontier.filter { it.first !in visitedFolderIds }
+            if (pending.isEmpty()) break
+            val waveParents = if (pending.any { it.first == mapping.cloudFolderId }) {
+                pending.filter { it.first == mapping.cloudFolderId }
+            } else {
+                val topPrio = forcePathPriority(pending.first().second)
+                pending
+                    .filter { forcePathPriority(it.second) == topPrio }
+                    .take(FORCE_PARENT_BATCH)
+            }
+            val waveIds = waveParents.map { it.first }.toSet()
+            visitedFolderIds.addAll(waveIds)
+            frontier = frontier.filter { it.first !in waveIds }
+
+            val needList = waveParents.map { it.first }
+                .filter { it !in structureCache }
+                .distinct()
+            if (needList.isNotEmpty()) {
+                val (listed, nextMatch) = listChildrenForceWaveByParent(
+                    needList,
+                    structureThrottle,
+                    matchAnyEnabled
+                )
+                matchAnyEnabled = nextMatch
+                for (id in needList) {
+                    structureCache[id] = listed[id].orEmpty()
+                }
+            }
+
+            val waveKids = waveParents.flatMap { (folderId, relativeParent) ->
+                structureCache[folderId].orEmpty().map { kid -> Triple(kid, folderId, relativeParent) }
             }
             val missing = waveKids.map { it.first.id }.filter { id ->
                 names[id].isNullOrEmpty()
@@ -1492,7 +1616,7 @@ class SyncEngine(
                 if (!kid.isFolder) sawRemoteFile = true
                 waveLocated.add(
                     RemoteChangeClassifier.RemoteLocated(
-                        entry = ru.protolink.communicator.sync.model.RemoteEntry(
+                        entry = RemoteEntry(
                             id = kid.id,
                             parentId = folderId,
                             name = name,
@@ -1502,7 +1626,7 @@ class SyncEngine(
                         relativePath = rel
                     )
                 )
-                if (kid.isFolder) next.add(kid.id to rel)
+                if (kid.isFolder && kid.id !in visitedFolderIds) next.add(kid.id to rel)
             }
             // Folders first (mkdir), then AC-priority files — same-depth wave is sibling-safe.
             val ordered = waveLocated.sortedWith(
@@ -1523,17 +1647,19 @@ class SyncEngine(
             }
             // Early ghost prune for every parent this wave fully enumerated (root ghosts die
             // before deeper Agents downloads finish — daily-use AC).
-            val kidsByParent = waveLocated.groupBy { PathUtil.parentOf(PathUtil.normalize(it.relativePath)) }
-            for ((parentRel, kids) in kidsByParent) {
+            val kidsByParentRel = waveLocated.groupBy {
+                PathUtil.parentOf(PathUtil.normalize(it.relativePath))
+            }
+            for ((parentRel, kids) in kidsByParentRel) {
                 pruneImmediateGhosts(
                     mapping,
                     parentRel,
                     kids.map { PathUtil.normalize(it.relativePath) }.toSet()
                 )
             }
-            frontier = next.sortedWith(
+            frontier = (frontier + next).sortedWith(
                 compareBy<Pair<String, String>> { forcePathPriority(it.second) }
-                    .thenBy { byParent[it.first].orEmpty().size }
+                    .thenBy { it.second.count { c -> c == '/' } }
                     .thenBy { it.second.lowercase() }
             )
         }
@@ -1640,7 +1766,18 @@ class SyncEngine(
             }
             return 0
         }
-        val bytes = remote.downloadFile(loc.entry.id)
+        val bytes = try {
+            remote.downloadFile(loc.entry.id)
+        } catch (e: Exception) {
+            // getFile is Response-based (null on 5xx) but keep soft-fail if a future path throws.
+            SyncRemoteDownload.logMaterializeFailed(
+                "ForcePullMapping",
+                path,
+                loc.entry.id,
+                e.message ?: e.javaClass.simpleName
+            )
+            return 0
+        }
         if (bytes == null) {
             SyncRemoteDownload.logFailed("ForcePullMapping", path, loc.entry.id)
             return 0
