@@ -774,11 +774,8 @@ class MainViewModel @Inject constructor(
     fun loadCloudFolder(folderId: String, statusAfterLoad: String? = null) = viewModelScope.launch {
         currentFolderId = folderId
         clearCloudFileOpen()
-        // Live 1.0.57: uncaught GetEntities HTTP 504 on Main FATAL'd Force mid-inventory.
-        if (_state.value.forceRunning && !CloudVirtualNodes.isVirtual(folderId)) {
-            _state.update { it.copy(status = "Force sync in progress…") }
-            return@launch
-        }
+        // Force must not gate browse (vision #cloud-unmapped-list / #cloud-folder-responsiveness).
+        // Live 1.0.57 FATAL was uncaught HttpException on Main — keep soft-fail catch below; never skip GetEntities.
         val lang = uiLang()
         try {
             if (folderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true)) {
@@ -1207,7 +1204,7 @@ class MainViewModel @Inject constructor(
             try {
                 // Yield so Loading glyph paints before network (change-then-wait).
                 kotlinx.coroutines.yield()
-                if (_state.value.forceRunning) return@launch
+                // Force must not gate tree expand — soft-fail catch below (no Main FATAL on 504).
                 ensureFolderTreeChildrenLoaded(folderId)
                 val kids = folderTreeChildren.entries
                     .firstOrNull { it.key.equals(folderId, ignoreCase = true) }
@@ -1480,7 +1477,7 @@ class MainViewModel @Inject constructor(
                 clearFolderTree()
                 return@launch
             }
-            if (_state.value.forceRunning) return@launch
+            // Force must not gate tree refresh after browse (same soft-fail as loadCloudFolder).
             ensurePhotosLibraryId()
             val crumbMeta = _state.value.breadcrumb.map { pair ->
                 val id = pair.first
