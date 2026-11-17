@@ -1,5 +1,12 @@
 package ru.protolink.communicator.sync.engine
 
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import ru.protolink.communicator.sync.model.LocalChange
 import ru.protolink.communicator.sync.model.RemoteChange
 import ru.protolink.communicator.sync.model.SyncItemMeta
@@ -16,6 +23,14 @@ class SyncEngine(
     private val localClassifier: LocalChangeClassifier = LocalChangeClassifier(),
     private val remoteClassifier: RemoteChangeClassifier = RemoteChangeClassifier()
 ) {
+    companion object {
+        /**
+         * Parallel GetEntities for folder walk. Align with Windows
+         * GetEntitiesThrottlingHandler.SyncLaneConcurrency — sequential DFS left
+         * MyNotesFolder (~3.5k folders) Force outside the daily-use window.
+         */
+        const val WALK_REMOTE_CONCURRENCY = 8
+    }
     data class Result(
         val localChanges: Int,
         val remoteChanges: Int
@@ -722,25 +737,63 @@ class SyncEngine(
         return applied
     }
 
+    /**
+     * Depth-first remote inventory with parallel sibling folder listings (Win WalkRemoteParallel parity).
+     * [visitedIds]/[seenPaths] stop cycles / alias dupes that would otherwise unbounded-walk.
+     */
     private suspend fun walkRemote(
         folderId: String,
         mappingId: String,
         relativeParent: String,
         out: MutableList<RemoteChangeClassifier.RemoteLocated>
     ) {
-        val children = remote.listChildrenPaged(folderId)
-        for (child in children) {
-            val rel = PathUtil.join(relativeParent, child.name)
-            out.add(
-                RemoteChangeClassifier.RemoteLocated(
-                    entry = child.copy(parentId = folderId),
-                    mappingId = mappingId,
-                    relativePath = rel
+        val visitedIds = mutableSetOf<String>()
+        val seenPaths = mutableSetOf<String>()
+        val gate = Mutex()
+        val throttle = Semaphore(WALK_REMOTE_CONCURRENCY)
+        walkRemoteParallel(
+            folderId, mappingId, relativeParent, out, visitedIds, seenPaths, gate, throttle
+        )
+    }
+
+    private suspend fun walkRemoteParallel(
+        folderId: String,
+        mappingId: String,
+        relativeParent: String,
+        out: MutableList<RemoteChangeClassifier.RemoteLocated>,
+        visitedIds: MutableSet<String>,
+        seenPaths: MutableSet<String>,
+        gate: Mutex,
+        throttle: Semaphore
+    ) {
+        val children = throttle.withPermit { remote.listChildrenPaged(folderId) }
+        val subfolders = mutableListOf<Pair<String, String>>()
+        gate.withLock {
+            for (child in children) {
+                if (!visitedIds.add(child.id)) continue
+                val rel = PathUtil.join(relativeParent, child.name)
+                if (!seenPaths.add(PathUtil.normalize(rel))) continue
+                out.add(
+                    RemoteChangeClassifier.RemoteLocated(
+                        entry = child.copy(parentId = folderId),
+                        mappingId = mappingId,
+                        relativePath = rel
+                    )
                 )
-            )
-            if (child.isFolder) {
-                walkRemote(child.id, mappingId, rel, out)
+                if (child.isFolder) {
+                    subfolders.add(child.id to rel)
+                }
             }
+        }
+        if (subfolders.isEmpty()) return
+        coroutineScope {
+            subfolders.map { (id, rel) ->
+                async {
+                    walkRemoteParallel(
+                        id, mappingId, rel, out, visitedIds, seenPaths, gate, throttle
+                    )
+                }
+            }.awaitAll()
         }
     }
 

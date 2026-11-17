@@ -53,13 +53,17 @@ object AppModule {
             else chain.request().newBuilder().header("Authorization", "Bearer $token").build()
             chain.proceed(req)
         }
+        // Do NOT body-log GetEntities: WalkRemote floods ~3.5k folder listings (Win DevTools
+        // hang class). Path-only BASIC interceptor still counts requests.
         val messengerLog = Interceptor { chain ->
             val req = chain.request()
             val path = req.url.encodedPath
-            val watch = path.contains("AddEntity", true) ||
-                path.contains("AddPermission", true) ||
-                path.contains("commands", true) ||
-                (path.contains("GetEntities", true) && req.method.equals("POST", true))
+            val isGetEntities = path.contains("GetEntities", true) && req.method.equals("POST", true)
+            val watch = !isGetEntities && (
+                path.contains("AddEntity", true) ||
+                    path.contains("AddPermission", true) ||
+                    path.contains("commands", true)
+                )
             if (watch) {
                 val copy = req.newBuilder().build()
                 val buffer = okio.Buffer()

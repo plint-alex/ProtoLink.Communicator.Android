@@ -523,6 +523,70 @@ class SyncEngineTest {
         assertThat(String(fs.readFile(root, "ok.txt"))).isEqualTo("ok")
     }
 
+    /**
+     * FAIL class P1-20261117 walkRemote duration: wide sibling folders must still Force-fill
+     * after parallel walk (Win WalkRemoteParallel parity).
+     */
+    @Test
+    fun forcePull_wideSiblingTree_fillsAllLeaves() = runTest {
+        val (store, fs, remote) = harness()
+        repeat(24) { i ->
+            val folderId = "branch-$i"
+            remote.seedFolder(folderId, "cloud-root", "branch$i")
+            remote.seedFile("leaf-$i", folderId, "index.html", "b$i".toByteArray())
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(24)
+        repeat(24) { i ->
+            assertThat(String(fs.readFile(root, "branch$i/index.html"))).isEqualTo("b$i")
+        }
+    }
+
+    /**
+     * Graph cycle / re-parent alias must not unbounded-walk: each remote id listed once.
+     */
+    @Test
+    fun forcePull_remoteCycle_doesNotUnboundedWalk() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("a", "cloud-root", "a")
+        inner.seedFolder("b", "a", "b")
+        inner.seedFile("leaf", "b", "ok.txt", "ok".toByteArray())
+
+        val listCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun listChildrenPaged(parentId: String): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                listCalls.incrementAndGet()
+                val kids = inner.listChildrenPaged(parentId).toMutableList()
+                // Cycle edge: listing b also returns already-visited folder a.
+                if (parentId == "b") {
+                    kids.add(
+                        ru.protolink.communicator.sync.model.RemoteEntry(
+                            id = "a",
+                            parentId = "b",
+                            name = "a-again",
+                            isFolder = true
+                        )
+                    )
+                }
+                return kids
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(1)
+        assertThat(String(fs.readFile(root, "a/b/ok.txt"))).isEqualTo("ok")
+        // root + a + b only (cycle edge skipped by visitedIds) — not exploding.
+        assertThat(listCalls.get()).isAtMost(4)
+    }
+
+    @Test
+    fun walkRemote_concurrencyConstant_matchesWindowsSyncLane() {
+        assertThat(SyncEngine.WALK_REMOTE_CONCURRENCY).isEqualTo(8)
+    }
+
     @Test
     fun localEdited_remoteUnchanged_writes() = runTest {
         val (store, fs, remote) = harness()
