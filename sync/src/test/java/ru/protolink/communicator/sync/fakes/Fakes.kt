@@ -75,6 +75,24 @@ class InMemoryFileSystem : LocalFileSystem {
         return result
     }
 
+    override fun listImmediate(rootPath: String, relativePath: String): List<FsEntry> {
+        val parent = PathUtil.normalize(relativePath)
+        val prefix = "${rootPath.trimEnd('/', '\\')}|"
+        val fileRels = files.keys.filter { it.startsWith(prefix) }.map { it.removePrefix(prefix) }
+        val dirRels = dirs.filter { it.startsWith(prefix) }.map { it.removePrefix(prefix) }.filter { it.isNotEmpty() }
+        fun isImmediate(rel: String): Boolean =
+            PathUtil.normalize(PathUtil.parentOf(rel)) == parent
+        val out = mutableListOf<FsEntry>()
+        for (rel in fileRels.filter(::isImmediate)) {
+            val bytes = files.getValue(prefix + rel)
+            out.add(FsEntry(rel, false, bytes.size.toLong(), ""))
+        }
+        for (rel in dirRels.filter(::isImmediate)) {
+            out.add(FsEntry(rel, true, 0))
+        }
+        return out
+    }
+
     override fun createDirectory(rootPath: String, relativePath: String) {
         val n = PathUtil.normalize(relativePath)
         if (n.isEmpty()) return

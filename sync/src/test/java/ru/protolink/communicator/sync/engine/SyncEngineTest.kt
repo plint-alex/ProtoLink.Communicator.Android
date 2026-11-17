@@ -1006,6 +1006,69 @@ class SyncEngineTest {
     }
 
     /**
+     * Live 1.0.56 progressive-incomplete: ghost prune waited for full tree Force-complete.
+     * After root wave names, wrong-tree root dirs must die before deeper downloads finish.
+     */
+    @Test
+    fun forcePull_earlyPrunesRootGhostsBeforeDeepDownloads() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("films", "cloud-root", "Films")
+        inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
+        inner.seedFolder("deep", "cloud-root", "Deep")
+        inner.seedFile("deepf", "deep", "file.txt", "x".toByteArray())
+        fs.createDirectory(root, "confluence")
+        fs.writeFile(root, "confluence/page.html", "ghost".toByteArray())
+        fs.createDirectory(root, "databases")
+
+        val deepDownloaded = java.util.concurrent.atomic.AtomicBoolean(false)
+        val ghostGoneBeforeDeep = java.util.concurrent.atomic.AtomicBoolean(false)
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun downloadFile(entityId: String): ByteArray? {
+                if (entityId == "deepf") {
+                    ghostGoneBeforeDeep.set(
+                        !fs.exists(root, "confluence") && !fs.exists(root, "databases")
+                    )
+                    deepDownloaded.set(true)
+                }
+                return inner.downloadFile(entityId)
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(2)
+        assertThat(deepDownloaded.get()).isTrue()
+        assertThat(ghostGoneBeforeDeep.get()).isTrue()
+        assertThat(fs.exists(root, "confluence")).isFalse()
+        assertThat(fs.exists(root, "databases")).isFalse()
+        assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
+    }
+
+    /** AC folders (films/agentteamverify) materialize before lower-priority sibling trees. */
+    @Test
+    fun forcePull_priorityMaterializesFilmsBeforeWideSibling() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("wide", "cloud-root", "WideTree")
+        inner.seedFile("w1", "wide", "a.txt", "w".toByteArray())
+        inner.seedFolder("films", "cloud-root", "Films")
+        inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
+
+        val order = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun downloadFile(entityId: String): ByteArray? {
+                order.add(entityId)
+                return inner.downloadFile(entityId)
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(2)
+        assertThat(order.indexOf("idx")).isLessThan(order.indexOf("w1"))
+        assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
+    }
+
+    /**
      * Meta RelativePath leaf names seed ForceIdsNames — skip IncludeValues for known ids.
      */
     @Test

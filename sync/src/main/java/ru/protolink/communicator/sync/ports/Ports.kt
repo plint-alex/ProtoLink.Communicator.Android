@@ -19,6 +19,11 @@ interface MetadataStore {
 
 interface LocalFileSystem {
     fun snapshot(rootPath: String): List<FsEntry>
+    /**
+     * Immediate children only (no recursion, no content hash). Empty [relativePath] = root.
+     * Force uses this for early per-parent ghost prune without a full hashed snapshot.
+     */
+    fun listImmediate(rootPath: String, relativePath: String = ""): List<FsEntry>
     fun createDirectory(rootPath: String, relativePath: String)
     fun writeFile(rootPath: String, relativePath: String, bytes: ByteArray)
     fun readFile(rootPath: String, relativePath: String): ByteArray

@@ -177,6 +177,17 @@ class CloudFolderDeleteTest {
             folders.map { FsEntry(it, true, 0) } +
                 files.map { FsEntry(it.key, false, it.value.size.toLong()) }
 
+        override fun listImmediate(rootPath: String, relativePath: String): List<FsEntry> {
+            val parent = relativePath.trim('/').lowercase()
+            fun isImmediate(rel: String): Boolean {
+                val n = rel.replace('\\', '/').trim('/')
+                val p = n.substringBeforeLast('/', missingDelimiterValue = "")
+                return p.equals(parent, ignoreCase = true) || (parent.isEmpty() && !n.contains('/'))
+            }
+            return folders.filter(::isImmediate).map { FsEntry(it, true, 0) } +
+                files.keys.filter(::isImmediate).map { FsEntry(it, false, files.getValue(it).size.toLong()) }
+        }
+
         override fun createDirectory(rootPath: String, relativePath: String) {
             folders.add(relativePath)
         }

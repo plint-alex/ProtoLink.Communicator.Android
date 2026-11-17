@@ -306,11 +306,44 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
         return sum
     }
 
+    override fun listImmediate(rootPath: String, relativePath: String): List<FsEntry> {
+        val tree = treeUri(rootPath)
+        val parentNorm = relativePath.replace('\\', '/').trim('/')
+        val parentId = if (parentNorm.isEmpty()) {
+            SafTreeLister.treeDocumentId(tree)
+        } else {
+            NotesTreeBuilder.folderDocumentId(tree, parentNorm)
+        }
+        return SafTreeLister.listChildren(context, tree, parentId).map { child ->
+            val childRel = if (parentNorm.isEmpty()) child.name else "$parentNorm/${child.name}"
+            FsEntry(
+                relativePath = childRel.replace('\\', '/'),
+                isFolder = child.isDirectory,
+                sizeBytes = 0L,
+                contentHash = ""
+            )
+        }
+    }
+
     override fun createDirectory(rootPath: String, relativePath: String) {
         val n = relativePath.replace('\\', '/').trim('/')
+        if (n.isEmpty()) return
         val tree = treeUri(rootPath)
         var curId = SafTreeLister.treeDocumentId(tree)
         for (part in n.split('/').filter { it.isNotEmpty() }) {
+            // Guess-first: Force materialize was spending ~6–7s/file on listChildren of wide parents.
+            val guessed = SafChildResolve.nextChildDocumentId(
+                emptyList(),
+                part,
+                curId
+            ) { guessId ->
+                val uri = SafTreeLister.documentUri(tree, guessId)
+                DocumentFile.fromSingleUri(context, uri)?.exists() == true
+            }
+            if (guessed != null) {
+                curId = guessed
+                continue
+            }
             val existing = SafTreeLister.listChildren(context, tree, curId)
                 .firstOrNull { it.isDirectory && it.name.equals(part, true) }
             if (existing != null) {
@@ -337,18 +370,23 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
         } else {
             NotesTreeBuilder.folderDocumentId(tree, parent)
         }
-        // Prefer open-by-guess / listed file so we don't create duplicates when listFiles is blind.
-        val existingUri = SafTreeLister.listChildren(context, tree, parentId)
-            .firstOrNull { !it.isDirectory && it.name.equals(name, true) }
-            ?.uri
+        // Guess-first then listChildren fallback — avoids O(parent width) query per Force file.
+        val guessId = SafChildResolve.nextChildDocumentId(
+            emptyList(),
+            name,
+            parentId
+        ) { id ->
+            val uri = SafTreeLister.documentUri(tree, id)
+            DocumentFile.fromSingleUri(context, uri)?.exists() == true
+        }
+        val existingUri = guessId?.let { SafTreeLister.documentUri(tree, it) }
+            ?: SafTreeLister.listChildren(context, tree, parentId)
+                .firstOrNull { !it.isDirectory && it.name.equals(name, true) }
+                ?.uri
             ?: if (name.equals("index.html", true) || name.equals("index.htm", true)) {
                 SafTreeLister.findIndexHtmlByGuess(context, tree, parentId)
             } else {
-                val guessId = "$parentId/$name"
-                val uri = SafTreeLister.documentUri(tree, guessId)
-                runCatching {
-                    context.contentResolver.openInputStream(uri)?.use { uri }
-                }.getOrNull()
+                null
             }
 
         val target = existingUri ?: DocumentsContract.createDocument(

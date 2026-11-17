@@ -55,8 +55,29 @@ class SyncEngine(
          */
         const val FORCE_PARENT_BATCH = 48
 
+        /**
+         * Parallel getFile / mkdir materialize within a Force wave. Live 1.0.56 was sequential
+         * (~12 files/min with SAF listChildren gaps) and never reached Force-complete in ~25m.
+         * Align with name concurrency; OkHttp maxRequestsPerHost already ≥ walk (24).
+         */
+        const val FORCE_DOWNLOAD_CONCURRENCY = 8
+
         /** Force inventory GetEntities attempts (transient HTTP 5xx). */
         const val FORCE_INVENTORY_MAX_ATTEMPTS = SyncInventoryFetch.MAX_ATTEMPTS
+
+        /**
+         * Lower = materialize / deepen earlier (AC fill folders before wide sibling trees).
+         */
+        fun forcePathPriority(relativePath: String): Int {
+            val top = PathUtil.nameOf(
+                relativePath.substringBefore('/').ifEmpty { relativePath }
+            ).lowercase()
+            return when {
+                top == "films" || top == "agentteamverify" -> 0
+                top == "agents" || top.contains("test") -> 1
+                else -> 2
+            }
+        }
     }
     data class Result(
         val localChanges: Int,
@@ -1434,19 +1455,22 @@ class SyncEngine(
      */
     suspend fun forcePullMapping(mapping: SyncMapping): Int {
         // Structure-first (MatchAny), then BFS name waves → materialize each wave before
-        // naming deeper edges. Live 1.0.54 waited for ALL IncludeValues names first →
-        // downloadFile=0 past 28m; progressive fill reaches AC folders in daily-use.
+        // naming deeper edges. Live 1.0.56 started getFile but stayed sequential (~12/min) with
+        // end-only prune — never Force-complete in daily-use. This path: parallel getFile,
+        // AC-priority frontier, early per-parent ghost prune after each named wave.
         val edges = collectForceStructureEdges(mapping.cloudFolderId)
         if (edges.isEmpty()) {
             throw SyncException("Force download found no remote files in this folder.")
         }
         val byParent = edges.groupBy { it.parentId }
         val names = forceMetaNameSeed(mapping.id).toMutableMap()
-        val remotePaths = mutableSetOf<String>()
+        val remotePaths = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         val seenPaths = mutableSetOf<String>()
         var files = 0
+        val filesGate = Mutex()
         var sawRemoteFile = false
         var frontier = listOf(mapping.cloudFolderId to "")
+        val downloadThrottle = Semaphore(FORCE_DOWNLOAD_CONCURRENCY)
         while (frontier.isNotEmpty()) {
             val waveKids = frontier.flatMap { (folderId, relativeParent) ->
                 byParent[folderId].orEmpty().map { kid -> Triple(kid, folderId, relativeParent) }
@@ -1480,11 +1504,38 @@ class SyncEngine(
                 )
                 if (kid.isFolder) next.add(kid.id to rel)
             }
-            // Depth-sort within the wave so parents exist before nested paths in same wave.
-            for (loc in waveLocated.sortedBy { it.relativePath.count { c -> c == '/' } }) {
-                files += materializeForceLocated(mapping, loc, remotePaths)
+            // Folders first (mkdir), then AC-priority files — same-depth wave is sibling-safe.
+            val ordered = waveLocated.sortedWith(
+                compareBy<RemoteChangeClassifier.RemoteLocated> { if (it.entry.isFolder) 0 else 1 }
+                    .thenBy { forcePathPriority(it.relativePath) }
+                    .thenBy { it.relativePath.count { c -> c == '/' } }
+                    .thenBy { it.relativePath.lowercase() }
+            )
+            coroutineScope {
+                ordered.map { loc ->
+                    async {
+                        downloadThrottle.withPermit {
+                            val n = materializeForceLocated(mapping, loc, remotePaths)
+                            if (n != 0) filesGate.withLock { files += n }
+                        }
+                    }
+                }.awaitAll()
             }
-            frontier = next
+            // Early ghost prune for every parent this wave fully enumerated (root ghosts die
+            // before deeper Agents downloads finish — daily-use AC).
+            val kidsByParent = waveLocated.groupBy { PathUtil.parentOf(PathUtil.normalize(it.relativePath)) }
+            for ((parentRel, kids) in kidsByParent) {
+                pruneImmediateGhosts(
+                    mapping,
+                    parentRel,
+                    kids.map { PathUtil.normalize(it.relativePath) }.toSet()
+                )
+            }
+            frontier = next.sortedWith(
+                compareBy<Pair<String, String>> { forcePathPriority(it.second) }
+                    .thenBy { byParent[it.first].orEmpty().size }
+                    .thenBy { it.second.lowercase() }
+            )
         }
         if (remotePaths.isEmpty()) {
             throw SyncException("Force download found no remote files in this folder.")
@@ -1495,6 +1546,60 @@ class SyncEngine(
         }
         store.setLastSyncUtc(mapping.id, Instant.now())
         return files
+    }
+
+    /**
+     * After a parent’s remote children are named, delete local immediate children absent from
+     * that set (wrong-tree ghosts). Soft-fail per item (NFR-SYNC-1). Does not touch deeper
+     * paths under still-valid remote folders.
+     */
+    private fun pruneImmediateGhosts(
+        mapping: SyncMapping,
+        parentRelative: String,
+        remoteChildPaths: Set<String>
+    ) {
+        val parentNorm = PathUtil.normalize(parentRelative)
+        val remoteNames = remoteChildPaths.map { PathUtil.nameOf(it).lowercase() }.toSet()
+        val locals = try {
+            fs.listImmediate(mapping.localRootPath, parentNorm)
+        } catch (e: Exception) {
+            SyncRemoteDownload.logMaterializeFailed(
+                "ForcePullMapping.EarlyPruneList",
+                parentNorm.ifEmpty { "." },
+                "-",
+                e.message ?: e.javaClass.simpleName
+            )
+            return
+        }
+        val ghosts = locals
+            .filter { PathUtil.nameOf(it.relativePath).lowercase() !in remoteNames }
+            .sortedByDescending { PathUtil.normalize(it.relativePath).count { c -> c == '/' } }
+        for (entry in ghosts) {
+            val path = PathUtil.normalize(entry.relativePath)
+            try {
+                if (fs.exists(mapping.localRootPath, path)) {
+                    fs.delete(mapping.localRootPath, path, entry.isFolder)
+                }
+                store.delete(mapping.id, path)
+                // Drop nested meta under a pruned folder.
+                if (entry.isFolder) {
+                    val prefix = "$path/"
+                    for (meta in store.getAll(mapping.id)) {
+                        val m = PathUtil.normalize(meta.relativePath)
+                        if (m == path || m.startsWith(prefix)) {
+                            store.delete(mapping.id, m)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                SyncRemoteDownload.logMaterializeFailed(
+                    "ForcePullMapping.EarlyPrune",
+                    path,
+                    "-",
+                    e.message ?: e.javaClass.simpleName
+                )
+            }
+        }
     }
 
     /**
