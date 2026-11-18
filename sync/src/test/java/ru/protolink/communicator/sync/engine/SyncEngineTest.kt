@@ -512,6 +512,68 @@ class SyncEngineTest {
     }
 
     @Test
+    fun agentsRoleQueuePaths_protectsOpenQueues_notDone() {
+        assertThat(
+            AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(
+                "Protolink.ru/Agents/roles/frontend-developer/todo/P1-task/index.html"
+            )
+        ).isTrue()
+        assertThat(
+            AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(
+                "Protolink.ru/Agents/roles/frontend-developer/done/P1-old/index.html"
+            )
+        ).isFalse()
+        assertThat(
+            AgentsRoleQueuePaths.shouldSkipFolderMaterialize(
+                "Protolink.ru/Agents/roles/fe/todo/ghost-shell"
+            )
+        ).isTrue()
+        assertThat(
+            AgentsRoleQueuePaths.shouldSkipFolderMaterialize(
+                "Protolink.ru/Agents/roles/fe/todo"
+            )
+        ).isFalse()
+    }
+
+    @Test
+    fun forcePull_doesNotPruneAgentsRoleOpenQueueTaskPage() = runTest {
+        val (store, fs, remote) = harness()
+        remote.seedFolder("films-f", "cloud-root", "films")
+        remote.seedFile("films-i", "films-f", "index.html", "movie".toByteArray())
+        val planted =
+            "Protolink.ru/Agents/roles/frontend-developer/todo/P1-20261118-planted/index.html"
+        fs.writeFile(root, planted, "planted-agents-queue".toByteArray())
+        fs.writeFile(root, "ghost-root.txt", "junk".toByteArray())
+
+        SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(fs.exists(root, planted)).isTrue()
+        assertThat(String(fs.readFile(root, planted))).isEqualTo("planted-agents-queue")
+        assertThat(fs.exists(root, "ghost-root.txt")).isFalse()
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
+    }
+
+    @Test
+    fun forcePull_skipsAgentsOpenQueueFolderOnlyMaterialize() = runTest {
+        val (store, fs, remote) = harness()
+        remote.seedFolder("films-f", "cloud-root", "films")
+        remote.seedFile("films-i", "films-f", "index.html", "movie".toByteArray())
+        remote.seedFolder("pl-ru", "cloud-root", "Protolink.ru")
+        remote.seedFolder("agents", "pl-ru", "Agents")
+        remote.seedFolder("roles", "agents", "roles")
+        remote.seedFolder("role", "roles", "frontend-developer")
+        remote.seedFolder("todo", "role", "todo")
+        remote.seedFolder("shell", "todo", "ghost-shell")
+
+        SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(
+            fs.exists(root, "Protolink.ru/Agents/roles/frontend-developer/todo/ghost-shell")
+        ).isFalse()
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
+    }
+
+    @Test
     fun forcePull_emptyRemoteBytes_writesAndContinues() = runTest {
         val (store, fs, remote) = harness()
         remote.seedFolder("films-f", "cloud-root", "films")

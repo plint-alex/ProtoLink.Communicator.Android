@@ -1783,8 +1783,22 @@ class SyncEngine(
         val ghosts = locals
             .filter { PathUtil.nameOf(it.relativePath).lowercase() !in remoteNames }
             .sortedByDescending { PathUtil.normalize(it.relativePath).count { c -> c == '/' } }
+        val localPaths = try {
+            fs.snapshot(mapping.localRootPath).map { PathUtil.normalize(it.relativePath) }
+        } catch (_: Exception) {
+            emptyList()
+        }
         for (entry in ghosts) {
             val path = PathUtil.normalize(entry.relativePath)
+            if (AgentsRoleQueuePaths.isForcePruneProtected(path, localPaths)) {
+                SyncRemoteDownload.logMaterializeFailed(
+                    "ForcePullMapping.EarlyPrune.AgentsQueueSkip",
+                    path,
+                    "-",
+                    "skip prune of Agents role open queue path"
+                )
+                continue
+            }
             try {
                 if (fs.exists(mapping.localRootPath, path)) {
                     fs.delete(mapping.localRootPath, path, entry.isFolder)
@@ -1823,6 +1837,15 @@ class SyncEngine(
         val path = PathUtil.normalize(loc.relativePath)
         remotePaths.add(path)
         if (loc.entry.isFolder) {
+            if (AgentsRoleQueuePaths.shouldSkipFolderMaterialize(path)) {
+                SyncRemoteDownload.logMaterializeFailed(
+                    "ForcePullMapping.AgentsQueueSkipMkdir",
+                    path,
+                    loc.entry.id,
+                    "skip folder materialize under Agents role open queue"
+                )
+                return 0
+            }
             try {
                 if (!fs.exists(mapping.localRootPath, path)) {
                     fs.createDirectory(mapping.localRootPath, path)
@@ -1898,9 +1921,19 @@ class SyncEngine(
     private fun pruneLocalAbsentFromRemote(mapping: SyncMapping, remotePaths: Set<String>) {
         val snap = fs.snapshot(mapping.localRootPath)
             .sortedByDescending { PathUtil.normalize(it.relativePath).count { c -> c == '/' } }
+        val localPaths = snap.map { PathUtil.normalize(it.relativePath) }
         for (entry in snap) {
             val path = PathUtil.normalize(entry.relativePath)
             if (path in remotePaths) continue
+            if (AgentsRoleQueuePaths.isForcePruneProtected(path, localPaths)) {
+                SyncRemoteDownload.logMaterializeFailed(
+                    "ForcePullMapping.Prune.AgentsQueueSkip",
+                    path,
+                    "-",
+                    "skip prune of Agents role open queue path"
+                )
+                continue
+            }
             try {
                 if (fs.exists(mapping.localRootPath, path)) {
                     fs.delete(mapping.localRootPath, path, entry.isFolder)
@@ -1918,6 +1951,7 @@ class SyncEngine(
         for (meta in store.getAll(mapping.id)) {
             val path = PathUtil.normalize(meta.relativePath)
             if (path in remotePaths) continue
+            if (AgentsRoleQueuePaths.isForcePruneProtected(path, localPaths)) continue
             store.delete(mapping.id, path)
         }
     }
