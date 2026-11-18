@@ -42,7 +42,7 @@ code{padding:1px 4px;}
 html{color-scheme:light;background:#ffffff;}
 html,body{height:100%;margin:0;background:#ffffff;color:#111111;}
 body{font-family:sans-serif;line-height:1.6;padding:12px 14px 24px;min-height:100%;box-sizing:border-box;}
-#editor{outline:none;min-height:50vh;font-size:16px;padding:4px 2px 24vh;box-sizing:border-box;background:#ffffff;color:#111111;-webkit-user-select:text;user-select:text;}
+#editor{outline:none;min-height:50vh;font-size:16px;padding:4px 2px 24vh;box-sizing:border-box;background:#ffffff;color:#111111;-webkit-user-select:text;user-select:text;-webkit-user-modify:read-write;user-modify:read-write;}
 #editor:focus{outline:none;}
 h1,h2,h3{margin-top:1em;margin-bottom:0.5em;}
 p{margin:0.5em 0;}
@@ -52,7 +52,7 @@ a{color:#0366d6;text-decoration:underline;}
 </style>
 </head>
 <body>
-<div id="editor" contenteditable="true" data-content-base64="$base64"></div>
+<div id="editor" contenteditable="true" inputmode="text" enterkeyhint="enter" data-content-base64="$base64"></div>
 <script>
 $script
 </script>

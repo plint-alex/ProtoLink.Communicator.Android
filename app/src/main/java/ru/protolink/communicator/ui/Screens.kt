@@ -3144,12 +3144,15 @@ private fun NotesEditorPane(
                         runCatching {
                             context.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
                         }
+                    },
+                    onEditorActivate = {
+                        getWebView()?.let { NotesWebViewIme.requestShow(it) }
                     }
                 )
             }
             AndroidView(
                 factory = { ctx ->
-                    // NotesEditableWebView: onCheckIsTextEditor + touch focus so IME opens on contenteditable.
+                    // NotesEditableWebView: onCheckIsTextEditor + explicit showSoftInput / #editor focus.
                     NotesEditableWebView(ctx).apply {
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
@@ -3306,11 +3309,15 @@ private fun flushNoteAndLeave(
 
 private fun loadNotesEditorDocument(web: WebView, context: android.content.Context, content: String) {
     val editable = NotesEditorHtml.wrap(context, content)
-    val encoded = android.util.Base64.encodeToString(
-        editable.toByteArray(Charsets.UTF_8),
-        android.util.Base64.NO_WRAP
+    // loadDataWithBaseURL (not bare loadData/base64): Chromium IME + contenteditable are more
+    // reliable with a real https origin on OEM WebViews (Huawei ADY-LX9).
+    web.loadDataWithBaseURL(
+        "https://appassets.androidplatform.net/notes-editor/",
+        editable,
+        "text/html",
+        "utf-8",
+        null
     )
-    web.loadData(encoded, "text/html; charset=utf-8", "base64")
 }
 
 /** Keep caret visible above the soft keyboard inside the contenteditable WebView. */
@@ -3352,7 +3359,8 @@ private class NotesEditorBridge(
     private val onDirty: () -> Unit,
     private val onSelectionState: (Boolean, Boolean, Boolean, Boolean, Boolean, Boolean, String) -> Unit,
     private val onRequestLink: () -> Unit,
-    private val onOpenLink: (String) -> Unit
+    private val onOpenLink: (String) -> Unit,
+    private val onEditorActivate: () -> Unit = {}
 ) {
     private val main = Handler(Looper.getMainLooper())
 
@@ -3365,6 +3373,7 @@ private class NotesEditorBridge(
                 when (obj.optString("type")) {
                     "contentChanged" -> onDirty()
                     "requestLink" -> onRequestLink()
+                    "editorActivate" -> onEditorActivate()
                     "openLink" -> {
                         val url = obj.optString("url")
                         if (url.startsWith("http://") || url.startsWith("https://")) onOpenLink(url)

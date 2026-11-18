@@ -893,6 +893,15 @@
   editor.addEventListener('keyup', scheduleSelectionState);
   editor.addEventListener('mouseup', scheduleSelectionState);
 
+  // Android host: after a user gesture, ask native to showSoftInput (OEM WebViews often leave
+  // mServedView set but mShowRequested=false without an explicit IMM request).
+  function notifyEditorActivate() {
+    editor.focus();
+    postToHost({ type: 'editorActivate' });
+  }
+  editor.addEventListener('pointerup', notifyEditorActivate);
+  editor.addEventListener('touchend', notifyEditorActivate);
+
   window.getHtml = function () {
     return editor.innerHTML || '';
   };
