@@ -37,6 +37,7 @@ import ru.protolink.communicator.sync.engine.SyncEngine
 import ru.protolink.communicator.sync.model.SyncMapping
 import ru.protolink.communicator.sync.ports.MetadataStore
 import ru.protolink.communicator.syncadapt.ApiRemoteCloud
+import ru.protolink.communicator.syncadapt.ForceStatusGuard
 import ru.protolink.communicator.syncadapt.SafLocalFileSystem
 import ru.protolink.communicator.syncadapt.SyncFlight
 import ru.protolink.communicator.data.messenger.MessengerChatFolderResolver
@@ -498,7 +499,7 @@ class MainViewModel @Inject constructor(
                     requestFullSync()
                 }
             }
-            _state.update { it.copy(status = "Live update${commandType?.let { t -> " ($t)" } ?: ""}") }
+            setStatusUnlessForce("Live update${commandType?.let { t -> " ($t)" } ?: ""}")
         }
     }
 
@@ -2781,6 +2782,22 @@ class MainViewModel @Inject constructor(
         requestFullSync()
     }
 
+    /** Force (or conflict resolve) owns the status banner — do not clobber with coalesce text. */
+    private fun forceOwnsStatus(): Boolean =
+        ForceStatusGuard.ownsStatus(_state.value.forceRunning, SyncFlight.forcePreferred.get())
+
+    /** Apply [status] only when Force does not own the banner (1.0.66 FORCE_NO_PROGRESS). */
+    private fun setStatusUnlessForce(status: String) {
+        _state.update { cur ->
+            val next = ForceStatusGuard.statusOrNull(
+                forceRunning = cur.forceRunning,
+                forcePreferred = SyncFlight.forcePreferred.get(),
+                proposed = status
+            ) ?: return@update cur
+            cur.copy(status = next)
+        }
+    }
+
     /** Full reconcile (startup / SignalR / manual). Coalesces if busy. */
     private fun requestFullSync() {
         viewModelScope.launch {
@@ -2791,14 +2808,13 @@ class MainViewModel @Inject constructor(
                 return@launch
             }
             if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) {
+                // Win parity: defer only — do not overwrite "Force download…" / lock wait.
                 SyncFlight.deferredFull.set(true)
-                _state.update { it.copy(status = "Full sync queued…") }
                 return@launch
             }
             runCatching { healDuplicateSameNamedMappings() }
             if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) {
                 SyncFlight.deferredFull.set(true)
-                _state.update { it.copy(status = "Full sync queued…") }
                 return@launch
             }
             val mappings = mappingStore.load()
@@ -2813,7 +2829,7 @@ class MainViewModel @Inject constructor(
             }
             if (!SyncFlight.mutex.tryLock()) {
                 SyncFlight.deferredFull.set(true)
-                _state.update { it.copy(status = "Full sync queued…") }
+                setStatusUnlessForce("Full sync queued…")
                 return@launch
             }
             // Mutex owner must not be the Force preempt target (1.0.65: cancelling this Job
@@ -2847,7 +2863,8 @@ class MainViewModel @Inject constructor(
                     SyncFlight.deferredFull.getAndSet(false) && !SyncFlight.forcePreferred.get()
                 )
                 if (SyncFlight.forcePreferred.get()) {
-                    _state.update { it.copy(syncing = false, status = "Sync yielded to Force") }
+                    // Leave Force banner intact when we yielded mid-pass.
+                    _state.update { it.copy(syncing = false) }
                 } else {
                     _state.update {
                         it.copy(
@@ -3011,12 +3028,17 @@ class MainViewModel @Inject constructor(
                     if (drained == null) break
                     currentFolderId?.let { loadCloudFolder(it) }
                 }
-                _state.update {
-                    it.copy(
-                        status = if (applied > 0) "Uploaded local changes ($applied)" else "No local changes",
-                        syncing = false,
-                        mappings = mappingStore.load()
-                    )
+                // Preempted Force owns the banner — unlock without "No local changes" clobber (1.0.66).
+                if (forceOwnsStatus()) {
+                    _state.update { it.copy(syncing = false, mappings = mappingStore.load()) }
+                } else {
+                    _state.update {
+                        it.copy(
+                            status = if (applied > 0) "Uploaded local changes ($applied)" else "No local changes",
+                            syncing = false,
+                            mappings = mappingStore.load()
+                        )
+                    }
                 }
             } catch (e: CancellationException) {
                 _state.update { it.copy(syncing = false) }
@@ -3119,6 +3141,10 @@ class MainViewModel @Inject constructor(
     fun confirmForceMapping() {
         val pending = _state.value.pendingForce ?: return
         _state.update { it.copy(pendingForce = null) }
+        android.util.Log.e(
+            "ProtoLinkSync",
+            "confirmForceMapping push=${pending.push} cloudFolderId=${pending.cloudFolderId}"
+        )
         runForceMapping(pending.cloudFolderId, push = pending.push)
     }
 
@@ -3148,13 +3174,15 @@ class MainViewModel @Inject constructor(
             _state.update { it.copy(syncError = "Force sync already running") }
             return
         }
+        val forceStatus = if (push) "Force upload…" else "Force download…"
         if (managePreferred) SyncFlight.preemptExclusiveForForce()
         _state.update {
             it.copy(
                 forceRunning = true,
-                status = if (push) "Force upload…" else "Force download…"
+                status = forceStatus
             )
         }
+        android.util.Log.e("ProtoLinkSync", "force ${if (push) "upload" else "download"} started (forceRunning)")
         var locked = false
         val exclusive = currentCoroutineContext()[Job]
         try {
@@ -3169,6 +3197,8 @@ class MainViewModel @Inject constructor(
                 SyncFlight.forcePreferred.set(true)
                 locked = true
             }
+            // Re-assert after lock wait — local push / coalesce may have raced the banner.
+            _state.update { it.copy(forceRunning = true, status = forceStatus) }
             if (exclusive != null) SyncFlight.bindExclusiveJob(exclusive)
             android.util.Log.e("ProtoLinkSync", "force ${if (push) "upload" else "download"} locked, pulling…")
             val count = withContext(Dispatchers.IO) {
@@ -3199,6 +3229,13 @@ class MainViewModel @Inject constructor(
                 )
             }
         } catch (e: CancellationException) {
+            // Do not leave forceRunning stuck — that freezes UI on "Full sync queued…" forever.
+            _state.update {
+                it.copy(
+                    forceRunning = false,
+                    status = "Force sync cancelled"
+                )
+            }
             throw e
         } catch (e: Exception) {
             Log.e("ProtoLinkSync", "force sync failed", e)
@@ -4343,11 +4380,17 @@ fun setNotesRoot(uri: String) {
         // Expand root by default (Windows tree shows root children)
         val expanded = _state.value.notesExpandedIds.ifEmpty { setOf(root.documentId) }
         val rows = NotesTreeBuilder.flattenVisible(root, expanded).map { it.toTreeRow() }
-        _state.update {
-            it.copy(
+        val treeStatus = "Notes tree: ${countFolders(root)} page folder(s)"
+        _state.update { cur ->
+            val status = ForceStatusGuard.statusOrNull(
+                forceRunning = cur.forceRunning,
+                forcePreferred = SyncFlight.forcePreferred.get(),
+                proposed = treeStatus
+            ) ?: cur.status
+            cur.copy(
                 notesExpandedIds = expanded,
                 notesTreeRows = rows,
-                status = "Notes tree: ${countFolders(root)} page folder(s)"
+                status = status
             )
         }
         refreshNotesSiblingFilesSuspend()
