@@ -63,7 +63,13 @@ class SyncWorker @AssistedInject constructor(
                 }
                 SyncFlight.deferredFull.set(false)
                 Log.i(TAG, "Reconcile ${mappings.size} mapping(s)")
-                val result = SyncEngine(metadataStore, localFs, remote).reconcileAll(mappings)
+                val result = SyncFlight.runDeferringToForce {
+                    SyncEngine(metadataStore, localFs, remote).reconcileAll(mappings)
+                }
+                if (result == null) {
+                    Log.i(TAG, "Reconcile yielded to Force")
+                    break
+                }
                 Log.i(TAG, "Done local=${result.localChanges} remote=${result.remoteChanges}")
             } while (SyncFlight.deferredFull.getAndSet(false) && !SyncFlight.forcePreferred.get())
             Result.success()

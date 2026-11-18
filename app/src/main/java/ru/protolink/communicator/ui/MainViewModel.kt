@@ -2835,8 +2835,11 @@ class MainViewModel @Inject constructor(
                                 cloudFolderName = it.cloudFolderName
                             )
                         }
-                        SyncEngine(metadataStore, localFs, remoteCloud).reconcileAll(engineMappings)
-                    }
+                        // Abort mid-reconcile when Force prefers (not only between passes).
+                        SyncFlight.runDeferringToForce {
+                            SyncEngine(metadataStore, localFs, remoteCloud).reconcileAll(engineMappings)
+                        }
+                    } ?: break
                     lastLocal = result.localChanges
                     lastRemote = result.remoteChanges
                     currentFolderId?.let { loadCloudFolder(it) }
@@ -2982,7 +2985,9 @@ class MainViewModel @Inject constructor(
                             cloudFolderName = it.cloudFolderName
                         )
                     }
-                    SyncEngine(metadataStore, localFs, remoteCloud).pushLocalChanges(engineMappings)
+                    SyncFlight.runDeferringToForce {
+                        SyncEngine(metadataStore, localFs, remoteCloud).pushLocalChanges(engineMappings)
+                    } ?: 0
                 }
                 if (applied > 0) {
                     notifyOtherDevices()
@@ -2993,7 +2998,7 @@ class MainViewModel @Inject constructor(
                     SyncFlight.deferredFull.getAndSet(false) && !SyncFlight.forcePreferred.get()
                 ) {
                     val currentMappings = mappingStore.load()
-                    withContext(Dispatchers.IO) {
+                    val drained = withContext(Dispatchers.IO) {
                         val engineMappings = currentMappings.map {
                             SyncMapping(
                                 id = it.cloudFolderId.replace("-", ""),
@@ -3002,8 +3007,11 @@ class MainViewModel @Inject constructor(
                                 cloudFolderName = it.cloudFolderName
                             )
                         }
-                        SyncEngine(metadataStore, localFs, remoteCloud).reconcileAll(engineMappings)
+                        SyncFlight.runDeferringToForce {
+                            SyncEngine(metadataStore, localFs, remoteCloud).reconcileAll(engineMappings)
+                        }
                     }
+                    if (drained == null) break
                     currentFolderId?.let { loadCloudFolder(it) }
                 }
                 _state.update {

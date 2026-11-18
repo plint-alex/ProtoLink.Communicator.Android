@@ -1,6 +1,7 @@
 package ru.protolink.communicator.sync.engine
 
 import com.google.common.truth.Truth.assertThat
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import org.junit.Test
 import ru.protolink.communicator.sync.fakes.InMemoryFileSystem
@@ -1666,5 +1667,51 @@ class SyncEngineTest {
         SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
         assertThat(fs.exists(root, "solo.txt")).isTrue()
         assertThat(remote.childrenOf("cloud-root").any { it.name.equals("solo.txt", true) }).isTrue()
+    }
+
+    /**
+     * Live 1.0.64 FORCE_SYNC_LOCK_TIMEOUT: compare-phase item loops must honour Job cancel
+     * so SyncFlight Force can unlock ≪120s (Win ThrowIfCancellationRequested parity).
+     */
+    @Test
+    fun reconcile_comparePhase_abortsPromptlyOnCancel() = runTest {
+        val (store, fs, inner) = harness()
+        // Seed many same-sized files so compare phase downloads each (hash converge).
+        repeat(40) { i ->
+            val id = "f$i"
+            val name = "n$i.txt"
+            val bytes = "body-$i".toByteArray()
+            inner.seedFile(id, "cloud-root", name, bytes)
+            fs.writeFile(root, name, bytes)
+            store.upsert(
+                SyncItemMeta(
+                    mappingId = mapping.id,
+                    remoteId = id,
+                    parentRemoteId = "cloud-root",
+                    relativePath = name,
+                    isFolder = false,
+                    sizeBytes = bytes.size.toLong(),
+                    contentHash = ContentHashUtil.sha256Hex(bytes),
+                    remoteUpdateTime = Instant.now()
+                )
+            )
+        }
+        var downloads = 0
+        val delaying = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun downloadFile(entityId: String): ByteArray? {
+                downloads++
+                kotlinx.coroutines.delay(50)
+                return inner.downloadFile(entityId)
+            }
+        }
+        val job = launch {
+            SyncEngine(store, fs, delaying).reconcileAll(listOf(mapping))
+        }
+        kotlinx.coroutines.delay(120)
+        job.cancel()
+        job.join()
+        assertThat(job.isCancelled).isTrue()
+        // Must not have finished all 40 delayed downloads after cancel.
+        assertThat(downloads).isLessThan(40)
     }
 }

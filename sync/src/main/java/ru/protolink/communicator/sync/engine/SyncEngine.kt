@@ -174,6 +174,7 @@ class SyncEngine(
         }
         var applied = 0
         for (mapping in ready) {
+            coroutineContext.ensureActive()
             val dirty = mutableSetOf<String>()
             applied += applyLocalPhase(mapping, dirty, skipSizeUpdates = false, remoteInMapping = emptyList())
             store.setLastSyncUtc(mapping.id, Instant.now())
@@ -206,6 +207,9 @@ class SyncEngine(
         var reads = 0
 
         for (meta in store.getAll(mapping.id)) {
+            // Force SyncFlight cancel must abort mid-phase (live 1.0.64: phase-boundary-only
+            // ensureActive left mutex held >120s on MyNotesFolder → FORCE_SYNC_LOCK_TIMEOUT).
+            coroutineContext.ensureActive()
             if (meta.isFolder) continue
             val located = remoteById[meta.remoteId] ?: continue
             if (located.mappingId != mapping.id) continue
@@ -319,6 +323,7 @@ class SyncEngine(
         walkRemote(mapping.cloudFolderId, mapping.id, "", located)
         val enriched = enrichRemoteSizes(located)
         for (loc in enriched.sortedBy { it.relativePath.count { c -> c == '/' } }) {
+            coroutineContext.ensureActive()
             var fileBytes: ByteArray? = null
             try {
                 if (loc.entry.isFolder) {
@@ -429,6 +434,7 @@ class SyncEngine(
             .sortedByDescending { it.meta.relativePath.count { c -> c == '/' } }
 
         for (r in renames) {
+            coroutineContext.ensureActive()
             val newParentPath = PathUtil.parentOf(r.newRelativePath)
             val newParentId = resolveParentId(mapping, newParentPath)
                 ?: mapping.cloudFolderId
@@ -451,6 +457,7 @@ class SyncEngine(
         }
 
         for (a in adds) {
+            coroutineContext.ensureActive()
             val path = PathUtil.normalize(a.entry.relativePath)
             val existingRemote = remoteByPath[path]
             // Meta incomplete but cloud already has this path: adopt id (and upload local edits).
@@ -622,6 +629,7 @@ class SyncEngine(
 
         if (!skipSizeUpdates) {
             for (u in updates) {
+                coroutineContext.ensureActive()
                 if (u.meta.isFolder) {
                     store.upsert(u.meta.copy(sizeBytes = u.newSize))
                 } else {
@@ -642,10 +650,12 @@ class SyncEngine(
         } else {
             // Folder size bookkeeping + same-size content uploads (hash-driven).
             for (u in updates.filter { it.meta.isFolder }) {
+                coroutineContext.ensureActive()
                 store.upsert(u.meta.copy(sizeBytes = u.newSize))
                 applied++
             }
             for (u in updates.filter { !it.meta.isFolder }) {
+                coroutineContext.ensureActive()
                 // Content convergence is owned by applyComparePhase (always hash-verify).
                 // Do not upload here — that overwrote unknown cloud content when download failed.
                 store.upsert(u.meta.copy(sizeBytes = u.newSize))
@@ -653,6 +663,7 @@ class SyncEngine(
         }
 
         for (rm in removes) {
+            coroutineContext.ensureActive()
             remote.delete(rm.meta.remoteId)
             store.delete(mapping.id, rm.meta.relativePath)
             dirty.add(PathUtil.normalize(rm.meta.relativePath))
@@ -676,6 +687,7 @@ class SyncEngine(
 
         var applied = 0
         for (c in changes) {
+            coroutineContext.ensureActive()
             when (c) {
                 is RemoteChange.Renamed -> {
                     if (c.meta.mappingId != mapping.id) continue
@@ -855,6 +867,7 @@ class SyncEngine(
         throttle: Semaphore,
         metaByRemoteId: Map<String, SyncItemMeta>
     ) {
+        coroutineContext.ensureActive()
         // Cold (empty meta): IncludeValues listing per folder.
         // Warm reconcile: structure-only first; if every child is already in meta, reuse
         // RelativePath names. Any unknown child → one IncludeValues re-list for that folder.
