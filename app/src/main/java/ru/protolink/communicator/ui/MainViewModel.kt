@@ -67,6 +67,7 @@ import ru.protolink.communicator.util.MessengerSendStateMachine
 import androidx.core.content.FileProvider
 import ru.protolink.communicator.util.NoteRemoteIdResolver
 import ru.protolink.communicator.util.NotesDeleteNavigate
+import ru.protolink.communicator.util.NotesTreeCreateVisibility
 import ru.protolink.communicator.util.NotesTreeShare
 import ru.protolink.communicator.util.PhotosLibrary
 import ru.protolink.communicator.util.ShareAccountStrings
@@ -4377,8 +4378,9 @@ fun setNotesRoot(uri: String) {
             NotesTreeBuilder.build(appContext, treeUri)
         }
         notesRootCache = root
-        // Expand root by default (Windows tree shows root children)
-        val expanded = _state.value.notesExpandedIds.ifEmpty { setOf(root.documentId) }
+        // Always keep root expanded (Windows shows root children). Do not rely on ifEmpty alone —
+        // a non-empty set that omitted root hid every page after create/refresh.
+        val expanded = _state.value.notesExpandedIds + root.documentId
         val rows = NotesTreeBuilder.flattenVisible(root, expanded).map { it.toTreeRow() }
         val treeStatus = "Notes tree: ${countFolders(root)} page folder(s)"
         _state.update { cur ->
@@ -4394,6 +4396,18 @@ fun setNotesRoot(uri: String) {
             )
         }
         refreshNotesSiblingFilesSuspend()
+    }
+
+    /** Re-flatten [notesRootCache] with current expanded ids (no SAF walk). */
+    private fun applyNotesTreeRowsFromCache() {
+        val root = notesRootCache ?: return
+        val expanded = _state.value.notesExpandedIds + root.documentId
+        _state.update {
+            it.copy(
+                notesExpandedIds = expanded,
+                notesTreeRows = NotesTreeBuilder.flattenVisible(root, expanded).map { r -> r.toTreeRow() }
+            )
+        }
     }
 
     private fun countFolders(node: NotesTreeBuilder.Node): Int =
@@ -4725,19 +4739,19 @@ fun setNotesRoot(uri: String) {
                 return@launch
             }
             val childRel = if (parent.isEmpty()) folderName else "$parent/$folderName"
+            val treeUri = Uri.parse(rootUri)
+            // Prefer real SAF parent id from tree cache — guessed "$root/$rel" is wrong on some OEMs.
+            val cachedParentId = notesRootCache?.let { findNotesNodeByRelativePath(it, parent)?.safDocumentId }
             val created: CreatedNoteRefs
             try {
                 created = withContext(Dispatchers.IO) {
-                    val treeUri = Uri.parse(rootUri)
-                    // Duplicate sibling check (case-insensitive).
-                    val parentId = if (parent.isEmpty()) {
-                        ru.protolink.communicator.data.SafTreeLister.treeDocumentId(treeUri)
-                    } else {
-                        NotesTreeBuilder.folderDocumentId(treeUri, parent)
-                    }
-                    val siblings = ru.protolink.communicator.data.SafTreeLister.listChildren(
-                        appContext, treeUri, parentId
-                    )
+                    val parentId = cachedParentId?.takeIf { it.isNotBlank() }
+                        ?: if (parent.isEmpty()) {
+                            SafTreeLister.treeDocumentId(treeUri)
+                        } else {
+                            NotesTreeBuilder.folderDocumentId(treeUri, parent)
+                        }
+                    val siblings = SafTreeLister.listChildren(appContext, treeUri, parentId)
                     if (siblings.any { it.isDirectory && it.name.equals(folderName, ignoreCase = true) }) {
                         throw IllegalStateException("A note with this name already exists")
                     }
@@ -4750,14 +4764,12 @@ fun setNotesRoot(uri: String) {
                         html.toByteArray(Charsets.UTF_8)
                     )
                     // Resolve *actual* SAF ids (guess "$root/$rel" is wrong on some OEMs).
-                    val folderEntry = ru.protolink.communicator.data.SafTreeLister.listChildren(
-                        appContext, treeUri, parentId
-                    ).firstOrNull { it.isDirectory && it.name.equals(folderName, ignoreCase = true) }
+                    val folderEntry = SafTreeLister.listChildren(appContext, treeUri, parentId)
+                        .firstOrNull { it.isDirectory && it.name.equals(folderName, ignoreCase = true) }
                     val safId = folderEntry?.documentId
                         ?: NotesTreeBuilder.folderDocumentId(treeUri, childRel)
-                    val indexUri = ru.protolink.communicator.data.SafTreeLister.resolveIndexHtml(
-                        appContext, treeUri, safId
-                    ) ?: NotesTreeBuilder.resolveIndexViaDocumentFile(appContext, treeUri, childRel)
+                    val indexUri = SafTreeLister.resolveIndexHtml(appContext, treeUri, safId)
+                        ?: NotesTreeBuilder.resolveIndexViaDocumentFile(appContext, treeUri, childRel)
                     CreatedNoteRefs(safId, folderEntry?.uri, indexUri)
                 }
             } catch (e: Exception) {
@@ -4778,32 +4790,68 @@ fun setNotesRoot(uri: String) {
                 }
                 return@launch
             }
-            _state.update { it.copy(pendingCreateNote = null, status = "Created “$folderName”") }
-            val treeUri = Uri.parse(rootUri)
             val folderUri = created.folderUri
-                ?: ru.protolink.communicator.data.SafTreeLister.documentUri(treeUri, created.safDocumentId)
-            val openRow = NoteTreeRow(
-                documentId = folderUri.toString(),
-                safDocumentId = created.safDocumentId,
+                ?: SafTreeLister.documentUri(treeUri, created.safDocumentId)
+            val leaf = NotesTreeCreateVisibility.CreatedLeaf(
                 name = folderName,
                 relativePath = childRel,
-                depth = childRel.count { it == '/' },
-                hasChildren = false,
-                expanded = false,
+                documentId = folderUri.toString(),
+                safDocumentId = created.safDocumentId,
                 folderUri = folderUri.toString(),
                 indexUri = created.indexUri?.toString()
             )
-            // Await open — selectNotesNode is fire-and-forget and raced with tree refresh.
-            openNotesNode(openRow)
-            val opened = !_state.value.selectedNoteIndexUri.isNullOrBlank() &&
-                _state.value.selectedNoteRelativePath == childRel
-            writeCreateNoteDebugResult(
-                if (opened) "OK open=$childRel index=${_state.value.selectedNoteIndexUri}"
-                else "FAIL open=$childRel status=${_state.value.status}"
+            // Optimistic merge + expand so the new row is visible before any SAF re-walk finishes.
+            val prior = notesRootCache
+            if (prior != null) {
+                val (merged, expanded) = NotesTreeCreateVisibility.ensureCreatedVisible(
+                    prior, leaf, _state.value.notesExpandedIds
+                )
+                notesRootCache = merged
+                _state.update {
+                    it.copy(
+                        pendingCreateNote = null,
+                        status = "Created “$folderName”",
+                        notesExpandedIds = expanded,
+                        notesTreeRows = NotesTreeBuilder.flattenVisible(merged, expanded)
+                            .map { r -> r.toTreeRow() }
+                    )
+                }
+            } else {
+                _state.update { it.copy(pendingCreateNote = null, status = "Created “$folderName”") }
+            }
+            // SAF refresh may lag on some OEMs — keep synthetic leaf if scan misses it.
+            refreshNotesTreeSuspend()
+            val rootAfter = notesRootCache
+            if (rootAfter != null && findNotesNodeByRelativePath(rootAfter, childRel) == null) {
+                val (merged, expanded) = NotesTreeCreateVisibility.ensureCreatedVisible(
+                    rootAfter, leaf, _state.value.notesExpandedIds
+                )
+                notesRootCache = merged
+                _state.update {
+                    it.copy(
+                        notesExpandedIds = expanded,
+                        notesTreeRows = NotesTreeBuilder.flattenVisible(merged, expanded)
+                            .map { r -> r.toTreeRow() }
+                    )
+                }
+            } else if (rootAfter != null) {
+                expandPathAncestors(childRel)
+                applyNotesTreeRowsFromCache()
+            }
+            // Open from refreshed/merged cache (correct depth + ids) — never flatten a stale cache
+            // that omits the new leaf (that wiped create→visible on compact Back).
+            openNoteByRelativePath(childRel)
+            val visible = NotesTreeCreateVisibility.isRelativePathInTree(
+                _state.value.notesTreeRows.map { it.relativePath },
+                childRel
             )
-            refreshNotesTreeSuspend()
-            expandPathAncestors(childRel)
-            refreshNotesTreeSuspend()
+            val opened = !_state.value.selectedNoteIndexUri.isNullOrBlank() &&
+                NotesTreeCreateVisibility.normalizeRelative(_state.value.selectedNoteRelativePath.orEmpty())
+                    .equals(NotesTreeCreateVisibility.normalizeRelative(childRel), ignoreCase = true)
+            writeCreateNoteDebugResult(
+                if (opened && visible) "OK open=$childRel visible=1 index=${_state.value.selectedNoteIndexUri}"
+                else "FAIL open=$childRel opened=$opened visible=$visible status=${_state.value.status}"
+            )
             requestLocalPush()
         }
     }
@@ -4840,16 +4888,10 @@ fun setNotesRoot(uri: String) {
 
     private fun expandPathAncestors(relativePath: String) {
         val root = notesRootCache ?: return
-        val parts = relativePath.replace('\\', '/').trim('/').split('/').filter { it.isNotEmpty() }
-        val ids = mutableSetOf(root.documentId)
-        var cur = root
-        for (part in parts) {
-            val child = cur.children.firstOrNull { it.name.equals(part, ignoreCase = true) } ?: break
-            ids.add(child.documentId)
-            cur = child
-        }
-        // Also expand parent chain without the leaf if leaf is the new page (still expand parents).
-        _state.update { it.copy(notesExpandedIds = it.notesExpandedIds + ids) }
+        val expanded = NotesTreeCreateVisibility.expandedIdsForPath(
+            root, relativePath, _state.value.notesExpandedIds
+        )
+        _state.update { it.copy(notesExpandedIds = expanded) }
     }
 
     /** Windows parity: selecting a folder node opens/edits that folder's index.html. */
@@ -4899,13 +4941,19 @@ fun setNotesRoot(uri: String) {
             }
             val body = html.ifBlank { "<p><br></p>" }
             val root = notesRootCache
-            val expanded = if (root != null && row.hasChildren) {
-                _state.value.notesExpandedIds + row.documentId
-            } else {
-                _state.value.notesExpandedIds
+            val pathInCache = root != null &&
+                findNotesNodeByRelativePath(root, row.relativePath) != null
+            val expanded = when {
+                root == null -> _state.value.notesExpandedIds
+                row.hasChildren -> _state.value.notesExpandedIds + row.documentId + root.documentId
+                else -> _state.value.notesExpandedIds + root.documentId
             }
-            val rows = root?.let { NotesTreeBuilder.flattenVisible(it, expanded).map { r -> r.toTreeRow() } }
-                ?: _state.value.notesTreeRows
+            // Do not flatten a cache that omits the open path — that wiped a just-created row.
+            val rows = if (root != null && pathInCache) {
+                NotesTreeBuilder.flattenVisible(root, expanded).map { r -> r.toTreeRow() }
+            } else {
+                _state.value.notesTreeRows
+            }
             _state.update {
                 it.copy(
                     selectedNotePath = row.name,
