@@ -140,6 +140,7 @@ Long-press на узле → меню: **«Новая заметка здесь�
 
 - 2026-10-09 — v1 UI+SAF create: `MainViewModel.createNote`, FAB на `NotesTreePane`, диалог `New note`, overflow в редакторе.
 - 2026-10-09 — после create: `await openNotesNode` + реальные SAF ids (раньше fire-and-forget → «не открывается»). Self-test: `files/force_create_note` → `files/create_note_last.txt`.
+- 2026-11-19 — create→tree visible P0: `NotesTreeCreateVisibility` optimistic merge + expand/reflatten **before** open; prefer cached parent SAF id; `refreshNotesTree` always keeps root expanded; `openNotesNode` must not flatten a cache that omits the open path. Ship **1.0.69**/vc**70** `b7850b8`.
 
 ## 11. Вне скоупа v1
 
