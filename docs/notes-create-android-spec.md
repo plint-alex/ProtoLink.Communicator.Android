@@ -142,6 +142,7 @@ Long-press на узле → меню: **«Новая заметка здесь�
 - 2026-10-09 — после create: `await openNotesNode` + реальные SAF ids (раньше fire-and-forget → «не открывается»). Self-test: `files/force_create_note` → `files/create_note_last.txt`.
 - 2026-11-19 — create→tree visible P0: `NotesTreeCreateVisibility` optimistic merge + expand/reflatten **before** open; prefer cached parent SAF id; `refreshNotesTree` always keeps root expanded; `openNotesNode` must not flatten a cache that omits the open path. Ship **1.0.69**/vc**70** `b7850b8`.
 - 2026-11-19 — SAF refresh wipe fix: register `pendingCreatedNotes` before refresh; every `refreshNotesTreeSuspend` runs `applyPendingCreates` (re-insert until SAF lists the leaf) + refresh generation so slower stale walks cannot clobber. Ship **1.0.71**/vc**72** (`P0-20261119-android-notes-create-wiped-by-saf-refresh`).
+- 2026-11-19 — init-order NPE: declare `notesTreeRefreshGeneration` + `pendingCreatedNotes` (+ `notesRootCache`) **above** `MainViewModel.init` — Kotlin class-body order means `init → refreshNotesTree` can hit a still-null `AtomicInteger` when the field is below `init` (1.0.71 crash). Ship **1.0.72**/vc**73** `91bc4a2` (`P0-20261119-fix-android-notes-refresh-generation-init-order`).
 
 ## 11. Вне скоупа v1
 
