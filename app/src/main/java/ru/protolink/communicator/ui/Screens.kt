@@ -3149,11 +3149,10 @@ private fun NotesEditorPane(
             }
             AndroidView(
                 factory = { ctx ->
-                    WebView(ctx).apply {
+                    // NotesEditableWebView: onCheckIsTextEditor + touch focus so IME opens on contenteditable.
+                    NotesEditableWebView(ctx).apply {
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
-                        isFocusable = true
-                        isFocusableInTouchMode = true
                         addJavascriptInterface(bridge, "ProtoLinkNotes")
                         webViewClient = object : WebViewClient() {
                             override fun onPageFinished(view: WebView?, url: String?) {

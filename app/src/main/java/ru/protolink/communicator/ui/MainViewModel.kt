@@ -4956,10 +4956,13 @@ fun setNotesRoot(uri: String) {
     private var notesDiskPollJob: Job? = null
     /** Fingerprint of open note on disk after our last load/save; poller ignores matches. */
     private var notesDiskFingerprint: String? = null
+    /** Latest cleaned HTML from the editor; debounce timer always persists this, not a stale capture. */
+    private var pendingNotesSaveHtml: String? = null
 
     fun clearSelectedNote() {
         notesSaveJob?.cancel()
         notesSaveJob = null
+        pendingNotesSaveHtml = null
         stopNotesDiskPoller()
         _state.update {
             it.copy(
@@ -5047,19 +5050,32 @@ fun setNotesRoot(uri: String) {
     fun scheduleSaveSelectedNote(html: String) {
         if (_state.value.selectedNoteIndexUri.isNullOrBlank()) return
         val cleaned = healJsEscapedHtml(html)
-        if (cleaned == _state.value.notesContent && !_state.value.notesDirty) return
+        val fp = ContentHashUtil.sha256Hex(cleaned.toByteArray(Charsets.UTF_8))
+        if (NotesAutosavePolicy.shouldSkipSave(fp, notesDiskFingerprint, _state.value.notesDirty)) {
+            return
+        }
+        if (NotesAutosavePolicy.shouldClearDirtyWithoutWrite(fp, notesDiskFingerprint, _state.value.notesDirty)) {
+            notesSaveJob?.cancel()
+            notesSaveJob = null
+            pendingNotesSaveHtml = null
+            _state.update { it.copy(notesDirty = false, status = "No changes to save") }
+            return
+        }
+        pendingNotesSaveHtml = cleaned
         markNotesDirty()
         _state.update { it.copy(status = "Changes will be saved in 5 seconds…") }
         notesSaveJob?.cancel()
         notesSaveJob = viewModelScope.launch {
             delay(5_000)
-            persistSelectedNote(cleaned)
+            val toSave = pendingNotesSaveHtml ?: return@launch
+            persistSelectedNote(toSave)
         }
     }
 
     fun cancelNotesPendingSave() {
         notesSaveJob?.cancel()
         notesSaveJob = null
+        pendingNotesSaveHtml = null
     }
 
     /** Immediate save (e.g. leave note). */
@@ -5176,9 +5192,12 @@ fun setNotesRoot(uri: String) {
                 } ?: error("Cannot open output stream")
             }
             notesDiskFingerprint = ContentHashUtil.sha256Hex(bytes)
+            // Do not echo cleaned HTML into notesContent while the note is open — the live
+            // WebView is source of truth. Echoing remounts/applies #editor and can wipe
+            // keystrokes typed after getHtml (NotesAutosavePolicy.shouldEchoNotesContentAfterLocalSave).
+            pendingNotesSaveHtml = null
             _state.update {
                 it.copy(
-                    notesContent = cleaned,
                     notesDirty = false,
                     notesReloadPrompt = false,
                     status = "Saved ${_state.value.selectedNotePath}"
