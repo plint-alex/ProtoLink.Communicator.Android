@@ -358,6 +358,24 @@ class MainViewModel @Inject constructor(
     private var previewLoadJob: Job? = null
     private var pasteResolveJob: Job? = null
 
+    /**
+     * Notes tree refresh state used from [init] (and later create/refresh paths).
+     * Must stay **above** [init]: Kotlin runs property initializers / init in class-body order,
+     * and [refreshNotesTree] can run its coroutine body before later fields are assigned
+     * (1.0.71 NPE on notesTreeRefreshGeneration when declared below init).
+     */
+    private var notesRootCache: NotesTreeBuilder.Node? = null
+
+    /**
+     * Just-created Notes pages kept until a SAF walk lists them.
+     * Overlapping refreshNotesTree jobs otherwise replace [notesRootCache] and wipe the row.
+     */
+    private val pendingCreatedNotes =
+        java.util.concurrent.ConcurrentHashMap<String, NotesTreeCreateVisibility.CreatedLeaf>()
+
+    /** Monotonic id so a slower older SAF walk cannot apply after a newer refresh. */
+    private val notesTreeRefreshGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+
     init {
         refreshAuth()
         _state.update {
@@ -4355,18 +4373,6 @@ fun setNotesRoot(uri: String) {
         }
         refreshNotesTree()
     }
-
-    private var notesRootCache: NotesTreeBuilder.Node? = null
-
-    /**
-     * Just-created Notes pages kept until a SAF walk lists them.
-     * Overlapping refreshNotesTree jobs otherwise replace [notesRootCache] and wipe the row.
-     */
-    private val pendingCreatedNotes =
-        java.util.concurrent.ConcurrentHashMap<String, NotesTreeCreateVisibility.CreatedLeaf>()
-
-    /** Monotonic id so a slower older SAF walk cannot apply after a newer refresh. */
-    private val notesTreeRefreshGeneration = java.util.concurrent.atomic.AtomicInteger(0)
 
     /** Survives loadMessages races that rewrite state.messages. */
     private val pendingChatSends = java.util.concurrent.ConcurrentHashMap<String, MessageItem>()
