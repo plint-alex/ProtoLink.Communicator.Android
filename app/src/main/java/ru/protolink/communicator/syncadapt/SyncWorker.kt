@@ -13,8 +13,6 @@ import androidx.work.WorkerParameters
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.currentCoroutineContext
 import ru.protolink.communicator.data.MappingStore
 import ru.protolink.communicator.sync.engine.SyncEngine
 import ru.protolink.communicator.sync.model.SyncMapping
@@ -53,8 +51,8 @@ class SyncWorker @AssistedInject constructor(
             Log.i(TAG, "Skip; another sync is already running (deferred full)")
             return Result.success()
         }
-        val job = currentCoroutineContext()[Job]
-        if (job != null) SyncFlight.bindExclusiveJob(job)
+        // Do not bind this worker Job as exclusive — Force preempt must cancel detached work
+        // inside runDeferringToForce, not the mutex owner (1.0.65 structured-join stall).
         return try {
             do {
                 if (SyncFlight.forcePreferred.get()) {
@@ -80,7 +78,6 @@ class SyncWorker @AssistedInject constructor(
             Log.e(TAG, "Sync failed", e)
             Result.retry()
         } finally {
-            if (job != null) SyncFlight.clearExclusiveJob(job)
             SyncFlight.mutex.unlock()
         }
     }

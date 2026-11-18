@@ -2816,8 +2816,8 @@ class MainViewModel @Inject constructor(
                 _state.update { it.copy(status = "Full sync queued…") }
                 return@launch
             }
-            val exclusive = currentCoroutineContext()[Job]
-            if (exclusive != null) SyncFlight.bindExclusiveJob(exclusive)
+            // Mutex owner must not be the Force preempt target (1.0.65: cancelling this Job
+            // trapped finally behind reconcile child joins). runDeferringToForce binds work.
             _state.update { it.copy(status = "Syncing ${mappings.size} folder(s)…", syncing = true) }
             try {
                 var lastLocal = 0
@@ -2864,7 +2864,6 @@ class MainViewModel @Inject constructor(
                 Log.e("ProtoLinkSync", "sync failed", e)
                 handleSyncFailure(e)
             } finally {
-                if (exclusive != null) SyncFlight.clearExclusiveJob(exclusive)
                 if (SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
             }
         }
@@ -2972,8 +2971,6 @@ class MainViewModel @Inject constructor(
             val mappings = mappingStore.load()
             if (mappings.isEmpty()) return@launch
             if (_state.value.syncing || !SyncFlight.mutex.tryLock()) return@launch
-            val exclusive = currentCoroutineContext()[Job]
-            if (exclusive != null) SyncFlight.bindExclusiveJob(exclusive)
             _state.update { it.copy(status = "Uploading local changes…", syncing = true) }
             try {
                 val applied = withContext(Dispatchers.IO) {
@@ -3028,7 +3025,6 @@ class MainViewModel @Inject constructor(
                 Log.e("ProtoLinkSync", "local push failed", e)
                 handleSyncFailure(e)
             } finally {
-                if (exclusive != null) SyncFlight.clearExclusiveJob(exclusive)
                 if (SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
             }
         }

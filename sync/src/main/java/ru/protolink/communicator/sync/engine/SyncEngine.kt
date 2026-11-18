@@ -1,5 +1,6 @@
 package ru.protolink.communicator.sync.engine
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -364,6 +365,7 @@ class SyncEngine(
                     }
                 }
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 SyncRemoteDownload.logMaterializeFailed(
                     "BootstrapFromRemote",
                     loc.relativePath,
@@ -569,6 +571,7 @@ class SyncEngine(
                     }
                     applied++
                 } catch (e: Exception) {
+                    if (e is CancellationException) throw e
                     SyncRemoteDownload.logMaterializeFailed(
                         "ApplyLocalPhase.PruneCloudAbsent",
                         path,
@@ -775,6 +778,7 @@ class SyncEngine(
                             )
                         }
                     } catch (e: Exception) {
+                        if (e is CancellationException) throw e
                         SyncRemoteDownload.logMaterializeFailed(
                             "ApplyRemotePhase.Added",
                             c.relativePath,
@@ -795,6 +799,7 @@ class SyncEngine(
                         store.delete(mapping.id, c.meta.relativePath)
                         applied++
                     } catch (e: Exception) {
+                        if (e is CancellationException) throw e
                         // NFR-SYNC-1: one gone/locked path must not abort cloud-delete converge.
                         SyncRemoteDownload.logMaterializeFailed(
                             "ApplyRemotePhase.Removed",
@@ -1357,6 +1362,7 @@ class SyncEngine(
             siblingCache[parentId] = kids
             SameNamedCloudSibling.preferExisting(parentId, displayName, isFolder, kids) to true
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             android.util.Log.w(
                 "ProtoLinkSync",
                 "sibling list failed parent=$parentId: ${e.message ?: e.javaClass.simpleName}"
@@ -1785,6 +1791,7 @@ class SyncEngine(
         val locals = try {
             fs.listImmediate(mapping.localRootPath, parentNorm)
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             SyncRemoteDownload.logMaterializeFailed(
                 "ForcePullMapping.EarlyPruneList",
                 parentNorm.ifEmpty { "." },
@@ -1798,7 +1805,8 @@ class SyncEngine(
             .sortedByDescending { PathUtil.normalize(it.relativePath).count { c -> c == '/' } }
         val localPaths = try {
             fs.snapshot(mapping.localRootPath).map { PathUtil.normalize(it.relativePath) }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             emptyList()
         }
         for (entry in ghosts) {
@@ -1828,6 +1836,7 @@ class SyncEngine(
                     }
                 }
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 SyncRemoteDownload.logMaterializeFailed(
                     "ForcePullMapping.EarlyPrune",
                     path,
@@ -1876,6 +1885,7 @@ class SyncEngine(
                     )
                 )
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 SyncRemoteDownload.logMaterializeFailed(
                     "ForcePullMapping",
                     path,
@@ -1888,6 +1898,7 @@ class SyncEngine(
         val bytes = try {
             remote.downloadFile(loc.entry.id)
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             // getFile is Response-based (null on 5xx) but keep soft-fail if a future path throws.
             SyncRemoteDownload.logMaterializeFailed(
                 "ForcePullMapping",
@@ -1917,6 +1928,7 @@ class SyncEngine(
             )
             1
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             SyncRemoteDownload.logMaterializeFailed(
                 "ForcePullMapping",
                 path,
@@ -1953,6 +1965,7 @@ class SyncEngine(
                 }
                 store.delete(mapping.id, path)
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 SyncRemoteDownload.logMaterializeFailed(
                     "ForcePullMapping.Prune",
                     path,

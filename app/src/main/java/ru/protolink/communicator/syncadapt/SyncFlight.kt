@@ -1,23 +1,29 @@
 package ru.protolink.communicator.syncadapt
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineName
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Single-flight lock shared by UI sync and [SyncWorker].
  *
- * Force Download/Upload must win the lane promptly (Win CTS preempt parity). A long
- * reconcile that only [Mutex.lock]s without cancel leaves Force waiting until timeout —
- * live 1.0.60 cold Force on MyNotesFolder aborted after 600s with getFile=0.
- * Live 1.0.64: Job cancel alone was not enough when SyncEngine only checked cancellation
- * between phases — [runDeferringToForce] cancels the in-flight block when Force prefers.
+ * Force Download/Upload must win the lane promptly (Win CTS preempt parity).
+ *
+ * Live 1.0.65 FAIL: preempt cancelled the **mutex-owning** Job. Structured concurrency then
+ * waited for reconcile children (OkHttp cancel reached the socket, but `finally`/unlock did not
+ * run until the whole tree finished) → FORCE_SYNC_LOCK_TIMEOUT at 120s. Fix: bind preempt to a
+ * **detached** work Job; after Force prefers, abandon that work within [ABANDON_AFTER_MS] so the
+ * owner unlocks; [laneEpoch] makes abandoned writers stop at the next check.
  */
 object SyncFlight {
     val mutex = Mutex()
@@ -25,8 +31,16 @@ object SyncFlight {
     val deferredFull = AtomicBoolean(false)
     /** Force (or conflict resolve) wants the exclusive lane — full/push must defer. */
     val forcePreferred = AtomicBoolean(false)
+    /**
+     * Bumped on Force preempt. Full/push work captures the epoch at start and aborts when it
+     * changes so an abandoned (post-grace) writer cannot keep mutating under Force.
+     */
+    val laneEpoch = AtomicInteger(0)
 
     private val exclusiveJob = AtomicReference<Job?>(null)
+
+    /** Grace after cancel before owner unlocks even if work ignores cancellation. */
+    const val ABANDON_AFTER_MS = 2_000L
 
     fun bindExclusiveJob(job: Job) {
         exclusiveJob.set(job)
@@ -36,9 +50,10 @@ object SyncFlight {
         exclusiveJob.compareAndSet(job, null)
     }
 
-    /** Mark Force priority and cancel the current exclusive holder so it unlocks. */
+    /** Mark Force priority, bump lane epoch, cancel current exclusive **work** (not mutex owner). */
     fun preemptExclusiveForForce() {
         forcePreferred.set(true)
+        laneEpoch.incrementAndGet()
         exclusiveJob.get()?.cancel(CancellationException("SyncFlight: Force preempt"))
     }
 
@@ -47,26 +62,53 @@ object SyncFlight {
     }
 
     /**
-     * Run full/push work until complete, or cancel it within ~[pollMs] when [forcePreferred]
-     * is set so Force can acquire the mutex without waiting out a whole MyNotesFolder pass.
+     * Run full/push work until complete, or yield to Force.
+     *
+     * Work runs on a **SupervisorJob with no parent link to the mutex owner**, so Force cancel /
+     * abandon cannot trap the owner's `finally` behind structured child joins (1.0.65).
      * Returns null when yielded to Force. Do **not** wrap Force's own pull/push.
      */
-    suspend fun <T> runDeferringToForce(pollMs: Long = 50L, block: suspend () -> T): T? =
-        coroutineScope {
-            val work = async { block() }
-            while (work.isActive) {
-                if (forcePreferred.get()) {
-                    work.cancel(CancellationException("SyncFlight: Force preferred"))
-                    break
+    suspend fun <T> runDeferringToForce(
+        pollMs: Long = 50L,
+        abandonAfterMs: Long = ABANDON_AFTER_MS,
+        block: suspend () -> T
+    ): T? {
+        val startEpoch = laneEpoch.get()
+        // Detached supervisor: cancel/abandon must not block the mutex-holding caller.
+        val workJob = SupervisorJob()
+        val worker = CoroutineScope(
+            Dispatchers.IO + workJob + CoroutineName("SyncFlightWork")
+        ).async {
+            ensureLaneActive(startEpoch)
+            block()
+        }
+        bindExclusiveJob(worker)
+        try {
+            while (true) {
+                val preempted = forcePreferred.get() || laneEpoch.get() != startEpoch
+                if (preempted) {
+                    // Cancel may already have flipped isActive=false while work is still
+                    // finishing under NonCancellable — do not fall through to await() (1.0.65).
+                    worker.cancel(CancellationException("SyncFlight: Force preferred"))
+                    withTimeoutOrNull(abandonAfterMs) { worker.join() }
+                    return null
                 }
+                if (!worker.isActive) break
                 delay(pollMs)
             }
-            try {
-                work.await()
+            return try {
+                worker.await()
             } catch (e: CancellationException) {
-                if (forcePreferred.get()) null else throw e
+                if (forcePreferred.get() || laneEpoch.get() != startEpoch) null else throw e
             }
+        } finally {
+            clearExclusiveJob(worker)
+            if (worker.isActive) {
+                worker.cancel(CancellationException("SyncFlight: work scope closed"))
+            }
+            // Do not join forever — abandon so mutex owner can unlock.
         }
+    }
 
     /**
      * Acquire [mutex] for Force: preempt any holder, then wait up to [waitMs].
@@ -89,11 +131,19 @@ object SyncFlight {
         } == true
     }
 
+    /** Throw if Force preempted this lane epoch (call from SyncEngine item loops). */
+    fun ensureLaneActive(startEpoch: Int) {
+        if (forcePreferred.get() || laneEpoch.get() != startEpoch) {
+            throw CancellationException("SyncFlight: lane preempted")
+        }
+    }
+
     /** Test-only: drop singleton leftovers between unit tests. */
     internal fun resetForTests() {
         exclusiveJob.set(null)
         forcePreferred.set(false)
         deferredFull.set(false)
+        laneEpoch.set(0)
         // Mutex must be unlocked by the test that locked it.
     }
 }
