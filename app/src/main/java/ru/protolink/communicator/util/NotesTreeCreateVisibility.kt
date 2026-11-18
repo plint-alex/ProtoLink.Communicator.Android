@@ -110,4 +110,35 @@ object NotesTreeCreateVisibility {
         val expanded = expandedIdsForPath(merged, leaf.relativePath, expandedIds)
         return merged to expanded
     }
+
+    /**
+     * After a SAF re-walk: keep every pending create visible until the scan actually lists it.
+     * Overlapping/stale refreshes otherwise wipe the optimistic row (tester AT-NC-1 FAIL class).
+     *
+     * @return merged root, expanded ids, and pending leaves still missing from SAF (caller keeps those).
+     */
+    fun applyPendingCreates(
+        root: NotesTreeBuilder.Node,
+        pending: Collection<CreatedLeaf>,
+        expandedIds: Set<String>,
+        isInTree: (NotesTreeBuilder.Node, String) -> Boolean
+    ): Triple<NotesTreeBuilder.Node, Set<String>, List<CreatedLeaf>> {
+        var merged = root
+        var expanded = expandedIds
+        val stillPending = ArrayList<CreatedLeaf>(pending.size)
+        for (leaf in pending) {
+            val rel = normalizeRelative(leaf.relativePath)
+            if (rel.isEmpty()) continue
+            if (isInTree(merged, rel)) {
+                // Confirmed on disk/SAF — expand ancestors so flatten shows it; drop from pending.
+                expanded = expandedIdsForPath(merged, rel, expanded)
+            } else {
+                val (nextRoot, nextExpanded) = ensureCreatedVisible(merged, leaf, expanded)
+                merged = nextRoot
+                expanded = nextExpanded
+                stillPending.add(leaf)
+            }
+        }
+        return Triple(merged, expanded, stillPending)
+    }
 }

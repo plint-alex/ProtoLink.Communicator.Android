@@ -4358,6 +4358,16 @@ fun setNotesRoot(uri: String) {
 
     private var notesRootCache: NotesTreeBuilder.Node? = null
 
+    /**
+     * Just-created Notes pages kept until a SAF walk lists them.
+     * Overlapping refreshNotesTree jobs otherwise replace [notesRootCache] and wipe the row.
+     */
+    private val pendingCreatedNotes =
+        java.util.concurrent.ConcurrentHashMap<String, NotesTreeCreateVisibility.CreatedLeaf>()
+
+    /** Monotonic id so a slower older SAF walk cannot apply after a newer refresh. */
+    private val notesTreeRefreshGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+
     /** Survives loadMessages races that rewrite state.messages. */
     private val pendingChatSends = java.util.concurrent.ConcurrentHashMap<String, MessageItem>()
     private val pendingChatSendContact = java.util.concurrent.ConcurrentHashMap<String, String>()
@@ -4368,19 +4378,43 @@ fun setNotesRoot(uri: String) {
         val rootUriStr = settingsStore.load().notesRootUri
         if (rootUriStr.isNullOrBlank()) {
             notesRootCache = null
+            pendingCreatedNotes.clear()
             _state.update {
                 it.copy(notesTreeRows = emptyList(), status = "Choose a notes folder")
             }
             return
         }
+        val generation = notesTreeRefreshGeneration.incrementAndGet()
         val treeUri = Uri.parse(rootUriStr)
-        val root = withContext(Dispatchers.IO) {
+        val scanned = withContext(Dispatchers.IO) {
             NotesTreeBuilder.build(appContext, treeUri)
         }
+        if (generation != notesTreeRefreshGeneration.get()) {
+            // Superseded by a newer refresh — do not clobber cache/UI with a stale walk.
+            return
+        }
+        // Re-read map after scan so creates registered during the walk are included.
+        val pendingSnapshot = pendingCreatedNotes.values.toList()
+        val (mergedRoot, expandedMerged, stillPending) = NotesTreeCreateVisibility.applyPendingCreates(
+            root = scanned,
+            pending = pendingSnapshot,
+            expandedIds = _state.value.notesExpandedIds + scanned.documentId,
+            isInTree = { r, rel -> findNotesNodeByRelativePath(r, rel) != null }
+        )
+        if (generation != notesTreeRefreshGeneration.get()) return
+        // Drop only leaves this walk confirmed in SAF — do not clear creates registered after snapshot.
+        val stillKeys = stillPending
+            .map { NotesTreeCreateVisibility.normalizeRelative(it.relativePath) }
+            .toSet()
+        for (leaf in pendingSnapshot) {
+            val key = NotesTreeCreateVisibility.normalizeRelative(leaf.relativePath)
+            if (key !in stillKeys) pendingCreatedNotes.remove(key)
+        }
+        val root = mergedRoot
         notesRootCache = root
         // Always keep root expanded (Windows shows root children). Do not rely on ifEmpty alone —
         // a non-empty set that omitted root hid every page after create/refresh.
-        val expanded = _state.value.notesExpandedIds + root.documentId
+        val expanded = expandedMerged + root.documentId
         val rows = NotesTreeBuilder.flattenVisible(root, expanded).map { it.toTreeRow() }
         val treeStatus = "Notes tree: ${countFolders(root)} page folder(s)"
         _state.update { cur ->
@@ -4800,6 +4834,8 @@ fun setNotesRoot(uri: String) {
                 folderUri = folderUri.toString(),
                 indexUri = created.indexUri?.toString()
             )
+            // Register before any refresh so overlapping/stale SAF walks re-merge this leaf.
+            pendingCreatedNotes[NotesTreeCreateVisibility.normalizeRelative(childRel)] = leaf
             // Optimistic merge + expand so the new row is visible before any SAF re-walk finishes.
             val prior = notesRootCache
             if (prior != null) {
@@ -4819,7 +4855,7 @@ fun setNotesRoot(uri: String) {
             } else {
                 _state.update { it.copy(pendingCreateNote = null, status = "Created “$folderName”") }
             }
-            // SAF refresh may lag on some OEMs — keep synthetic leaf if scan misses it.
+            // Full SAF refresh; refreshNotesTreeSuspend always re-applies pendingCreatedNotes.
             refreshNotesTreeSuspend()
             val rootAfter = notesRootCache
             if (rootAfter != null && findNotesNodeByRelativePath(rootAfter, childRel) == null) {
@@ -4827,6 +4863,7 @@ fun setNotesRoot(uri: String) {
                     rootAfter, leaf, _state.value.notesExpandedIds
                 )
                 notesRootCache = merged
+                pendingCreatedNotes[NotesTreeCreateVisibility.normalizeRelative(childRel)] = leaf
                 _state.update {
                     it.copy(
                         notesExpandedIds = expanded,
