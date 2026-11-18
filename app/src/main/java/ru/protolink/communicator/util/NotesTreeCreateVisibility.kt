@@ -1,6 +1,8 @@
 package ru.protolink.communicator.util
 
+import android.net.Uri
 import ru.protolink.communicator.data.NotesTreeBuilder
+import ru.protolink.communicator.data.SafTreeLister
 
 /**
  * After Notes create: keep the new page visible in the flattened tree.
@@ -21,6 +23,84 @@ object NotesTreeCreateVisibility {
     fun normalizeRelative(relativePath: String): String =
         relativePath.replace('\\', '/').trim('/')
 
+    /**
+     * Empty root node from the SAF tree URI — used when [notesRootCache] is still null
+     * because the initial DocumentsContract walk has not finished (cold hub / large tree).
+     */
+    fun minimalRoot(treeUri: Uri, rootName: String = "Notes"): NotesTreeBuilder.Node {
+        val rootId = SafTreeLister.treeDocumentId(treeUri)
+        val rootUri = SafTreeLister.documentUri(treeUri, rootId)
+        return NotesTreeBuilder.Node(
+            documentId = rootUri.toString(),
+            safDocumentId = rootId,
+            name = rootName,
+            relativePath = "",
+            folderUri = rootUri,
+            indexUri = null,
+            children = emptyList()
+        )
+    }
+
+    /**
+     * Optimistic merge when cache may be null: seed [minimalRoot] if needed, insert leaf
+     * (stubbing missing ancestors via guessed SAF ids), expand path for flatten.
+     */
+    fun ensureCreatedVisibleSeeding(
+        prior: NotesTreeBuilder.Node?,
+        treeUri: Uri,
+        leaf: CreatedLeaf,
+        expandedIds: Set<String>,
+        rootName: String = "Notes"
+    ): Pair<NotesTreeBuilder.Node, Set<String>> {
+        val base = prior ?: minimalRoot(treeUri, rootName)
+        val withAncestors = ensureAncestorStubs(base, leaf, treeUri)
+        return ensureCreatedVisible(withAncestors, leaf, expandedIds)
+    }
+
+    /** Insert missing parent folders so [insertCreatedLeaf] can attach [leaf] under a seed root. */
+    fun ensureAncestorStubs(
+        root: NotesTreeBuilder.Node,
+        leaf: CreatedLeaf,
+        treeUri: Uri
+    ): NotesTreeBuilder.Node {
+        val rel = normalizeRelative(leaf.relativePath)
+        val parentParts = rel.split('/').filter { it.isNotEmpty() }.dropLast(1)
+        if (parentParts.isEmpty()) return root
+        return insertAncestorChain(root, parentParts, 0, treeUri) ?: root
+    }
+
+    private fun insertAncestorChain(
+        node: NotesTreeBuilder.Node,
+        parentParts: List<String>,
+        index: Int,
+        treeUri: Uri
+    ): NotesTreeBuilder.Node? {
+        if (index >= parentParts.size) return node
+        val want = parentParts[index]
+        val childIdx = node.children.indexOfFirst { it.name.equals(want, ignoreCase = true) }
+        if (childIdx >= 0) {
+            val updated = insertAncestorChain(node.children[childIdx], parentParts, index + 1, treeUri)
+                ?: return null
+            val next = node.children.toMutableList()
+            next[childIdx] = updated
+            return node.copy(children = next)
+        }
+        val stubRel = parentParts.take(index + 1).joinToString("/")
+        val stubId = NotesTreeBuilder.folderDocumentId(treeUri, stubRel)
+        val stubUri = SafTreeLister.documentUri(treeUri, stubId)
+        val stub = NotesTreeBuilder.Node(
+            documentId = stubUri.toString(),
+            safDocumentId = stubId,
+            name = want,
+            relativePath = stubRel,
+            folderUri = stubUri,
+            indexUri = null,
+            children = emptyList()
+        )
+        val filled = insertAncestorChain(stub, parentParts, index + 1, treeUri) ?: return null
+        val nextChildren = (node.children + filled).sortedBy { it.name.lowercase() }
+        return node.copy(children = nextChildren)
+    }
     fun isRelativePathVisible(
         rows: List<NotesTreeBuilder.VisibleRow>,
         relativePath: String

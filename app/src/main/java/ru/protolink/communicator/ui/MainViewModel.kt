@@ -4842,31 +4842,37 @@ fun setNotesRoot(uri: String) {
             )
             // Register before any refresh so overlapping/stale SAF walks re-merge this leaf.
             pendingCreatedNotes[NotesTreeCreateVisibility.normalizeRelative(childRel)] = leaf
-            // Optimistic merge + expand so the new row is visible before any SAF re-walk finishes.
-            val prior = notesRootCache
-            if (prior != null) {
-                val (merged, expanded) = NotesTreeCreateVisibility.ensureCreatedVisible(
-                    prior, leaf, _state.value.notesExpandedIds
+            // Optimistic merge even when notesRootCache is still null (cold hub / long SAF walk):
+            // seed minimal root from notesRootUri, insert pending leaf, paint rows, open editor
+            // before awaiting the full DocumentsContract snack.
+            val (mergedOptimistic, expandedOptimistic) =
+                NotesTreeCreateVisibility.ensureCreatedVisibleSeeding(
+                    prior = notesRootCache,
+                    treeUri = treeUri,
+                    leaf = leaf,
+                    expandedIds = _state.value.notesExpandedIds
                 )
-                notesRootCache = merged
-                _state.update {
-                    it.copy(
-                        pendingCreateNote = null,
-                        status = "Created “$folderName”",
-                        notesExpandedIds = expanded,
-                        notesTreeRows = NotesTreeBuilder.flattenVisible(merged, expanded)
-                            .map { r -> r.toTreeRow() }
-                    )
-                }
-            } else {
-                _state.update { it.copy(pendingCreateNote = null, status = "Created “$folderName”") }
+            notesRootCache = mergedOptimistic
+            _state.update {
+                it.copy(
+                    pendingCreateNote = null,
+                    status = "Created “$folderName”",
+                    notesExpandedIds = expandedOptimistic,
+                    notesTreeRows = NotesTreeBuilder.flattenVisible(mergedOptimistic, expandedOptimistic)
+                        .map { r -> r.toTreeRow() }
+                )
             }
+            // Open from seeded/merged cache before the long SAF re-walk finishes.
+            openNoteByRelativePath(childRel)
             // Full SAF refresh; refreshNotesTreeSuspend always re-applies pendingCreatedNotes.
             refreshNotesTreeSuspend()
             val rootAfter = notesRootCache
             if (rootAfter != null && findNotesNodeByRelativePath(rootAfter, childRel) == null) {
-                val (merged, expanded) = NotesTreeCreateVisibility.ensureCreatedVisible(
-                    rootAfter, leaf, _state.value.notesExpandedIds
+                val (merged, expanded) = NotesTreeCreateVisibility.ensureCreatedVisibleSeeding(
+                    prior = rootAfter,
+                    treeUri = treeUri,
+                    leaf = leaf,
+                    expandedIds = _state.value.notesExpandedIds
                 )
                 notesRootCache = merged
                 pendingCreatedNotes[NotesTreeCreateVisibility.normalizeRelative(childRel)] = leaf
@@ -4881,9 +4887,10 @@ fun setNotesRoot(uri: String) {
                 expandPathAncestors(childRel)
                 applyNotesTreeRowsFromCache()
             }
-            // Open from refreshed/merged cache (correct depth + ids) — never flatten a stale cache
-            // that omits the new leaf (that wiped create→visible on compact Back).
-            openNoteByRelativePath(childRel)
+            // Re-open if refresh cleared selection; keep leaf visible after Back.
+            if (_state.value.selectedNoteIndexUri.isNullOrBlank()) {
+                openNoteByRelativePath(childRel)
+            }
             val visible = NotesTreeCreateVisibility.isRelativePathInTree(
                 _state.value.notesTreeRows.map { it.relativePath },
                 childRel

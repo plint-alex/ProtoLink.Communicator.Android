@@ -191,6 +191,95 @@ class NotesTreeCreateVisibilityTest {
         assertThat(NotesTreeCreateVisibility.isRelativePathVisible(rows, "Parent/Child")).isTrue()
     }
 
+    @Test
+    fun ensureCreatedVisibleSeeding_nullPrior_paintsRootChild() {
+        // Cold hub: notesRootCache still null while SAF walk runs — Create must still show a row.
+        val treeUri = Uri.parse("content://com.android.externalstorage.documents/tree/primary%3Amynotes")
+        val leaf = NotesTreeCreateVisibility.CreatedLeaf(
+            name = "NewPage",
+            relativePath = "NewPage",
+            documentId = "content://tree/id:NewPage",
+            safDocumentId = "id:NewPage",
+            folderUri = "content://tree/id:NewPage",
+            indexUri = "content://tree/id:NewPage/index.html"
+        )
+        val (merged, expanded) = NotesTreeCreateVisibility.ensureCreatedVisibleSeeding(
+            prior = null,
+            treeUri = treeUri,
+            leaf = leaf,
+            expandedIds = emptySet()
+        )
+        assertThat(merged.relativePath).isEmpty()
+        assertThat(merged.children.map { it.name }).containsExactly("NewPage")
+        val rows = NotesTreeBuilder.flattenVisible(merged, expanded)
+        assertThat(NotesTreeCreateVisibility.isRelativePathVisible(rows, "NewPage")).isTrue()
+        assertThat(expanded).contains(merged.documentId)
+    }
+
+    @Test
+    fun ensureCreatedVisibleSeeding_nullPrior_nestedStubsAncestors() {
+        val treeUri = Uri.parse("content://com.android.externalstorage.documents/tree/primary%3Amynotes")
+        val leaf = NotesTreeCreateVisibility.CreatedLeaf(
+            name = "Child",
+            relativePath = "Parent/Child",
+            documentId = "content://tree/id:Parent/Child",
+            safDocumentId = "id:Parent/Child",
+            folderUri = "content://tree/id:Parent/Child",
+            indexUri = null
+        )
+        val (merged, expanded) = NotesTreeCreateVisibility.ensureCreatedVisibleSeeding(
+            prior = null,
+            treeUri = treeUri,
+            leaf = leaf,
+            expandedIds = emptySet()
+        )
+        assertThat(merged.children.map { it.name }).containsExactly("Parent")
+        val rows = NotesTreeBuilder.flattenVisible(merged, expanded)
+        assertThat(NotesTreeCreateVisibility.isRelativePathVisible(rows, "Parent/Child")).isTrue()
+    }
+
+    @Test
+    fun applyPendingCreates_afterNullPriorSeed_survivesOverlappingSafMiss() {
+        val treeUri = Uri.parse("content://com.android.externalstorage.documents/tree/primary%3Amynotes")
+        val leaf = NotesTreeCreateVisibility.CreatedLeaf(
+            name = "NewPage",
+            relativePath = "NewPage",
+            documentId = "content://tree/id:NewPage",
+            safDocumentId = "id:NewPage",
+            folderUri = "content://tree/id:NewPage",
+            indexUri = null
+        )
+        val (seeded, expandedSeed) = NotesTreeCreateVisibility.ensureCreatedVisibleSeeding(
+            prior = null,
+            treeUri = treeUri,
+            leaf = leaf,
+            expandedIds = emptySet()
+        )
+        // Overlapping SAF walk returns other folders only — pending must re-insert NewPage.
+        val safWithoutLeaf = NotesTreeCreateVisibility.minimalRoot(treeUri).copy(
+            children = listOf(node("Existing", "Existing"))
+        )
+        val (merged, expanded, stillPending) = NotesTreeCreateVisibility.applyPendingCreates(
+            root = safWithoutLeaf,
+            pending = listOf(leaf),
+            expandedIds = expandedSeed,
+            isInTree = { r, rel ->
+                NotesTreeCreateVisibility.isRelativePathInTree(collectRelativePaths(r), rel)
+            }
+        )
+        assertThat(stillPending).hasSize(1)
+        assertThat(merged.children.map { it.name }).contains("NewPage")
+        assertThat(NotesTreeCreateVisibility.isRelativePathVisible(
+            NotesTreeBuilder.flattenVisible(merged, expanded),
+            "NewPage"
+        )).isTrue()
+        // Seeded optimistic tree still had the leaf before SAF miss merge.
+        assertThat(NotesTreeCreateVisibility.isRelativePathVisible(
+            NotesTreeBuilder.flattenVisible(seeded, expandedSeed),
+            "NewPage"
+        )).isTrue()
+    }
+
     private fun collectRelativePaths(root: NotesTreeBuilder.Node): List<String> {
         val out = ArrayList<String>()
         fun walk(n: NotesTreeBuilder.Node) {
