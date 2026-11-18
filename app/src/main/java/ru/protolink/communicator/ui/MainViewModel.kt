@@ -540,7 +540,7 @@ class MainViewModel @Inject constructor(
         val openChat = _state.value.selectedContact
         if (openChat != null) loadMessages(openChat)
         refreshUnreadBadges()
-        _state.update { it.copy(status = "Live update (message_sent)") }
+        setStatusUnlessForce("Live update (message_sent)")
     }
 
     private suspend fun handleMessageRead(parameters: Map<String, Any?>?) {
@@ -823,14 +823,28 @@ class MainViewModel @Inject constructor(
                     children.mapNotNull { e -> cloudChildItem(e) }
                 }
             }
-            _state.update {
-                it.copy(cloudItems = items, status = CloudListingStatus.afterReload(statusAfterLoad))
+            // Browse stays live during Force (1.0.60) — but never clobber Force banner with
+            // "Cloud loaded" (live 1.0.73 FORCE_NO_PROGRESS: Download all disabled + Cloud loaded).
+            _state.update { cur ->
+                val proposed = CloudListingStatus.afterReload(statusAfterLoad)
+                val status = ForceStatusGuard.statusOrNull(
+                    forceRunning = cur.forceRunning,
+                    forcePreferred = SyncFlight.forcePreferred.get(),
+                    proposed = proposed
+                ) ?: cur.status
+                cur.copy(cloudItems = items, status = status)
             }
             refreshFolderTree()
         } catch (e: Exception) {
             Log.e("ProtoLinkCloud", "loadCloudFolder failed id=$folderId", e)
-            _state.update {
-                it.copy(status = "Cloud load failed: ${e.message ?: e.javaClass.simpleName}")
+            _state.update { cur ->
+                val proposed = "Cloud load failed: ${e.message ?: e.javaClass.simpleName}"
+                val status = ForceStatusGuard.statusOrNull(
+                    forceRunning = cur.forceRunning,
+                    forcePreferred = SyncFlight.forcePreferred.get(),
+                    proposed = proposed
+                ) ?: cur.status
+                cur.copy(status = status)
             }
         }
     }
@@ -2694,11 +2708,15 @@ class MainViewModel @Inject constructor(
      * Discovers same-named folders across CloudRoots (Android root vs Win Drive).
      */
     private suspend fun healDuplicateSameNamedMappings(): Int {
+        // Heal runs outside SyncFlight mutex so Force can grab the lane — bail when Force
+        // prefers so discovery GetEntities do not starve forcePull (live 1.0.73 heal flash).
+        if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) return 0
         val mappings = mappingStore.load()
         if (mappings.isEmpty()) return 0
         val parentByMapped = linkedMapOf<String, String>()
         val ancestorRootByMapped = linkedMapOf<String, String>()
         for (m in mappings) {
+            if (SyncFlight.forcePreferred.get()) return 0
             val parents = runCatching {
                 api.getEntities(
                     GetEntitiesRequest(
@@ -2729,6 +2747,7 @@ class MainViewModel @Inject constructor(
             .toSet()
         val siblingsByParent = linkedMapOf<String, List<SameNamedCloudFolderHeal.Sibling>>()
         for (parentId in parentByMapped.values.distinctBy { it.lowercase() }) {
+            if (SyncFlight.forcePreferred.get()) return 0
             val siblings = loadChildFolderSiblingsForDiscovery(
                 parentId = parentId,
                 mustIncludeRootIds = mustRoots,
@@ -2743,6 +2762,7 @@ class MainViewModel @Inject constructor(
                 "same-named heal discover parent=$parentId siblings=${siblings.size} nameHits=$nameHits"
             )
         }
+        if (SyncFlight.forcePreferred.get()) return 0
         val rows = mappings.map {
             SameNamedCloudFolderHeal.MappingRow(it.cloudFolderId, it.localPath, it.cloudFolderName)
         }
@@ -2894,7 +2914,13 @@ class MainViewModel @Inject constructor(
                     }
                 }
             } catch (e: CancellationException) {
-                _state.update { it.copy(syncing = false, status = "Sync cancelled") }
+                _state.update { cur ->
+                    if (ForceStatusGuard.ownsStatus(cur.forceRunning, SyncFlight.forcePreferred.get())) {
+                        cur.copy(syncing = false)
+                    } else {
+                        cur.copy(syncing = false, status = "Sync cancelled")
+                    }
+                }
                 throw e
             } catch (e: Exception) {
                 Log.e("ProtoLinkSync", "sync failed", e)
@@ -2908,9 +2934,14 @@ class MainViewModel @Inject constructor(
     private fun handleSyncFailure(e: Exception) {
         // Decide/cloud-wins — SyncConflictException removed (D-LEGACY-CONFLICT). Failures surface as status.
         val detail = e.message ?: e.javaClass.simpleName
-        _state.update {
-            it.copy(
-                status = "Sync failed: $detail",
+        _state.update { cur ->
+            val status = ForceStatusGuard.statusOrNull(
+                forceRunning = cur.forceRunning,
+                forcePreferred = SyncFlight.forcePreferred.get(),
+                proposed = "Sync failed: $detail"
+            ) ?: cur.status
+            cur.copy(
+                status = status,
                 syncing = false,
                 syncError = detail
             )

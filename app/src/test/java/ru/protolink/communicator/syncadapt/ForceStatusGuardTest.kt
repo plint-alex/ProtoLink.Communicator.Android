@@ -6,6 +6,7 @@ import org.junit.Test
 /**
  * Live 1.0.66: forceRunning true (Download all disabled) while status showed
  * "No local changes" / "Full sync queued…" — coalesce must not clobber Force UI.
+ * Live 1.0.73: "Cloud loaded" from listing reload must not clobber either.
  */
 class ForceStatusGuardTest {
 
@@ -51,5 +52,23 @@ class ForceStatusGuardTest {
                 proposed = "No local changes"
             )
         ).isEqualTo("No local changes")
+    }
+
+    @Test
+    fun statusOrNull_preservesForceOverCloudLoaded() {
+        assertThat(
+            ForceStatusGuard.statusOrNull(
+                forceRunning = true,
+                forcePreferred = false,
+                proposed = "Cloud loaded"
+            )
+        ).isNull()
+        assertThat(
+            ForceStatusGuard.statusOrNull(
+                forceRunning = false,
+                forcePreferred = true,
+                proposed = "Cloud loaded"
+            )
+        ).isNull()
     }
 }
