@@ -232,6 +232,74 @@ object SameNamedCloudFolderHeal {
     }
 
     /**
+     * SqlServer SearchEntities TitlePrefix/MidContains are collation-sensitive in some
+     * environments — lowercased mapped keys (`mynotesfolder`) can yield raw hits=0 while
+     * display casing (`MyNotesFolder`) matches. Prefer sibling / mapping display titles.
+     */
+    fun exactTitleSearchQueries(
+        needLower: String,
+        siblings: List<Sibling>,
+        mappingDisplayByLower: Map<String, String> = emptyMap()
+    ): List<String> {
+        val key = needLower.trim().lowercase()
+        if (key.length < 2) return emptyList()
+        val out = linkedSetOf<String>()
+        fun add(raw: String?) {
+            val t = raw?.trim().orEmpty()
+            if (t.length >= 2) out.add(t)
+        }
+        add(siblings.firstOrNull { it.name.trim().equals(key, ignoreCase = true) }?.name)
+        add(mappingDisplayByLower[key])
+        add(needLower.trim())
+        // Last resort: capitalize first letter (MyNotesFolder-style keys already covered above).
+        if (key.isNotEmpty()) {
+            add(key.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() })
+        }
+        return out.toList()
+    }
+
+    /** Lightweight SearchEntities row for unit-tested exact-title / typeTag filtering. */
+    data class SearchTitleHit(
+        val id: String?,
+        val title: String?,
+        val code: String? = null,
+        val typeTag: String? = null,
+        val updateTime: String? = null
+    )
+
+    /**
+     * KEEP exact-title CloudFolder/CloudRoot rows for [query].
+     * FAIL classes: API empty → []; typeTag/code non-folder → drop; case via equalsIgnoreCase.
+     */
+    fun filterExactTitleFolderHits(
+        query: String,
+        hits: List<SearchTitleHit>,
+        folderCode: String = "CloudFolder",
+        rootCode: String = "CloudRoot"
+    ): List<Sibling> {
+        val q = query.trim()
+        if (q.length < 2 || hits.isEmpty()) return emptyList()
+        val out = ArrayList<Sibling>()
+        for (hit in hits) {
+            val id = hit.id?.trim().orEmpty()
+            if (id.isEmpty()) continue
+            val title = hit.title?.trim().orEmpty()
+            if (!title.equals(q, ignoreCase = true)) continue
+            val code = hit.code?.trim().orEmpty()
+            val tag = hit.typeTag?.trim().orEmpty()
+            val isFolder =
+                code.equals(folderCode, ignoreCase = true) ||
+                    code.equals(rootCode, ignoreCase = true) ||
+                    tag.equals(folderCode, ignoreCase = true) ||
+                    tag.equals(rootCode, ignoreCase = true) ||
+                    (code.isEmpty() && tag.isEmpty())
+            if (!isFolder) continue
+            out.add(Sibling(id = id, name = title, creationTime = hit.updateTime))
+        }
+        return out
+    }
+
+    /**
      * Merge exact-name SearchEntities CloudFolder hits into root-paged siblings so
      * prefer-populated remap can see Drive 898c1453 when files-first child paging
      * never reached the folder under a polluted CloudRoot.

@@ -65,33 +65,34 @@ data class GetEntitiesRequest(
     val sharedWithMe: Boolean = false
 )
 
-/** POST api/Entities/SearchEntities — title hits for heal name-search discover. */
+/** POST api/entities/SearchEntities — title hits for heal name-search discover. */
 data class SearchEntitiesRequest(
-    val query: String,
-    val skip: Int = 0,
-    val take: Int? = 50,
-    val parentId: String? = null,
-    val typeEntityIds: List<String>? = null,
-    val includeHidden: Boolean = false,
-    val lang: String? = null
+    @SerializedName("query") val query: String,
+    @SerializedName("skip") val skip: Int = 0,
+    @SerializedName("take") val take: Int? = 50,
+    @SerializedName("parentId") val parentId: String? = null,
+    @SerializedName("typeEntityIds") val typeEntityIds: List<String>? = null,
+    @SerializedName("includeHidden") val includeHidden: Boolean = false,
+    @SerializedName("lang") val lang: String? = null
 )
 
 data class SearchEntitiesResponse(
-    val items: List<SearchEntityItemDto>? = null,
-    val skip: Int = 0,
-    val take: Int = 0,
-    val hasMore: Boolean = false,
-    val truncated: Boolean = false
+    @SerializedName("items") val items: List<SearchEntityItemDto>? = null,
+    @SerializedName("skip") val skip: Int = 0,
+    @SerializedName("take") val take: Int = 0,
+    @SerializedName("hasMore") val hasMore: Boolean = false,
+    @SerializedName("truncated") val truncated: Boolean = false
 )
 
 data class SearchEntityItemDto(
-    val id: String? = null,
-    val code: String? = null,
-    val title: String? = null,
-    val snippet: String? = null,
-    val typeTag: String? = null,
-    val updateTime: String? = null,
-    val score: Int = 0
+    @SerializedName("id") val id: String? = null,
+    @SerializedName("code") val code: String? = null,
+    @SerializedName("title") val title: String? = null,
+    @SerializedName("snippet") val snippet: String? = null,
+    @SerializedName("typeTag") val typeTag: String? = null,
+    @SerializedName("typeEntityId") val typeEntityId: String? = null,
+    @SerializedName("updateTime") val updateTime: String? = null,
+    @SerializedName("score") val score: Int = 0
 )
 
 data class EntityDto(
@@ -218,12 +219,13 @@ interface ProtoLinkApi {
     /**
      * Title search (heal same-named discover when CloudRoot child paging misses Drive
      * canonical under files-first pollution — FORCE_HEAL_DISCOVER_MISS_DRIVE_898).
+     * Path casing matches web SearchPalette (`api/entities/...`).
      */
-    @POST("api/Entities/SearchEntities")
+    @POST("api/entities/SearchEntities")
     suspend fun searchEntities(
         @Body body: SearchEntitiesRequest,
         @Query("fromCache") fromCache: Boolean = false
-    ): SearchEntitiesResponse
+    ): retrofit2.Response<SearchEntitiesResponse>
 
     /** GetEntity card — name + mainParentId (AT-PC5). */
     @GET("api/Entities/GetEntity/{id}")

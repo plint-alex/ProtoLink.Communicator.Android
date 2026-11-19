@@ -261,6 +261,71 @@ class SameNamedCloudFolderHealTest {
     }
 
     /**
+     * FORCE_HEAL_DISCOVER_MISS_DRIVE_898 name-search hits=0 class: lowercased mapped key
+     * must prefer sibling/mapping display casing for SqlServer TitlePrefix.
+     */
+    @Test
+    fun exactTitleSearchQueries_prefersDisplayCasingOverLowerKey() {
+        val twin = SameNamedCloudFolderHeal.Sibling(
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "MyNotesFolder",
+            "2026-11-19T17:00:00",
+            0
+        )
+        val queries = SameNamedCloudFolderHeal.exactTitleSearchQueries(
+            needLower = "mynotesfolder",
+            siblings = listOf(twin),
+            mappingDisplayByLower = mapOf("mynotesfolder" to "MyNotesFolder")
+        )
+        assertThat(queries.first()).isEqualTo("MyNotesFolder")
+        assertThat(queries).contains("mynotesfolder")
+    }
+
+    @Test
+    fun filterExactTitleFolderHits_emptyApi_returnsEmpty() {
+        assertThat(
+            SameNamedCloudFolderHeal.filterExactTitleFolderHits(
+                "MyNotesFolder",
+                emptyList()
+            )
+        ).isEmpty()
+    }
+
+    @Test
+    fun filterExactTitleFolderHits_typeFilterDropsCloudFile_keepsFolderIgnoreCase() {
+        val hits = listOf(
+            SameNamedCloudFolderHeal.SearchTitleHit(
+                id = winId,
+                title = "MyNotesFolder",
+                code = "CloudFolder",
+                typeTag = "CloudFolder"
+            ),
+            SameNamedCloudFolderHeal.SearchTitleHit(
+                id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                title = "MyNotesFolder",
+                code = "CloudFile",
+                typeTag = "CloudFile"
+            ),
+            SameNamedCloudFolderHeal.SearchTitleHit(
+                id = dupId,
+                title = "mynotesfolder",
+                code = null,
+                typeTag = null
+            ),
+            SameNamedCloudFolderHeal.SearchTitleHit(
+                id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                title = "MyNotesFolder__twin_parked",
+                code = "CloudFolder",
+                typeTag = "CloudFolder"
+            )
+        )
+        val kept = SameNamedCloudFolderHeal.filterExactTitleFolderHits("mynotesfolder", hits)
+        assertThat(kept.map { it.id }).containsExactly(winId, dupId).inOrder()
+        assertThat(kept.none { it.id.startsWith("dddd") }).isTrue()
+        assertThat(kept.none { it.name.contains("__twin") }).isTrue()
+    }
+
+    /**
      * FORCE_HEAL_DISCOVER_MISS_DRIVE_898: root child paging only saw empty Android twin
      * (nameHits=1); SearchEntities exact-title hits merge Drive 898 → remap.
      */

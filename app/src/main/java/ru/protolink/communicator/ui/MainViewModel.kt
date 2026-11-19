@@ -2602,11 +2602,13 @@ class MainViewModel @Inject constructor(
                     }
                     // Never mint a second same-named CloudFolder (dual MyNotesFolder FAIL class).
                     // Cross-CloudRoot: Win may already have the name under Drive while wizard is on Android root.
+                    val nameLower = name.trim().lowercase()
                     val existing = SameNamedCloudFolderHeal.preferExistingSameName(
                         name,
                         loadChildFolderSiblingsForDiscovery(
                             parentId = parent,
-                            onlyNames = setOf(name.trim().lowercase())
+                            onlyNames = setOf(nameLower),
+                            mappingDisplayByLower = mapOf(nameLower to name.trim())
                         )
                     )
                     if (existing != null) {
@@ -2738,41 +2740,73 @@ class MainViewModel @Inject constructor(
     /**
      * Exact-title CloudFolder/CloudRoot hits via SearchEntities — supplements root
      * child paging when Drive pollution buries canonical MyNotesFolder (898c1453).
+     * Tries [queries] in order (display casing first — live FAIL hits=0 on lowercased key).
      */
-    private suspend fun searchCloudFoldersByExactName(name: String): List<SameNamedCloudFolderHeal.Sibling> {
-        val q = name.trim()
-        if (q.length < 2) return emptyList()
-        val resp = runCatching {
-            api.searchEntities(
-                SearchEntitiesRequest(query = q, take = 50),
-                fromCache = false
-            )
-        }.getOrNull() ?: return emptyList()
-        val items = resp.items.orEmpty()
-        val out = ArrayList<SameNamedCloudFolderHeal.Sibling>()
-        for (hit in items) {
-            val id = hit.id?.trim().orEmpty()
-            if (id.isEmpty()) continue
-            val title = hit.title?.trim().orEmpty()
-            if (!title.equals(q, ignoreCase = true)) continue
-            val code = hit.code?.trim().orEmpty()
-            val tag = hit.typeTag?.trim().orEmpty()
-            val isFolder =
-                code.equals(CloudCodes.CLOUD_FOLDER, ignoreCase = true) ||
-                    code.equals(CloudCodes.CLOUD_ROOT, ignoreCase = true) ||
-                    tag.equals(CloudCodes.CLOUD_FOLDER, ignoreCase = true) ||
-                    tag.equals(CloudCodes.CLOUD_ROOT, ignoreCase = true) ||
-                    (code.isEmpty() && tag.isEmpty())
-            if (!isFolder) continue
-            out.add(
-                SameNamedCloudFolderHeal.Sibling(
-                    id = id,
-                    name = title,
-                    creationTime = hit.updateTime
-                )
-            )
+    private suspend fun searchCloudFoldersByExactName(
+        queries: List<String>
+    ): List<SameNamedCloudFolderHeal.Sibling> {
+        val triedExact = linkedSetOf<String>()
+        for (raw in queries) {
+            val q = raw.trim()
+            if (q.length < 2) continue
+            if (!triedExact.add(q)) continue
+            val pageHits = searchCloudFoldersByExactNameOnce(q)
+            if (pageHits.isNotEmpty()) return pageHits
         }
-        return out
+        return emptyList()
+    }
+
+    private suspend fun searchCloudFoldersByExactNameOnce(q: String): List<SameNamedCloudFolderHeal.Sibling> {
+        var skip = 0
+        val pageSize = 50
+        val out = ArrayList<SameNamedCloudFolderHeal.Sibling>()
+        var pages = 0
+        while (pages < 4) {
+            pages++
+            val response = runCatching {
+                api.searchEntities(
+                    SearchEntitiesRequest(query = q, skip = skip, take = pageSize),
+                    fromCache = false
+                )
+            }.onFailure { e ->
+                android.util.Log.e(
+                    "ProtoLinkSync",
+                    "same-named heal name-search error q=$q ${e.javaClass.simpleName}: ${e.message}"
+                )
+            }.getOrNull() ?: return out
+
+            if (!response.isSuccessful) {
+                android.util.Log.e(
+                    "ProtoLinkSync",
+                    "same-named heal name-search http=${response.code()} q=$q"
+                )
+                return out
+            }
+            val body = response.body() ?: return out
+            val items = body.items.orEmpty()
+            val filtered = SameNamedCloudFolderHeal.filterExactTitleFolderHits(
+                query = q,
+                hits = items.map {
+                    SameNamedCloudFolderHeal.SearchTitleHit(
+                        id = it.id,
+                        title = it.title,
+                        code = it.code,
+                        typeTag = it.typeTag,
+                        updateTime = it.updateTime
+                    )
+                },
+                folderCode = CloudCodes.CLOUD_FOLDER,
+                rootCode = CloudCodes.CLOUD_ROOT
+            )
+            android.util.Log.e(
+                "ProtoLinkSync",
+                "same-named heal name-search q=$q raw=${items.size} exactFolders=${filtered.size} skip=$skip"
+            )
+            out += filtered
+            if (filtered.isNotEmpty() || !body.hasMore || items.isEmpty()) break
+            skip += pageSize
+        }
+        return out.distinctBy { it.id.lowercase() }
     }
 
     private suspend fun loadUserCloudRootsRaw(): List<SameNamedCloudFolderHeal.Sibling> {
@@ -2815,7 +2849,8 @@ class MainViewModel @Inject constructor(
     private suspend fun loadChildFolderSiblingsForDiscovery(
         parentId: String,
         mustIncludeRootIds: Collection<String> = emptyList(),
-        onlyNames: Set<String>? = null
+        onlyNames: Set<String>? = null,
+        mappingDisplayByLower: Map<String, String> = emptyMap()
     ): List<SameNamedCloudFolderHeal.Sibling> {
         val local = loadChildFolderSiblingsRaw(parentId)
         val roots = runCatching { loadUserCloudRootsRaw() }.getOrElse { emptyList() }
@@ -2839,10 +2874,15 @@ class MainViewModel @Inject constructor(
         if (needing.isNotEmpty()) {
             val fromSearch = mutableListOf<SameNamedCloudFolderHeal.Sibling>()
             for (n in needing) {
-                val hits = searchCloudFoldersByExactName(n)
+                val queries = SameNamedCloudFolderHeal.exactTitleSearchQueries(
+                    needLower = n,
+                    siblings = merged,
+                    mappingDisplayByLower = mappingDisplayByLower
+                )
+                val hits = searchCloudFoldersByExactName(queries)
                 android.util.Log.e(
                     "ProtoLinkSync",
-                    "same-named heal name-search name=$n hits=${hits.size}"
+                    "same-named heal name-search name=$n queries=$queries hits=${hits.size}"
                 )
                 fromSearch += hits
             }
@@ -2933,16 +2973,20 @@ class MainViewModel @Inject constructor(
         }
         if (parentByMapped.isEmpty()) return 0
         val mustRoots = ancestorRootByMapped.values.distinctBy { it.lowercase() }
-        val mappedNames = mappings
-            .map { it.cloudFolderName.trim().lowercase() }
-            .filter { it.isNotEmpty() }
-            .toSet()
+        val mappingDisplayByLower = linkedMapOf<String, String>()
+        for (m in mappings) {
+            val display = m.cloudFolderName.trim()
+            if (display.isEmpty()) continue
+            mappingDisplayByLower.putIfAbsent(display.lowercase(), display)
+        }
+        val mappedNames = mappingDisplayByLower.keys
         val siblingsByParent = linkedMapOf<String, List<SameNamedCloudFolderHeal.Sibling>>()
         for (parentId in parentByMapped.values.distinctBy { it.lowercase() }) {
             val siblings = loadChildFolderSiblingsForDiscovery(
                 parentId = parentId,
                 mustIncludeRootIds = mustRoots,
-                onlyNames = mappedNames
+                onlyNames = mappedNames,
+                mappingDisplayByLower = mappingDisplayByLower
             )
             siblingsByParent[parentId] = siblings
             val nameHits = mappedNames.associateWith { n ->
