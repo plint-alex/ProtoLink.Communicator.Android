@@ -10,6 +10,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
+import ru.protolink.communicator.sync.model.FsEntry
 import ru.protolink.communicator.sync.model.LocalChange
 import ru.protolink.communicator.sync.model.RemoteChange
 import ru.protolink.communicator.sync.model.RemoteEntry
@@ -1708,6 +1709,11 @@ class SyncEngine(
             val kidsByParentRel = waveLocated.groupBy {
                 PathUtil.parentOf(PathUtil.normalize(it.relativePath))
             }
+            android.util.Log.e(
+                "ProtoLinkSync",
+                "force pull wave=$waveIndex named=${waveLocated.size} parents=${kidsByParentRel.size} " +
+                    "beforeEarlyPrune frontier=${frontier.size + next.size}"
+            )
             for ((parentRel, kids) in kidsByParentRel) {
                 pruneImmediateGhosts(
                     mapping,
@@ -1793,6 +1799,11 @@ class SyncEngine(
      * After a parent’s remote children are named, delete local immediate children absent from
      * that set (wrong-tree ghosts). Soft-fail per item (NFR-SYNC-1). Does not touch deeper
      * paths under still-valid remote folders.
+     *
+     * Live 1.0.75 FORCE_MID_INVENTORY: never call full-tree [LocalFileSystem.snapshot] here —
+     * SAF snapshot hashes every file and stalled after root kids=380 with ghosts already absent.
+     * Skip when there are no ghosts; Agents protect uses a scoped listImmediate walk under the
+     * ghost folder only.
      */
     private fun pruneImmediateGhosts(
         mapping: SyncMapping,
@@ -1816,15 +1827,15 @@ class SyncEngine(
         val ghosts = locals
             .filter { PathUtil.nameOf(it.relativePath).lowercase() !in remoteNames }
             .sortedByDescending { PathUtil.normalize(it.relativePath).count { c -> c == '/' } }
-        val localPaths = try {
-            fs.snapshot(mapping.localRootPath).map { PathUtil.normalize(it.relativePath) }
-        } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            emptyList()
-        }
+        if (ghosts.isEmpty()) return
         for (entry in ghosts) {
             val path = PathUtil.normalize(entry.relativePath)
-            if (AgentsRoleQueuePaths.isForcePruneProtected(path, localPaths)) {
+            val protectProbe = if (entry.isFolder) {
+                listRelativePathsUnder(mapping, path)
+            } else {
+                null
+            }
+            if (AgentsRoleQueuePaths.isForcePruneProtected(path, protectProbe)) {
                 SyncRemoteDownload.logMaterializeFailed(
                     "ForcePullMapping.EarlyPrune.AgentsQueueSkip",
                     path,
@@ -1858,6 +1869,64 @@ class SyncEngine(
                 )
             }
         }
+    }
+
+    /**
+     * Names/isFolder only via [LocalFileSystem.listImmediate] — no content-hash snapshot.
+     * Used for Agents open-queue protect and end-of-Force mirror prune.
+     */
+    private fun listRelativePathsUnder(mapping: SyncMapping, folderRelative: String): List<String> {
+        val out = mutableListOf<String>()
+        val queue = ArrayDeque<String>()
+        queue.add(PathUtil.normalize(folderRelative))
+        while (queue.isNotEmpty()) {
+            val rel = queue.removeFirst()
+            val kids = try {
+                fs.listImmediate(mapping.localRootPath, rel)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                SyncRemoteDownload.logMaterializeFailed(
+                    "ForcePullMapping.ListUnder",
+                    rel.ifEmpty { "." },
+                    "-",
+                    e.message ?: e.javaClass.simpleName
+                )
+                continue
+            }
+            for (kid in kids) {
+                val path = PathUtil.normalize(kid.relativePath)
+                out.add(path)
+                if (kid.isFolder) queue.add(path)
+            }
+        }
+        return out
+    }
+
+    /** Full mapping tree via listImmediate (no SAF content hash). */
+    private fun listAllRelativeEntries(mapping: SyncMapping): List<FsEntry> {
+        val out = mutableListOf<FsEntry>()
+        val queue = ArrayDeque<String>()
+        queue.add("")
+        while (queue.isNotEmpty()) {
+            val rel = queue.removeFirst()
+            val kids = try {
+                fs.listImmediate(mapping.localRootPath, rel)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                SyncRemoteDownload.logMaterializeFailed(
+                    "ForcePullMapping.ListAll",
+                    rel.ifEmpty { "." },
+                    "-",
+                    e.message ?: e.javaClass.simpleName
+                )
+                continue
+            }
+            for (kid in kids) {
+                out.add(kid)
+                if (kid.isFolder) queue.add(PathUtil.normalize(kid.relativePath))
+            }
+        }
+        return out
     }
 
     /**
@@ -1955,9 +2024,10 @@ class SyncEngine(
     /**
      * Force download mirror: remove local files/folders (and meta) whose path is not in the
      * remote walk — cloud-absent / Cloud-deleted ghosts leave the device.
+     * Uses listImmediate walk (no content-hash snapshot) — same Agents protect, far cheaper on SAF.
      */
     private fun pruneLocalAbsentFromRemote(mapping: SyncMapping, remotePaths: Set<String>) {
-        val snap = fs.snapshot(mapping.localRootPath)
+        val snap = listAllRelativeEntries(mapping)
             .sortedByDescending { PathUtil.normalize(it.relativePath).count { c -> c == '/' } }
         val localPaths = snap.map { PathUtil.normalize(it.relativePath) }
         for (entry in snap) {

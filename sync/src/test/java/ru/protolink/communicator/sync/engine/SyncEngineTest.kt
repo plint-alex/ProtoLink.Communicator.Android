@@ -1069,6 +1069,47 @@ class SyncEngineTest {
     }
 
     /**
+     * Live 1.0.75 FORCE_MID_INVENTORY: early prune called full-tree snapshot (SAF content-hash)
+     * even when root ghosts were already absent — stalled after root kids before wave/getFile.
+     * Pre-matched local tree must not snapshot during Force.
+     */
+    @Test
+    fun forcePull_noGhosts_doesNotSnapshotWholeTree() = runTest {
+        val (store, innerFs, remote) = harness()
+        var snapshots = 0
+        val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
+            override fun snapshot(rootPath: String): List<FsEntry> {
+                snapshots++
+                return innerFs.snapshot(rootPath)
+            }
+        }
+        remote.seedFolder("films", "cloud-root", "Films")
+        remote.seedFile("idx", "films", "index.html", "movie".toByteArray())
+        remote.seedFolder("atv", "cloud-root", "AgentTeamVerify")
+        remote.seedFile("t1", "atv", "a.txt", "a".toByteArray())
+        // Wide root peers (live ~380) already present locally — no ghosts.
+        repeat(60) { i ->
+            remote.seedFile("root$i", "cloud-root", "shot-$i.png", "img$i".toByteArray())
+            innerFs.writeFile(root, "shot-$i.png", "img$i".toByteArray())
+        }
+        innerFs.createDirectory(root, "Films")
+        innerFs.writeFile(root, "Films/index.html", "movie".toByteArray())
+        innerFs.createDirectory(root, "AgentTeamVerify")
+        innerFs.writeFile(root, "AgentTeamVerify/a.txt", "a".toByteArray())
+        // Large already-synced tree that a hashed snapshot would thrash.
+        repeat(80) { i ->
+            innerFs.writeFile(root, "Agents/deep/file-$i.html", "x$i".toByteArray())
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(2)
+        assertThat(snapshots).isEqualTo(0)
+        assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
+        assertThat(String(fs.readFile(root, "AgentTeamVerify/a.txt"))).isEqualTo("a")
+    }
+
+    /**
      * Live 1.0.56 progressive-incomplete: ghost prune waited for full tree Force-complete.
      * After root wave names, wrong-tree root dirs must die before deeper downloads finish.
      */
