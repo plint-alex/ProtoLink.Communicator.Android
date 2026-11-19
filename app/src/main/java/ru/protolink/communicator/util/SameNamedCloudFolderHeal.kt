@@ -216,6 +216,40 @@ object SameNamedCloudFolderHeal {
         return out.values.take(maxRoots)
     }
 
+    /**
+     * FORCE_HEAL_DISCOVER_MISS_DRIVE_898: after CloudRoot child paging, which mapped
+     * names still have fewer than [minHits] siblings (canonical Drive id never listed).
+     */
+    fun namesNeedingMoreHits(
+        siblings: List<Sibling>,
+        onlyNamesLower: Set<String>,
+        minHits: Int = 2
+    ): Set<String> {
+        if (onlyNamesLower.isEmpty() || minHits < 1) return emptySet()
+        return onlyNamesLower.filterTo(linkedSetOf()) { n ->
+            siblings.count { it.name.trim().equals(n, ignoreCase = true) } < minHits
+        }
+    }
+
+    /**
+     * Merge exact-name SearchEntities CloudFolder hits into root-paged siblings so
+     * prefer-populated remap can see Drive 898c1453 when files-first child paging
+     * never reached the folder under a polluted CloudRoot.
+     */
+    fun mergeExactNameSearchHits(
+        siblings: List<Sibling>,
+        searchHits: List<Sibling>,
+        onlyNamesLower: Set<String>
+    ): List<Sibling> {
+        if (searchHits.isEmpty() || onlyNamesLower.isEmpty()) return siblings
+        val relevant = searchHits.filter { s ->
+            val n = s.name.trim().lowercase()
+            n.isNotEmpty() && n in onlyNamesLower
+        }
+        if (relevant.isEmpty()) return siblings
+        return mergeById(siblings, relevant)
+    }
+
     private val siblingCanonicalOrder = Comparator<Sibling> { a, b ->
         val scoreCmp = CloudInteractiveListing.healRichnessScore(
             b.immediateChildCount,

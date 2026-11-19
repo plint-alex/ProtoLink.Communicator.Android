@@ -31,6 +31,7 @@ import ru.protolink.communicator.data.api.DeleteEntityRequest
 import ru.protolink.communicator.data.api.EntityDto
 import ru.protolink.communicator.data.api.GetEntitiesRequest
 import ru.protolink.communicator.data.api.ProtoLinkApi
+import ru.protolink.communicator.data.api.SearchEntitiesRequest
 import ru.protolink.communicator.data.api.SendCommandRequest
 import ru.protolink.communicator.sync.engine.ContentHashUtil
 import ru.protolink.communicator.sync.engine.SyncEngine
@@ -2676,35 +2677,100 @@ class MainViewModel @Inject constructor(
         )
     }
 
-    /** Immediate children only (paged). No child-count enrich. */
+    /**
+     * Immediate folder children (paged). Values-light first so files-first API order
+     * does not burn the page budget on IncludeValues, then hydrate folder names by id.
+     */
     private suspend fun loadChildFolderSiblingsRaw(parentId: String): List<SameNamedCloudFolderHeal.Sibling> {
         if (parentId.isBlank() || CloudVirtualNodes.isVirtual(parentId)) return emptyList()
-        val out = mutableListOf<SameNamedCloudFolderHeal.Sibling>()
+        val folderIds = ArrayList<String>()
+        val creationById = linkedMapOf<String, String?>()
         var skip = 0
         val pageSize = 500
-        val maxSkip = 5_000
+        val maxSkip = 20_000
         while (skip <= maxSkip) {
-            val children = api.getEntities(
-                GetEntitiesRequest(
-                    parentIds = listOf(parentId),
-                    includeValues = true,
-                    skip = skip,
-                    take = pageSize
+            val children = runCatching {
+                api.getEntities(
+                    GetEntitiesRequest(
+                        parentIds = listOf(parentId),
+                        includeValues = false,
+                        skip = skip,
+                        take = pageSize
+                    )
                 )
-            )
+            }.getOrElse { emptyList() }
             if (children.isEmpty()) break
             for (e in children) {
                 if (e.code != CloudCodes.CLOUD_FOLDER && e.code != CloudCodes.CLOUD_ROOT) continue
-                out.add(
-                    SameNamedCloudFolderHeal.Sibling(
-                        id = e.id,
-                        name = entityDisplayName(e),
-                        creationTime = e.creationTime
-                    )
-                )
+                if (e.id.isBlank()) continue
+                folderIds.add(e.id)
+                creationById.putIfAbsent(e.id.lowercase(), e.creationTime)
             }
             if (children.size < pageSize) break
             skip += pageSize
+        }
+        if (folderIds.isEmpty()) return emptyList()
+        val nameById = linkedMapOf<String, String>()
+        for (chunk in folderIds.distinctBy { it.lowercase() }.chunked(80)) {
+            val hydrated = runCatching {
+                api.getEntities(
+                    GetEntitiesRequest(
+                        ids = chunk,
+                        includeValues = true,
+                        take = chunk.size
+                    )
+                )
+            }.getOrElse { emptyList() }
+            for (e in hydrated) {
+                if (e.id.isBlank()) continue
+                nameById[e.id.lowercase()] = entityDisplayName(e)
+            }
+        }
+        return folderIds.distinctBy { it.lowercase() }.map { id ->
+            SameNamedCloudFolderHeal.Sibling(
+                id = id,
+                name = nameById[id.lowercase()].orEmpty(),
+                creationTime = creationById[id.lowercase()]
+            )
+        }
+    }
+
+    /**
+     * Exact-title CloudFolder/CloudRoot hits via SearchEntities — supplements root
+     * child paging when Drive pollution buries canonical MyNotesFolder (898c1453).
+     */
+    private suspend fun searchCloudFoldersByExactName(name: String): List<SameNamedCloudFolderHeal.Sibling> {
+        val q = name.trim()
+        if (q.length < 2) return emptyList()
+        val resp = runCatching {
+            api.searchEntities(
+                SearchEntitiesRequest(query = q, take = 50),
+                fromCache = false
+            )
+        }.getOrNull() ?: return emptyList()
+        val items = resp.items.orEmpty()
+        val out = ArrayList<SameNamedCloudFolderHeal.Sibling>()
+        for (hit in items) {
+            val id = hit.id?.trim().orEmpty()
+            if (id.isEmpty()) continue
+            val title = hit.title?.trim().orEmpty()
+            if (!title.equals(q, ignoreCase = true)) continue
+            val code = hit.code?.trim().orEmpty()
+            val tag = hit.typeTag?.trim().orEmpty()
+            val isFolder =
+                code.equals(CloudCodes.CLOUD_FOLDER, ignoreCase = true) ||
+                    code.equals(CloudCodes.CLOUD_ROOT, ignoreCase = true) ||
+                    tag.equals(CloudCodes.CLOUD_FOLDER, ignoreCase = true) ||
+                    tag.equals(CloudCodes.CLOUD_ROOT, ignoreCase = true) ||
+                    (code.isEmpty() && tag.isEmpty())
+            if (!isFolder) continue
+            out.add(
+                SameNamedCloudFolderHeal.Sibling(
+                    id = id,
+                    name = title,
+                    creationTime = hit.updateTime
+                )
+            )
         }
         return out
     }
@@ -2743,6 +2809,8 @@ class MainViewModel @Inject constructor(
     /**
      * Immediate parent siblings merged with same-named folders under other CloudRoots
      * (Drive / oldest), so dual MyNotesFolder across Android root vs Win Drive remaps.
+     * When [onlyNames] still has nameHits under 2 after root paging, SearchEntities
+     * exact-title merge closes FORCE_HEAL_DISCOVER_MISS_DRIVE_898 (files-first pollution).
      */
     private suspend fun loadChildFolderSiblingsForDiscovery(
         parentId: String,
@@ -2765,7 +2833,21 @@ class MainViewModel @Inject constructor(
             if (rootId.equals(parentId, ignoreCase = true)) continue
             fromRoots += runCatching { loadChildFolderSiblingsRaw(rootId) }.getOrElse { emptyList() }
         }
-        val merged = SameNamedCloudFolderHeal.mergeById(local, fromRoots)
+        var merged = SameNamedCloudFolderHeal.mergeById(local, fromRoots)
+        val names = onlyNames?.filter { it.isNotBlank() }?.toSet().orEmpty()
+        val needing = SameNamedCloudFolderHeal.namesNeedingMoreHits(merged, names)
+        if (needing.isNotEmpty()) {
+            val fromSearch = mutableListOf<SameNamedCloudFolderHeal.Sibling>()
+            for (n in needing) {
+                val hits = searchCloudFoldersByExactName(n)
+                android.util.Log.e(
+                    "ProtoLinkSync",
+                    "same-named heal name-search name=$n hits=${hits.size}"
+                )
+                fromSearch += hits
+            }
+            merged = SameNamedCloudFolderHeal.mergeExactNameSearchHits(merged, fromSearch, names)
+        }
         return enrichDuplicateSiblingChildCounts(merged, onlyNames)
     }
 

@@ -259,4 +259,48 @@ class SameNamedCloudFolderHealTest {
         )
         assertThat(forForce!!.cloudFolderId).isEqualTo(winId)
     }
+
+    /**
+     * FORCE_HEAL_DISCOVER_MISS_DRIVE_898: root child paging only saw empty Android twin
+     * (nameHits=1); SearchEntities exact-title hits merge Drive 898 → remap.
+     */
+    @Test
+    fun forceHealDiscoverMiss_nameSearchMerge_remapsEmptyTwinTo898() {
+        val androidRoot = "ba9266e9-ac45-46f3-9b6d-cdde2f4e2d35"
+        val emptyTwin = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val underAndroidOnly = listOf(
+            SameNamedCloudFolderHeal.Sibling(emptyTwin, "MyNotesFolder", "2026-11-19T17:00:00", 0)
+        )
+        assertThat(
+            SameNamedCloudFolderHeal.namesNeedingMoreHits(
+                underAndroidOnly,
+                setOf("mynotesfolder")
+            )
+        ).containsExactly("mynotesfolder")
+
+        val searchHits = listOf(
+            SameNamedCloudFolderHeal.Sibling(emptyTwin, "MyNotesFolder", null, 0),
+            SameNamedCloudFolderHeal.Sibling(winId, "MyNotesFolder", "2026-10-29T18:49:32", 24),
+            SameNamedCloudFolderHeal.Sibling("cccccccc-cccc-4ccc-8ccc-cccccccccccc", "Other", null, 0)
+        )
+        val merged = SameNamedCloudFolderHeal.mergeExactNameSearchHits(
+            siblings = underAndroidOnly,
+            searchHits = searchHits,
+            onlyNamesLower = setOf("mynotesfolder")
+        )
+        assertThat(merged.count { it.name.equals("MyNotesFolder", ignoreCase = true) })
+            .isAtLeast(2)
+        assertThat(merged.any { it.id == winId }).isTrue()
+
+        val remaps = SameNamedCloudFolderHeal.remapsForDuplicateNames(
+            mappings = listOf(
+                SameNamedCloudFolderHeal.MappingRow(emptyTwin, local, "MyNotesFolder")
+            ),
+            siblingsByParent = mapOf(androidRoot to merged),
+            parentIdByMappedId = mapOf(emptyTwin to androidRoot)
+        )
+        assertThat(remaps).hasSize(1)
+        assertThat(remaps[0].fromId).isEqualTo(emptyTwin)
+        assertThat(remaps[0].toId).isEqualTo(winId)
+    }
 }

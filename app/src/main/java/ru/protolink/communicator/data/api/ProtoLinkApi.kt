@@ -65,6 +65,35 @@ data class GetEntitiesRequest(
     val sharedWithMe: Boolean = false
 )
 
+/** POST api/Entities/SearchEntities — title hits for heal name-search discover. */
+data class SearchEntitiesRequest(
+    val query: String,
+    val skip: Int = 0,
+    val take: Int? = 50,
+    val parentId: String? = null,
+    val typeEntityIds: List<String>? = null,
+    val includeHidden: Boolean = false,
+    val lang: String? = null
+)
+
+data class SearchEntitiesResponse(
+    val items: List<SearchEntityItemDto>? = null,
+    val skip: Int = 0,
+    val take: Int = 0,
+    val hasMore: Boolean = false,
+    val truncated: Boolean = false
+)
+
+data class SearchEntityItemDto(
+    val id: String? = null,
+    val code: String? = null,
+    val title: String? = null,
+    val snippet: String? = null,
+    val typeTag: String? = null,
+    val updateTime: String? = null,
+    val score: Int = 0
+)
+
 data class EntityDto(
     val id: String,
     val code: String?,
@@ -185,6 +214,16 @@ interface ProtoLinkApi {
 
     @POST("api/Entities/GetEntities")
     suspend fun getEntities(@Body body: GetEntitiesRequest): List<EntityDto>
+
+    /**
+     * Title search (heal same-named discover when CloudRoot child paging misses Drive
+     * canonical under files-first pollution — FORCE_HEAL_DISCOVER_MISS_DRIVE_898).
+     */
+    @POST("api/Entities/SearchEntities")
+    suspend fun searchEntities(
+        @Body body: SearchEntitiesRequest,
+        @Query("fromCache") fromCache: Boolean = false
+    ): SearchEntitiesResponse
 
     /** GetEntity card — name + mainParentId (AT-PC5). */
     @GET("api/Entities/GetEntity/{id}")
