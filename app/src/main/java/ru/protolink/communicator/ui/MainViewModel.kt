@@ -47,6 +47,7 @@ import ru.protolink.communicator.util.ChatTime
 import ru.protolink.communicator.util.CloudFileTypeCue
 import ru.protolink.communicator.util.CloudFolderDelete
 import ru.protolink.communicator.util.CloudFolderTree
+import ru.protolink.communicator.util.CloudInteractiveListing
 import ru.protolink.communicator.util.CloudListingStatus
 import ru.protolink.communicator.util.CloudMainParent
 import ru.protolink.communicator.util.CloudRecentList
@@ -130,7 +131,9 @@ data class CloudItem(
     /** Explorer Size column — cheap length or em-dash (no N+1). */
     val sizeDisplay: String = "—",
     /** Explorer Date when cheap (updateTime). */
-    val dateDisplay: String = ""
+    val dateDisplay: String = "",
+    /** Sort key — Win CloudInteractiveListing UpdateTime. */
+    val updateTimeMillis: Long = 0L
 )
 
 /** Persistent Folders tree row (AT-PC1 / AT-PC8 / E9b). */
@@ -739,9 +742,13 @@ class MainViewModel @Inject constructor(
     private fun entityDisplayName(e: EntityDto): String = EntityMeta.displayName(e)
 
     /** Folder/file row for Cloud list; files get mime + type-cue subtitle (AT-UL3 / AT-CE2). */
-    private fun cloudChildItem(e: EntityDto): CloudItem? {
-        val name = entityDisplayName(e)
-        val date = ChatTime.formatListMeta(ChatTime.parseMillis(e.updateTime))
+    private fun cloudChildItem(
+        e: EntityDto,
+        syncMetaLeafNameByRemoteId: ((String) -> String?)? = null
+    ): CloudItem? {
+        val name = CloudInteractiveListing.resolveRowName(e, syncMetaLeafNameByRemoteId)
+        val updateMillis = ChatTime.parseMillis(e.updateTime)
+        val date = ChatTime.formatListMeta(updateMillis)
         return when (e.code) {
             CloudCodes.CLOUD_FOLDER, CloudCodes.CLOUD_ROOT -> {
                 folderTreeCodes[e.id.lowercase()] = e.code
@@ -751,7 +758,8 @@ class MainViewModel @Inject constructor(
                     isFolder = true,
                     typeLabel = "Folder",
                     sizeDisplay = "—",
-                    dateDisplay = date
+                    dateDisplay = date,
+                    updateTimeMillis = updateMillis
                 )
             }
             CloudCodes.CLOUD_FILE -> {
@@ -765,11 +773,111 @@ class MainViewModel @Inject constructor(
                     subtitle = typeCue,
                     typeLabel = typeCue,
                     sizeDisplay = "—",
-                    dateDisplay = date
+                    dateDisplay = date,
+                    updateTimeMillis = updateMillis
                 )
             }
             else -> null
         }
+    }
+
+    private fun syncMetaLeafLookup(folderId: String): ((String) -> String?)? {
+        val mapping = mappingStore.load()
+            .firstOrNull { it.cloudFolderId.equals(folderId, ignoreCase = true) }
+            ?: return null
+        val mappingId = mapping.cloudFolderId.replace("-", "")
+        val byRemote = runCatching { metadataStore.getAll(mappingId) }
+            .getOrDefault(emptyList())
+            .associateBy { it.remoteId.lowercase() }
+        if (byRemote.isEmpty()) return null
+        return { remoteId ->
+            byRemote[remoteId.lowercase()]?.relativePath
+                ?.let { CloudInteractiveListing.leafName(it) }
+                ?.takeIf { it.isNotEmpty() }
+        }
+    }
+
+    private fun sortCloudListing(items: List<CloudItem>): List<CloudItem> =
+        CloudInteractiveListing.dedupeById(items) { it.id }
+            .sortedWith(
+                CloudInteractiveListing.listingComparator(
+                    isFolder = { it.isFolder },
+                    updateTimeMillis = { it.updateTimeMillis },
+                    name = { it.name }
+                )
+            )
+
+    /** Win-parity: values-light first page, then IncludeValues hydrate (same Take). */
+    private suspend fun loadCloudFolderChildren(folderId: String): List<CloudItem> {
+        val metaLeaf = syncMetaLeafLookup(folderId)
+        val pageSize = CloudInteractiveListing.PAGE_SIZE
+        val maxPages = CloudInteractiveListing.MAX_PAGES
+        val light = ArrayList<EntityDto>()
+        var skip = 0
+        for (page in 0 until maxPages) {
+            val batch = api.getEntities(
+                GetEntitiesRequest(
+                    parentIds = listOf(folderId),
+                    includeValues = false,
+                    skip = skip,
+                    take = pageSize
+                )
+            )
+            if (batch.isEmpty()) break
+            light.addAll(batch)
+            if (batch.size < pageSize) break
+            skip += pageSize
+        }
+        var items = sortCloudListing(light.mapNotNull { cloudChildItem(it, metaLeaf) })
+        // Soft Ready from sync-meta when GetEntities returned empty (Win TryApplySyncMetaSoftReady).
+        if (items.isEmpty() && metaLeaf != null) {
+            val mapping = mappingStore.load()
+                .firstOrNull { it.cloudFolderId.equals(folderId, ignoreCase = true) }
+            if (mapping != null) {
+                val mappingId = mapping.cloudFolderId.replace("-", "")
+                val soft = CloudInteractiveListing.buildSoftReadyRows(
+                    folderRemoteId = folderId,
+                    children = runCatching { metadataStore.getAll(mappingId) }.getOrDefault(emptyList()),
+                    maxRows = pageSize
+                )
+                items = soft.map { row ->
+                    CloudItem(
+                        id = row.id,
+                        name = row.name,
+                        isFolder = row.isFolder,
+                        typeLabel = if (row.isFolder) "Folder" else "File",
+                        sizeDisplay = "—",
+                        dateDisplay = ChatTime.formatListMeta(row.updateTimeMillis),
+                        updateTimeMillis = row.updateTimeMillis
+                    )
+                }
+            }
+        }
+        // Soft hydrate IncludeValues (Win HydrateListingValuesAsync) — soft-fail keeps light list.
+        runCatching {
+            val hydrated = ArrayList<EntityDto>()
+            skip = 0
+            for (page in 0 until maxPages) {
+                val batch = api.getEntities(
+                    GetEntitiesRequest(
+                        parentIds = listOf(folderId),
+                        includeValues = true,
+                        skip = skip,
+                        take = pageSize
+                    )
+                )
+                if (batch.isEmpty()) break
+                hydrated.addAll(batch)
+                if (batch.size < pageSize) break
+                skip += pageSize
+            }
+            if (hydrated.isNotEmpty()) {
+                items = sortCloudListing(hydrated.mapNotNull { cloudChildItem(it, metaLeaf) })
+            }
+        }.onFailure { e ->
+            Log.w("ProtoLinkCloud", "values hydrate soft-fail id=$folderId: ${e.message}")
+        }
+        return items
     }
 
     suspend fun ensureCloudRoot() {
@@ -816,12 +924,7 @@ class MainViewModel @Inject constructor(
                     loadSharedByMeListing(lang)
                 folderId.equals(CloudVirtualNodes.RECENT_ID, ignoreCase = true) ->
                     loadRecentListing()
-                else -> {
-                    val children = api.getEntities(
-                        GetEntitiesRequest(parentIds = listOf(folderId), includeValues = true, take = 500)
-                    )
-                    children.mapNotNull { e -> cloudChildItem(e) }
-                }
+                else -> loadCloudFolderChildren(folderId)
             }
             // Browse stays live during Force (1.0.60) — but never clobber Force banner with
             // "Cloud loaded" (live 1.0.73 FORCE_NO_PROGRESS: Download all disabled + Cloud loaded).
@@ -1480,14 +1583,7 @@ class MainViewModel @Inject constructor(
                     loadCloudFolder(CloudVirtualNodes.HUB_ID)
                 } else {
                     currentFolderId = parentFolder
-                    val children = api.getEntities(
-                        GetEntitiesRequest(
-                            parentIds = listOf(parentFolder),
-                            includeValues = true,
-                            take = 500
-                        )
-                    )
-                    val items = children.mapNotNull { e -> cloudChildItem(e) }
+                    val items = loadCloudFolderChildren(parentFolder)
                     val mime = EntityMeta.mimeType(entity)
                     _state.update { s -> s.copy(cloudItems = items) }
                     setCloudFileOpen(
@@ -2689,14 +2785,18 @@ class MainViewModel @Inject constructor(
         if (dupNames.isEmpty()) return siblings
         return siblings.map { s ->
             if (s.name.trim().lowercase() !in dupNames) return@map s
+            // Win honesty: junk CloudFiles on a twin must not outrank a folder-rich canonical
+            // (live FAIL: twin 0bc549dd ~132 files beat 898c1453 ~24 folders).
             val count = runCatching {
-                api.getEntities(
-                    GetEntitiesRequest(
-                        parentIds = listOf(s.id),
-                        includeValues = false,
-                        take = 500
+                CloudInteractiveListing.folderChildCount(
+                    api.getEntities(
+                        GetEntitiesRequest(
+                            parentIds = listOf(s.id),
+                            includeValues = false,
+                            take = 500
+                        )
                     )
-                ).size
+                )
             }.getOrDefault(0)
             s.copy(immediateChildCount = count)
         }
