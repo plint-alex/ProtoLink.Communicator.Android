@@ -908,7 +908,61 @@ class SyncEngineTest {
 
         assertThat(count).isEqualTo(1)
         assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
+        // Remote leaf under soft-fail parent was never listed → not downloaded.
         assertThat(fs.exists(root, "bad/gone.txt")).isFalse()
+    }
+
+    /**
+     * Soft-fail empty nested inventory must not prune local children (inbox/output wipe class).
+     * Win parity: ForcePull_SoftFailEmptyInventory_DoesNotPruneLocalChildren.
+     */
+    @Test
+    fun forcePull_softFailEmptyInventory_doesNotPruneLocalChildren() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("agents", "cloud-root", "Agents")
+        inner.seedFolder("films", "cloud-root", "films")
+        inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
+
+        fs.createDirectory(root, "Agents")
+        fs.createDirectory(root, "Agents/inbox")
+        fs.createDirectory(root, "Agents/inbox/ask-1")
+        fs.writeFile(root, "Agents/inbox/ask-1/index.html", "planted-inbox".toByteArray())
+        fs.createDirectory(root, "Agents/output")
+        fs.writeFile(root, "Agents/output/note.txt", "planted-output".toByteArray())
+        fs.writeFile(root, "ghost-root.txt", "local-only-ghost".toByteArray())
+
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun listChildrenPaged(
+                parentId: String,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                if (parentId == "agents") {
+                    throw RuntimeException("HTTP 500 Internal Server Error")
+                }
+                return inner.listChildrenPaged(parentId, includeValues)
+            }
+
+            override suspend fun listChildrenOfParents(
+                parentIds: List<String>,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> =
+                parentIds.flatMap { listChildrenPaged(it, includeValues) }
+        }
+
+        val engine = SyncEngine(store, fs, remote)
+        val count = engine.forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(1)
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
+        assertThat(String(fs.readFile(root, "Agents/inbox/ask-1/index.html"))).isEqualTo("planted-inbox")
+        assertThat(String(fs.readFile(root, "Agents/output/note.txt"))).isEqualTo("planted-output")
+        assertThat(fs.exists(root, "ghost-root.txt")).isFalse()
+        assertThat(
+            engine.isUnderForceInventoryUnknown(
+                "Agents/inbox/x",
+                setOf("Agents")
+            )
+        ).isTrue()
     }
 
     @Test

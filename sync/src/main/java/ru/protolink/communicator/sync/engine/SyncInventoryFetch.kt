@@ -3,8 +3,10 @@ package ru.protolink.communicator.sync.engine
 /**
  * Force structure-first inventory GetEntities: transient HTTP 5xx must not abort the whole
  * pass (live FAIL class: retrofit2.HttpException HTTP 500 mid parent-walk). Retry with
- * backoff, then soft-fail that parent/chunk so siblings still fill+prune (NFR-SYNC-1).
- * Auth / 4xx stay hard. Root listing exhaustion stays hard (empty inventory would prune all).
+ * backoff, then soft-fail that parent/chunk so siblings still fill (NFR-SYNC-1).
+ * Soft-fail empty ≠ proven-empty children — Force must not prune local descendants under
+ * that parent (inventoryUnknownRels). Auth / 4xx stay hard. Root listing exhaustion stays
+ * hard (empty inventory would prune all).
  */
 object SyncInventoryFetch {
     const val MAX_ATTEMPTS = 4

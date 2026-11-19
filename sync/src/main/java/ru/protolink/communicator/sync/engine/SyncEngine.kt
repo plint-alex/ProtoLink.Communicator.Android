@@ -1230,12 +1230,13 @@ class SyncEngine(
 
     private suspend fun listChildrenForceInventoryParallel(
         folderIds: List<String>,
-        throttle: Semaphore
+        throttle: Semaphore,
+        softFailedOut: MutableSet<String>? = null
     ): List<RemoteEntry> = coroutineScope {
         folderIds.map { id ->
             async {
                 throttle.withPermit {
-                    listChildrenForceInventory(id, softFailOnExhausted = true)
+                    listChildrenForceInventory(id, softFailOnExhausted = true, softFailedOut)
                 }
             }
         }.awaitAll().flatten()
@@ -1244,10 +1245,12 @@ class SyncEngine(
     /**
      * Structure-only GetEntities with backoff/retry on transient HTTP 5xx.
      * Soft-fail returns empty children (skip subtree); hard client errors and non-5xx rethrow.
+     * Soft-fail empty ≠ proven-empty — [softFailedOut] records unknown parents for Force prune skip.
      */
     private suspend fun listChildrenForceInventory(
         folderId: String,
-        softFailOnExhausted: Boolean
+        softFailOnExhausted: Boolean,
+        softFailedOut: MutableSet<String>? = null
     ): List<RemoteEntry> {
         var last: Throwable? = null
         for (attempt in 0 until SyncInventoryFetch.MAX_ATTEMPTS) {
@@ -1270,6 +1273,7 @@ class SyncEngine(
         val detail = last?.message ?: last?.javaClass?.simpleName ?: "exhausted"
         if (softFailOnExhausted) {
             SyncInventoryFetch.logSoftFail("ForceStructure", folderId, detail)
+            softFailedOut?.add(folderId)
             return emptyList()
         }
         throw last ?: SyncException("Force inventory GetEntities failed for root folder.")
@@ -1316,11 +1320,13 @@ class SyncEngine(
     /**
      * Structure-list one Force BFS wave of parents (MatchAny batches + 5xx → per-parent soft-fail).
      * Returns children keyed by parent id. [matchAnyEnabled] null = probe, false = 1 GE/parent.
+     * [softFailedOut] receives parent ids whose inventory soft-failed to empty (unknown, not proven empty).
      */
     private suspend fun listChildrenForceWaveByParent(
         parentIds: List<String>,
         throttle: Semaphore,
-        matchAnyEnabled: Boolean?
+        matchAnyEnabled: Boolean?,
+        softFailedOut: MutableSet<String>
     ): Pair<Map<String, List<RemoteEntry>>, Boolean?> {
         if (parentIds.isEmpty()) return emptyMap<String, List<RemoteEntry>>() to matchAnyEnabled
         val distinct = parentIds.distinct()
@@ -1337,7 +1343,7 @@ class SyncEngine(
         for (batch in distinct.chunked(FORCE_PARENT_BATCH)) {
             val children = when {
                 matchAny == false || batch.size == 1 ->
-                    listChildrenForceInventoryParallel(batch, throttle)
+                    listChildrenForceInventoryParallel(batch, throttle, softFailedOut)
                 else -> {
                     var batched = try {
                         throttle.withPermit {
@@ -1359,11 +1365,15 @@ class SyncEngine(
                             batch.first() + "+${batch.size - 1}",
                             t.message ?: t.javaClass.simpleName
                         )
-                        listChildrenForceInventoryParallel(batch, throttle)
+                        listChildrenForceInventoryParallel(batch, throttle, softFailedOut)
                     }
                     if (matchAny == null && batched.isEmpty() && batch.size > 1) {
                         val single = throttle.withPermit {
-                            listChildrenForceInventory(batch[0], softFailOnExhausted = true)
+                            listChildrenForceInventory(
+                                batch[0],
+                                softFailOnExhausted = true,
+                                softFailedOut
+                            )
                         }
                         if (single.isNotEmpty()) {
                             System.err.println(
@@ -1371,7 +1381,7 @@ class SyncEngine(
                                     "batch, non-empty single) — Force wave falls back to 1 GE/parent"
                             )
                             matchAny = false
-                            batched = listChildrenForceInventoryParallel(batch, throttle)
+                            batched = listChildrenForceInventoryParallel(batch, throttle, softFailedOut)
                         } else {
                             matchAny = true
                         }
@@ -1737,6 +1747,8 @@ class SyncEngine(
         val structureThrottle = Semaphore(WALK_REMOTE_CONCURRENCY)
         var matchAnyEnabled: Boolean? = null
         val structureCache = mutableMapOf<String, List<RemoteEntry>>()
+        // Soft-fail empty inventory ≠ proven zero children — skip early/final ghost prune under these.
+        val inventoryUnknownRels = mutableSetOf<String>()
         // Folder ids already materialized as a wave — breaks remote parent cycles.
         val visitedFolderIds = mutableSetOf<String>()
         // AC getFile deferred while other AC folders remain; non-downloadable files register only.
@@ -1799,14 +1811,20 @@ class SyncEngine(
                 .filter { it !in structureCache }
                 .distinct()
             if (needList.isNotEmpty()) {
+                val softFailedIds = mutableSetOf<String>()
                 val (listed, nextMatch) = listChildrenForceWaveByParent(
                     needList,
                     structureThrottle,
-                    matchAnyEnabled
+                    matchAnyEnabled,
+                    softFailedIds
                 )
                 matchAnyEnabled = nextMatch
                 for (id in needList) {
                     structureCache[id] = listed[id].orEmpty()
+                    if (id in softFailedIds) {
+                        val rel = waveParents.first { it.first == id }.second
+                        inventoryUnknownRels.add(PathUtil.normalize(rel))
+                    }
                 }
             }
 
@@ -1878,6 +1896,8 @@ class SyncEngine(
                     "beforeEarlyPrune frontier=${frontier.size + next.size}"
             )
             for ((parentRel, kids) in kidsByParentRel) {
+                val parentNorm = PathUtil.normalize(parentRel)
+                if (parentNorm in inventoryUnknownRels) continue
                 pruneImmediateGhosts(
                     mapping,
                     parentRel,
@@ -1950,12 +1970,29 @@ class SyncEngine(
         if (remotePaths.isEmpty()) {
             throw SyncException("Force download found no remote files in this folder.")
         }
-        pruneLocalAbsentFromRemote(mapping, remotePaths)
+        pruneLocalAbsentFromRemote(mapping, remotePaths, inventoryUnknownRels)
         if (files == 0 && !sawRemoteFile) {
             throw SyncException("Force download processed 0 files (folders only).")
         }
         store.setLastSyncUtc(mapping.id, Instant.now())
         return files
+    }
+
+    /**
+     * Soft-fail empty GetEntities must not count as proven-empty children for Force prune.
+     */
+    internal fun isUnderForceInventoryUnknown(
+        relativePath: String,
+        inventoryUnknownRels: Set<String>
+    ): Boolean {
+        if (inventoryUnknownRels.isEmpty()) return false
+        val norm = PathUtil.normalize(relativePath)
+        for (unknown in inventoryUnknownRels) {
+            if (unknown.isEmpty()) return true
+            if (norm.equals(unknown, ignoreCase = true)) return true
+            if (norm.startsWith("$unknown/", ignoreCase = true)) return true
+        }
+        return false
     }
 
     /**
@@ -2197,15 +2234,29 @@ class SyncEngine(
     /**
      * Force download mirror: remove local files/folders (and meta) whose path is not in the
      * remote walk — cloud-absent / Cloud-deleted ghosts leave the device.
+     * Paths under soft-fail inventory parents are skipped (unknown ≠ empty).
      * Uses listImmediate walk (no content-hash snapshot) — same Agents protect, far cheaper on SAF.
      */
-    private fun pruneLocalAbsentFromRemote(mapping: SyncMapping, remotePaths: Set<String>) {
+    private fun pruneLocalAbsentFromRemote(
+        mapping: SyncMapping,
+        remotePaths: Set<String>,
+        inventoryUnknownRels: Set<String>
+    ) {
         val snap = listAllRelativeEntries(mapping)
             .sortedByDescending { PathUtil.normalize(it.relativePath).count { c -> c == '/' } }
         val localPaths = snap.map { PathUtil.normalize(it.relativePath) }
         for (entry in snap) {
             val path = PathUtil.normalize(entry.relativePath)
             if (path in remotePaths) continue
+            if (isUnderForceInventoryUnknown(path, inventoryUnknownRels)) {
+                SyncRemoteDownload.logMaterializeFailed(
+                    "ForcePullMapping.Prune.InventoryUnknownSkip",
+                    path,
+                    "-",
+                    "skip prune under soft-fail empty inventory parent"
+                )
+                continue
+            }
             if (AgentsRoleQueuePaths.isForcePruneProtected(path, localPaths)) {
                 SyncRemoteDownload.logMaterializeFailed(
                     "ForcePullMapping.Prune.AgentsQueueSkip",
@@ -2233,6 +2284,7 @@ class SyncEngine(
         for (meta in store.getAll(mapping.id)) {
             val path = PathUtil.normalize(meta.relativePath)
             if (path in remotePaths) continue
+            if (isUnderForceInventoryUnknown(path, inventoryUnknownRels)) continue
             if (AgentsRoleQueuePaths.isForcePruneProtected(path, localPaths)) continue
             store.delete(mapping.id, path)
         }
