@@ -70,6 +70,53 @@ class SameNamedCloudFolderHealTest {
         ).isNull()
     }
 
+    /**
+     * Demotion FAIL class: after folderChildCount enrich, twin junk files score 0 folders while
+     * content-bearing 898 scores ~24 — mapped 898 must not remap to twin; twin remaps → 898.
+     */
+    @Test
+    fun preferExisting_folderRichCanonicalBeatsJunkFileTwin() {
+        val siblings = listOf(
+            SameNamedCloudFolderHeal.Sibling(dupId, "MyNotesFolder", "2026-10-28T09:46:55", 0),
+            SameNamedCloudFolderHeal.Sibling(winId, "MyNotesFolder", "2026-10-29T18:49:32", 24)
+        )
+        val pick = SameNamedCloudFolderHeal.preferExistingSameName("MyNotesFolder", siblings)
+        assertThat(pick!!.id).isEqualTo(winId)
+        assertThat(
+            SameNamedCloudFolderHeal.canonicalIdIfMappedIsDuplicate(winId, "MyNotesFolder", siblings)
+        ).isNull()
+    }
+
+    @Test
+    fun remaps_mappedCanonical_notDemotedWhenTwinHasZeroFolders() {
+        val siblings = listOf(
+            SameNamedCloudFolderHeal.Sibling(dupId, "MyNotesFolder", "2026-10-28T09:46:55", 0),
+            SameNamedCloudFolderHeal.Sibling(winId, "MyNotesFolder", "2026-10-29T18:49:32", 24)
+        )
+        val remaps = SameNamedCloudFolderHeal.remapsForDuplicateNames(
+            mappings = listOf(SameNamedCloudFolderHeal.MappingRow(winId, local, "MyNotesFolder")),
+            siblingsByParent = mapOf("parent" to siblings),
+            parentIdByMappedId = mapOf(winId to "parent")
+        )
+        assertThat(remaps).isEmpty()
+    }
+
+    @Test
+    fun remaps_twinJunk_healsToFolderRichCanonical() {
+        val siblings = listOf(
+            SameNamedCloudFolderHeal.Sibling(dupId, "MyNotesFolder", "2026-10-28T09:46:55", 0),
+            SameNamedCloudFolderHeal.Sibling(winId, "MyNotesFolder", "2026-10-29T18:49:32", 24)
+        )
+        val remaps = SameNamedCloudFolderHeal.remapsForDuplicateNames(
+            mappings = listOf(SameNamedCloudFolderHeal.MappingRow(dupId, local, "MyNotesFolder")),
+            siblingsByParent = mapOf("parent" to siblings),
+            parentIdByMappedId = mapOf(dupId to "parent")
+        )
+        assertThat(remaps).hasSize(1)
+        assertThat(remaps[0].fromId).isEqualTo(dupId)
+        assertThat(remaps[0].toId).isEqualTo(winId)
+    }
+
     @Test
     fun remapsAndApply_healsAndroidDupMappingWhenEmptyIsOlder() {
         val mappings = listOf(

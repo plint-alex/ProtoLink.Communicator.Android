@@ -5,7 +5,9 @@ package ru.protolink.communicator.util
  * Create-new in the map wizard adds a second id while Win already maps the populated one.
  *
  * Canonical pick among case-insensitive name matches:
- * 1) higher immediateChildCount (populated wins over empty older duplicates),
+ * 1) higher immediateChildCount (folder children only via
+ *    [CloudInteractiveListing.folderChildCount] — junk CloudFiles must not demote
+ *    folder-rich 898c1453 to twin 0bc549dd),
  * 2) then earliest creationTime,
  * 3) then id.
  */
