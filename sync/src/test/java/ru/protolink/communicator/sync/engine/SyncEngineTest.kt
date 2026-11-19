@@ -574,6 +574,61 @@ class SyncEngineTest {
         assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
     }
 
+    /**
+     * Live 1.0.76 FORCE_MID_INVENTORY: after wave≈16, Force kept BFS-listing under every
+     * Agents open-queue task shell (SkipMkdir only skipped mkdir). Must not listChildren the
+     * shell or its nested evidence tree — Force still completes AC fill.
+     */
+    @Test
+    fun forcePull_doesNotListUnderAgentsOpenQueueTaskShells() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("films-f", "cloud-root", "films")
+        inner.seedFile("films-i", "films-f", "index.html", "movie".toByteArray())
+        inner.seedFolder("pl-ru", "cloud-root", "Protolink.ru")
+        inner.seedFolder("agents", "pl-ru", "Agents")
+        inner.seedFolder("roles", "agents", "roles")
+        inner.seedFolder("role", "roles", "frontend-developer")
+        inner.seedFolder("todo", "role", "todo")
+        inner.seedFolder("shell", "todo", "p1-deep-shell")
+        // Nested under skip shell — must never be listed/downloaded.
+        inner.seedFolder("nested", "shell", "evidence")
+        inner.seedFile("blob", "nested", "dump.bin", ByteArray(64) { 1 })
+        val listedParents = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun listChildrenPaged(
+                parentId: String,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                listedParents.add(parentId)
+                return inner.listChildrenPaged(parentId, includeValues)
+            }
+
+            override suspend fun listChildrenOfParents(
+                parentIds: List<String>,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                listedParents.addAll(parentIds)
+                return parentIds.flatMap { listChildrenPaged(it, includeValues) }
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isAtLeast(1)
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
+        assertThat(listedParents).doesNotContain("shell")
+        assertThat(listedParents).doesNotContain("nested")
+        assertThat(
+            fs.exists(root, "Protolink.ru/Agents/roles/frontend-developer/todo/p1-deep-shell")
+        ).isFalse()
+        assertThat(
+            fs.exists(
+                root,
+                "Protolink.ru/Agents/roles/frontend-developer/todo/p1-deep-shell/evidence/dump.bin"
+            )
+        ).isFalse()
+    }
+
     @Test
     fun forcePull_emptyRemoteBytes_writesAndContinues() = runTest {
         val (store, fs, remote) = harness()

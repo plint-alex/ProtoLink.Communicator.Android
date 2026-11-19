@@ -1685,7 +1685,15 @@ class SyncEngine(
                         relativePath = rel
                     )
                 )
-                if (kid.isFolder && kid.id !in visitedFolderIds) next.add(kid.id to rel)
+                // Live 1.0.76 FORCE_MID_INVENTORY: SkipMkdir still BFS-descended into every
+                // Agents open-queue task shell → unbounded GE/materialize after wave≈16.
+                // Register the shell in remotePaths via materialize; do not list under it.
+                if (kid.isFolder &&
+                    kid.id !in visitedFolderIds &&
+                    !AgentsRoleQueuePaths.shouldSkipFolderMaterialize(rel)
+                ) {
+                    next.add(kid.id to rel)
+                }
             }
 
             val folders = waveLocated
@@ -1830,6 +1838,16 @@ class SyncEngine(
         if (ghosts.isEmpty()) return
         for (entry in ghosts) {
             val path = PathUtil.normalize(entry.relativePath)
+            // Path shape alone can protect (Agents/roles/…/todo/…) — do not SAF-walk first.
+            if (AgentsRoleQueuePaths.isForcePruneProtected(path, null)) {
+                SyncRemoteDownload.logMaterializeFailed(
+                    "ForcePullMapping.EarlyPrune.AgentsQueueSkip",
+                    path,
+                    "-",
+                    "skip prune of Agents role open queue path"
+                )
+                continue
+            }
             val protectProbe = if (entry.isFolder) {
                 listRelativePathsUnder(mapping, path)
             } else {
