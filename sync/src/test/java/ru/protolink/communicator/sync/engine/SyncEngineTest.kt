@@ -1969,25 +1969,35 @@ class SyncEngineTest {
         SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
 
         assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("from-cloud")
-        // Cloud-wins: junk absent from remote is pruned (not uploaded) on full Sync.
-        assertThat(fs.exists(root, "evidence-0.png")).isFalse()
+        // Win ApplyLocal: sparse/non-empty remote still uploads local-only paths (no prune fork).
+        assertThat(fs.exists(root, "evidence-0.png")).isTrue()
+        assertThat(remote.childrenOf("cloud-root").any { it.name.equals("evidence-0.png", true) }).isTrue()
     }
 
-    /** Sync removes cloud-absent local dirs when remote tree is non-empty (delete-ghost). */
+    /**
+     * Populated local tree + sparse non-empty remote: children survive full Sync and upload
+     * (Win AddEntity/AddFile parity — ADR sync-simple-win-reference). Former
+     * reconcile_prunesCloudAbsentLocalWhenRemoteNonEmpty asserted Android-only delete-ghost.
+     */
     @Test
-    fun reconcile_prunesCloudAbsentLocalWhenRemoteNonEmpty() = runTest {
+    fun reconcile_sparseRemote_uploadsLocalOnlyChildren() = runTest {
         val (store, fs, remote) = harness()
         remote.seedFolder("films-f", "cloud-root", "films")
         remote.seedFile("films-i", "films-f", "index.html", "movie".toByteArray())
         fs.writeFile(root, "tor browser/readme.txt", "junk".toByteArray())
         fs.createDirectory(root, "confluence")
+        fs.writeFile(root, "Agents/inbox/todo/note.txt", "keep".toByteArray())
 
         SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
 
         assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
-        assertThat(fs.exists(root, "tor browser")).isFalse()
-        assertThat(fs.exists(root, "confluence")).isFalse()
-        assertThat(remote.childrenOf("cloud-root").none { it.name.equals("tor browser", true) }).isTrue()
+        assertThat(fs.exists(root, "tor browser")).isTrue()
+        assertThat(fs.exists(root, "tor browser/readme.txt")).isTrue()
+        assertThat(fs.exists(root, "confluence")).isTrue()
+        assertThat(fs.exists(root, "Agents/inbox/todo/note.txt")).isTrue()
+        assertThat(remote.childrenOf("cloud-root").any { it.name.equals("tor browser", true) }).isTrue()
+        assertThat(remote.childrenOf("cloud-root").any { it.name.equals("confluence", true) }).isTrue()
+        assertThat(remote.childrenOf("cloud-root").any { it.name.equals("Agents", true) }).isTrue()
     }
 
     /** Empty remote still allows local-only upload (first map / push path). */

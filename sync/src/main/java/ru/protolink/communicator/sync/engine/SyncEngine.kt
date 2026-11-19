@@ -637,26 +637,9 @@ class SyncEngine(
                 applied++
                 continue
             }
-            // Full reconcile with a non-empty remote tree: cloud-absent local = ghost.
-            // Delete local (cloud-wins structure); do not upload junk. Local-only push
-            // (remoteInMapping empty) still uploads new notes — Force Upload for full repair.
-            if (remoteInMapping.isNotEmpty()) {
-                try {
-                    if (fs.exists(mapping.localRootPath, a.entry.relativePath)) {
-                        fs.delete(mapping.localRootPath, a.entry.relativePath, a.entry.isFolder)
-                    }
-                    applied++
-                } catch (e: Exception) {
-                    if (e is CancellationException) throw e
-                    SyncRemoteDownload.logMaterializeFailed(
-                        "ApplyLocalPhase.PruneCloudAbsent",
-                        path,
-                        "-",
-                        e.message ?: e.javaClass.simpleName
-                    )
-                }
-                continue
-            }
+            // Win reference (ApplyLocal Added): local-only path → create/upload (or soft-fail
+            // sibling listing). Never recursive-delete solely because remote walk missed the path
+            // (ADR sync-simple-win-reference). Force Download still uses pruneLocalAbsentFromRemote.
             val parentPath = PathUtil.parentOf(a.entry.relativePath)
             val parentId = resolveParentId(mapping, parentPath) ?: mapping.cloudFolderId
             val name = PathUtil.nameOf(a.entry.relativePath)
