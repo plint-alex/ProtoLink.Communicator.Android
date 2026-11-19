@@ -71,4 +71,23 @@ class ForceStatusGuardTest {
             )
         ).isNull()
     }
+
+    @Test
+    fun statusOrNull_preservesForceOverContacts() {
+        // Live 1.0.74: loadContacts enrich wrote Contacts:1 while Force download… cleared.
+        assertThat(
+            ForceStatusGuard.statusOrNull(
+                forceRunning = true,
+                forcePreferred = false,
+                proposed = "Contacts: 1"
+            )
+        ).isNull()
+        assertThat(
+            ForceStatusGuard.statusOrNull(
+                forceRunning = false,
+                forcePreferred = true,
+                proposed = "Contacts: 1"
+            )
+        ).isNull()
+    }
 }

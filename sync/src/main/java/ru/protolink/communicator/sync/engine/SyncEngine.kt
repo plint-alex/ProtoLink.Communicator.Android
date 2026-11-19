@@ -1587,15 +1587,22 @@ class SyncEngine(
         val deferredAcRootFiles = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
 
         // Root listing is hard (empty inventory would prune everything).
+        android.util.Log.e(
+            "ProtoLinkSync",
+            "force pull root list cloudFolderId=${mapping.cloudFolderId.take(8)}…"
+        )
         val rootKids = structureThrottle.withPermit {
             listChildrenForceInventory(mapping.cloudFolderId, softFailOnExhausted = false)
         }
         if (rootKids.isEmpty()) {
             throw SyncException("Force download found no remote files in this folder.")
         }
+        android.util.Log.e("ProtoLinkSync", "force pull root kids=${rootKids.size}")
         structureCache[mapping.cloudFolderId] = rootKids
 
+        var waveIndex = 0
         while (frontier.isNotEmpty()) {
+            waveIndex++
             if (deferredAcRootFiles.isNotEmpty() &&
                 frontier.none { forcePathPriority(it.second) == 0 }
             ) {
@@ -1747,6 +1754,12 @@ class SyncEngine(
                         }
                     }
                 }.awaitAll()
+            }
+            if (waveIndex == 1 || waveIndex % 5 == 0) {
+                android.util.Log.e(
+                    "ProtoLinkSync",
+                    "force pull wave=$waveIndex files=$files frontier=${frontier.size} remotePaths=${remotePaths.size}"
+                )
             }
         }
         if (deferredAcRootFiles.isNotEmpty()) {

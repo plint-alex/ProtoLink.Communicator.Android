@@ -3251,16 +3251,30 @@ class MainViewModel @Inject constructor(
             _state.update { it.copy(forceRunning = true, status = forceStatus) }
             if (exclusive != null) SyncFlight.bindExclusiveJob(exclusive)
             android.util.Log.e("ProtoLinkSync", "force ${if (push) "upload" else "download"} locked, pulling…")
-            val count = withContext(Dispatchers.IO) {
-                val engineMapping = SyncMapping(
-                    id = mapping.cloudFolderId.replace("-", ""),
-                    cloudFolderId = mapping.cloudFolderId,
-                    localRootPath = mapping.localPath,
-                    cloudFolderName = mapping.cloudFolderName
-                )
-                val engine = SyncEngine(metadataStore, localFs, remoteCloud)
-                if (push) engine.forcePushMapping(engineMapping)
-                else engine.forcePullMapping(engineMapping)
+            // Re-assert banner while pull runs — Contacts/SignalR enrich must not look like silent exit.
+            val bannerHeartbeat = viewModelScope.launch {
+                while (isActive) {
+                    delay(4_000)
+                    if (!_state.value.forceRunning) break
+                    _state.update { cur ->
+                        if (cur.forceRunning) cur.copy(status = forceStatus) else cur
+                    }
+                }
+            }
+            val count = try {
+                withContext(Dispatchers.IO) {
+                    val engineMapping = SyncMapping(
+                        id = mapping.cloudFolderId.replace("-", ""),
+                        cloudFolderId = mapping.cloudFolderId,
+                        localRootPath = mapping.localPath,
+                        cloudFolderName = mapping.cloudFolderName
+                    )
+                    val engine = SyncEngine(metadataStore, localFs, remoteCloud)
+                    if (push) engine.forcePushMapping(engineMapping)
+                    else engine.forcePullMapping(engineMapping)
+                }
+            } finally {
+                bannerHeartbeat.cancel()
             }
             val msg = if (push) {
                 "Force upload complete ($count file(s))"
@@ -3524,11 +3538,15 @@ class MainViewModel @Inject constructor(
             }
 
             val ready = items.distinctBy { c -> c.userId.lowercase() }
-            _state.update {
-                it.copy(
-                    contacts = ready,
-                    status = "Contacts: ${ready.size}"
-                )
+            // Live 1.0.74: enrich/list must not clobber "Force download…" (FORCE_NO_PROGRESS).
+            _state.update { cur ->
+                val proposed = "Contacts: ${ready.size}"
+                val status = ForceStatusGuard.statusOrNull(
+                    forceRunning = cur.forceRunning,
+                    forcePreferred = SyncFlight.forcePreferred.get(),
+                    proposed = proposed
+                ) ?: cur.status
+                cur.copy(contacts = ready, status = status)
             }
             // Stay on chat list until the user opens a conversation (phones show list first).
             refreshUnreadBadges()
@@ -3548,6 +3566,12 @@ class MainViewModel @Inject constructor(
                 }.sortedBy { it.displayName.lowercase() }
                 val selectedId = _state.value.selectedContact?.userId
                 _state.update { s ->
+                    val proposed = "Contacts: ${enriched.size}"
+                    val status = ForceStatusGuard.statusOrNull(
+                        forceRunning = s.forceRunning,
+                        forcePreferred = SyncFlight.forcePreferred.get(),
+                        proposed = proposed
+                    ) ?: s.status
                     s.copy(
                         contacts = enriched.map { e ->
                             val prev = s.contacts.firstOrNull { it.userId.equals(e.userId, true) }
@@ -3558,7 +3582,7 @@ class MainViewModel @Inject constructor(
                             val prev = s.selectedContact
                             hit?.copy(unreadCount = prev?.unreadCount ?: 0) ?: s.selectedContact
                         } ?: s.selectedContact,
-                        status = "Contacts: ${enriched.size}"
+                        status = status
                     )
                 }
                 refreshUnreadBadges()
@@ -3566,7 +3590,15 @@ class MainViewModel @Inject constructor(
             }
         } catch (e: Exception) {
             Log.e("ProtoLinkContacts", "loadContacts failed", e)
-            _state.update { it.copy(status = "Contacts failed: ${e.message}") }
+            _state.update { cur ->
+                val proposed = "Contacts failed: ${e.message}"
+                val status = ForceStatusGuard.statusOrNull(
+                    forceRunning = cur.forceRunning,
+                    forcePreferred = SyncFlight.forcePreferred.get(),
+                    proposed = proposed
+                ) ?: cur.status
+                cur.copy(status = status)
+            }
         }
     }
 
@@ -3699,7 +3731,15 @@ class MainViewModel @Inject constructor(
                     ) {
                         markOpenChatRead(targetContactId, merged)
                     } else {
-                        _state.update { it.copy(messages = merged, status = "Messages: ${merged.size}") }
+                        _state.update { cur ->
+                            val proposed = "Messages: ${merged.size}"
+                            val status = ForceStatusGuard.statusOrNull(
+                                forceRunning = cur.forceRunning,
+                                forcePreferred = SyncFlight.forcePreferred.get(),
+                                proposed = proposed
+                            ) ?: cur.status
+                            cur.copy(messages = merged, status = status)
+                        }
                         markOpenChatRead(targetContactId, merged)
                     }
                 } catch (ex: Exception) {
