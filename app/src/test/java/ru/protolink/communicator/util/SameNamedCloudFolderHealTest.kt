@@ -117,6 +117,32 @@ class SameNamedCloudFolderHealTest {
         assertThat(remaps[0].toId).isEqualTo(winId)
     }
 
+    /**
+     * FAIL class after folderChildCount tip: twin near-clone (29 folders + 86 junk files)
+     * still outranked 898 (28+25) on folders alone — healRichnessScore must prefer 898.
+     */
+    @Test
+    fun preferExisting_nearCloneJunkTwinLosesToCanonical898() {
+        val siblings = listOf(
+            SameNamedCloudFolderHeal.Sibling(
+                dupId, "MyNotesFolder", "2026-10-28T09:46:55",
+                immediateChildCount = 29, immediateFileCount = 86
+            ),
+            SameNamedCloudFolderHeal.Sibling(
+                winId, "MyNotesFolder", "2026-10-29T18:49:32",
+                immediateChildCount = 28, immediateFileCount = 25
+            )
+        )
+        val pick = SameNamedCloudFolderHeal.preferExistingSameName("MyNotesFolder", siblings)
+        assertThat(pick!!.id).isEqualTo(winId)
+        assertThat(
+            SameNamedCloudFolderHeal.canonicalIdIfMappedIsDuplicate(dupId, "MyNotesFolder", siblings)
+        ).isEqualTo(winId)
+        assertThat(
+            SameNamedCloudFolderHeal.canonicalIdIfMappedIsDuplicate(winId, "MyNotesFolder", siblings)
+        ).isNull()
+    }
+
     @Test
     fun remapsAndApply_healsAndroidDupMappingWhenEmptyIsOlder() {
         val mappings = listOf(

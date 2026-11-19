@@ -5,9 +5,8 @@ package ru.protolink.communicator.util
  * Create-new in the map wizard adds a second id while Win already maps the populated one.
  *
  * Canonical pick among case-insensitive name matches:
- * 1) higher immediateChildCount (folder children only via
- *    [CloudInteractiveListing.folderChildCount] — junk CloudFiles must not demote
- *    folder-rich 898c1453 to twin 0bc549dd),
+ * 1) higher [CloudInteractiveListing.healRichnessScore] (folder×10 − files — junk
+ *    CloudFiles must not demote folder-rich 898c1453 to near-clone twin 0bc549dd),
  * 2) then earliest creationTime,
  * 3) then id.
  */
@@ -17,7 +16,10 @@ object SameNamedCloudFolderHeal {
         val id: String,
         val name: String,
         val creationTime: String? = null,
-        val immediateChildCount: Int = 0
+        /** CloudFolder/CloudRoot immediate children only. */
+        val immediateChildCount: Int = 0,
+        /** CloudFile immediate children — near-clone junk demotion. */
+        val immediateFileCount: Int = 0
     )
 
     data class MappingRow(
@@ -171,7 +173,8 @@ object SameNamedCloudFolderHeal {
                 map[key] = prev.copy(
                     name = prev.name.ifBlank { s.name },
                     creationTime = prev.creationTime?.takeIf { it.isNotBlank() } ?: s.creationTime,
-                    immediateChildCount = maxOf(prev.immediateChildCount, s.immediateChildCount)
+                    immediateChildCount = maxOf(prev.immediateChildCount, s.immediateChildCount),
+                    immediateFileCount = maxOf(prev.immediateFileCount, s.immediateFileCount)
                 )
             }
         }
@@ -214,8 +217,16 @@ object SameNamedCloudFolderHeal {
     }
 
     private val siblingCanonicalOrder = Comparator<Sibling> { a, b ->
-        val childCmp = b.immediateChildCount.compareTo(a.immediateChildCount)
-        if (childCmp != 0) return@Comparator childCmp
+        val scoreCmp = CloudInteractiveListing.healRichnessScore(
+            b.immediateChildCount,
+            b.immediateFileCount
+        ).compareTo(
+            CloudInteractiveListing.healRichnessScore(
+                a.immediateChildCount,
+                a.immediateFileCount
+            )
+        )
+        if (scoreCmp != 0) return@Comparator scoreCmp
         val ta = a.creationTime?.trim().orEmpty()
         val tb = b.creationTime?.trim().orEmpty()
         when {

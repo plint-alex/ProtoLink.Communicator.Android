@@ -15,8 +15,17 @@ object CloudInteractiveListing {
     /** Win CloudApiService.InteractiveListingPageSize. */
     const val PAGE_SIZE = 80
 
-    /** Win CloudApiService.InteractiveListingMaxPages — first paint / hydrate. */
-    const val MAX_PAGES = 1
+    /**
+     * Win CloudApiService.InteractiveListingMaxPages.
+     * Live FAIL CLOUD_LISTING_DIVERGE_FOLDER_SET: MaxPages=1 Take=80 truncated twin
+     * MyNotesFolder (115 kids) on API CreationTime order (files first) — client folders-first
+     * sort never saw structural CloudFolders past the page. 5×80 covers MyNotesFolder-scale
+     * (≤~380) without unbounded Drive walk.
+     */
+    const val MAX_PAGES = 5
+
+    /** Soft-ready / paint budget for one interactive folder load. */
+    const val MAX_ROWS = PAGE_SIZE * MAX_PAGES
 
     fun leafName(relativePath: String): String {
         val n = relativePath.replace('\\', '/').trim('/')
@@ -110,4 +119,43 @@ object CloudInteractiveListing {
         children.count {
             it.code == CloudCodes.CLOUD_FOLDER || it.code == CloudCodes.CLOUD_ROOT
         }
+
+    /** CloudFile children only — used with [healRichnessScore] for near-clone junk twins. */
+    fun fileChildCount(children: List<EntityDto>): Int =
+        children.count { it.code == CloudCodes.CLOUD_FILE }
+
+    /**
+     * SameNamed heal score: folders win, but junk-file bloat loses near-clone ties.
+     * Live: twin 0bc549dd ≈29 folders + 86 dumps scored above 898c1453 ≈28+25 on
+     * folderChildCount alone — owner contract requires 898.
+     */
+    fun healRichnessScore(folderCount: Int, fileCount: Int): Int {
+        val folders = folderCount.coerceAtLeast(0)
+        val files = fileCount.coerceAtLeast(0)
+        return folders * 10 - files
+    }
+
+    /**
+     * Overlay IncludeValues hydrate onto values-light rows by id — never drop light
+     * CloudFolder rows when hydrate returns a shorter page (timeout / partial).
+     */
+    fun <T> mergeHydrateById(
+        light: List<T>,
+        hydrated: List<T>,
+        id: (T) -> String,
+        merge: (lightRow: T, hydratedRow: T) -> T
+    ): List<T> {
+        if (hydrated.isEmpty()) return light
+        if (light.isEmpty()) return hydrated
+        val byId = linkedMapOf<String, T>()
+        for (row in hydrated) {
+            val key = id(row).lowercase()
+            if (key.isNotEmpty()) byId[key] = row
+        }
+        return light.map { row ->
+            val key = id(row).lowercase()
+            val h = byId[key] ?: return@map row
+            merge(row, h)
+        }
+    }
 }

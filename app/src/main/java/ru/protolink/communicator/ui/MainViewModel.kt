@@ -807,7 +807,7 @@ class MainViewModel @Inject constructor(
                 )
             )
 
-    /** Win-parity: values-light first page, then IncludeValues hydrate (same Take). */
+    /** Win-parity: values-light pages to structure-complete, then IncludeValues hydrate merge. */
     private suspend fun loadCloudFolderChildren(folderId: String): List<CloudItem> {
         val metaLeaf = syncMetaLeafLookup(folderId)
         val pageSize = CloudInteractiveListing.PAGE_SIZE
@@ -838,7 +838,7 @@ class MainViewModel @Inject constructor(
                 val soft = CloudInteractiveListing.buildSoftReadyRows(
                     folderRemoteId = folderId,
                     children = runCatching { metadataStore.getAll(mappingId) }.getOrDefault(emptyList()),
-                    maxRows = pageSize
+                    maxRows = CloudInteractiveListing.MAX_ROWS
                 )
                 items = soft.map { row ->
                     CloudItem(
@@ -853,7 +853,8 @@ class MainViewModel @Inject constructor(
                 }
             }
         }
-        // Soft hydrate IncludeValues (Win HydrateListingValuesAsync) — soft-fail keeps light list.
+        // Soft hydrate IncludeValues (Win HydrateListingValuesAsync) — merge by id so a shorter
+        // hydrate page cannot drop structural folders already painted from values-light.
         runCatching {
             val hydrated = ArrayList<EntityDto>()
             skip = 0
@@ -872,7 +873,15 @@ class MainViewModel @Inject constructor(
                 skip += pageSize
             }
             if (hydrated.isNotEmpty()) {
-                items = sortCloudListing(hydrated.mapNotNull { cloudChildItem(it, metaLeaf) })
+                val hydratedItems = hydrated.mapNotNull { cloudChildItem(it, metaLeaf) }
+                items = sortCloudListing(
+                    CloudInteractiveListing.mergeHydrateById(
+                        light = items,
+                        hydrated = hydratedItems,
+                        id = { it.id },
+                        merge = { _, h -> h }
+                    )
+                )
             }
         }.onFailure { e ->
             Log.w("ProtoLinkCloud", "values hydrate soft-fail id=$folderId: ${e.message}")
@@ -2786,19 +2795,21 @@ class MainViewModel @Inject constructor(
         return siblings.map { s ->
             if (s.name.trim().lowercase() !in dupNames) return@map s
             // Win honesty: junk CloudFiles on a twin must not outrank a folder-rich canonical
-            // (live FAIL: twin 0bc549dd ~132 files beat 898c1453 ~24 folders).
-            val count = runCatching {
-                CloudInteractiveListing.folderChildCount(
-                    api.getEntities(
-                        GetEntitiesRequest(
-                            parentIds = listOf(s.id),
-                            includeValues = false,
-                            take = 500
-                        )
+            // (live FAIL: twin 0bc549dd ~132 files beat 898c1453 ~24 folders; near-clone
+            // 29 folders+86 dumps still beat 28+25 on folderChildCount alone — score demotes).
+            val kids = runCatching {
+                api.getEntities(
+                    GetEntitiesRequest(
+                        parentIds = listOf(s.id),
+                        includeValues = false,
+                        take = 500
                     )
                 )
-            }.getOrDefault(0)
-            s.copy(immediateChildCount = count)
+            }.getOrDefault(emptyList())
+            s.copy(
+                immediateChildCount = CloudInteractiveListing.folderChildCount(kids),
+                immediateFileCount = CloudInteractiveListing.fileChildCount(kids)
+            )
         }
     }
 
