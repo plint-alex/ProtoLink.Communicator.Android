@@ -368,4 +368,61 @@ class SameNamedCloudFolderHealTest {
         assertThat(remaps[0].fromId).isEqualTo(emptyTwin)
         assertThat(remaps[0].toId).isEqualTo(winId)
     }
+
+    /**
+     * Live FAIL 1.0.85/vc86: two empty Android-root twins already satisfy count minHits=2,
+     * so count-only namesNeedingMoreHits skipped SearchEntities — Drive 898 never merged.
+     * Empty / low-richness hits must still need name-search.
+     */
+    @Test
+    fun namesNeedingMoreHits_twoEmptyTwins_stillNeedsSearch() {
+        val emptyA = "7296ebfd-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val emptyB = "aebbe2a2-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val twoEmpty = listOf(
+            SameNamedCloudFolderHeal.Sibling(emptyA, "MyNotesFolder", "2026-11-19T18:00:00", 0),
+            SameNamedCloudFolderHeal.Sibling(emptyB, "MyNotesFolder", "2026-11-19T19:00:00", 0)
+        )
+        assertThat(twoEmpty.count { it.name.equals("MyNotesFolder", ignoreCase = true) })
+            .isAtLeast(2)
+        assertThat(
+            SameNamedCloudFolderHeal.namesNeedingMoreHits(twoEmpty, setOf("mynotesfolder"))
+        ).containsExactly("mynotesfolder")
+
+        val searchHits = listOf(
+            SameNamedCloudFolderHeal.Sibling(emptyA, "MyNotesFolder", null, 0),
+            SameNamedCloudFolderHeal.Sibling(emptyB, "MyNotesFolder", null, 0),
+            SameNamedCloudFolderHeal.Sibling(winId, "MyNotesFolder", "2026-10-29T18:49:32", 24)
+        )
+        val merged = SameNamedCloudFolderHeal.mergeExactNameSearchHits(
+            siblings = twoEmpty,
+            searchHits = searchHits,
+            onlyNamesLower = setOf("mynotesfolder")
+        )
+        assertThat(merged.any { it.id == winId }).isTrue()
+
+        val androidRoot = "ba9266e9-ac45-46f3-9b6d-cdde2f4e2d35"
+        val remaps = SameNamedCloudFolderHeal.remapsForDuplicateNames(
+            mappings = listOf(
+                SameNamedCloudFolderHeal.MappingRow(emptyA, local, "MyNotesFolder")
+            ),
+            siblingsByParent = mapOf(androidRoot to merged),
+            parentIdByMappedId = mapOf(emptyA to androidRoot)
+        )
+        assertThat(remaps).hasSize(1)
+        assertThat(remaps[0].fromId).isEqualTo(emptyA)
+        assertThat(remaps[0].toId).isEqualTo(winId)
+    }
+
+    /** Populated hit already present → name-search not required for that name. */
+    @Test
+    fun namesNeedingMoreHits_populatedHitPresent_skipsSearch() {
+        val emptyTwin = "7296ebfd-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val withPopulated = listOf(
+            SameNamedCloudFolderHeal.Sibling(emptyTwin, "MyNotesFolder", "2026-11-19T18:00:00", 0),
+            SameNamedCloudFolderHeal.Sibling(winId, "MyNotesFolder", "2026-10-29T18:49:32", 24)
+        )
+        assertThat(
+            SameNamedCloudFolderHeal.namesNeedingMoreHits(withPopulated, setOf("mynotesfolder"))
+        ).isEmpty()
+    }
 }

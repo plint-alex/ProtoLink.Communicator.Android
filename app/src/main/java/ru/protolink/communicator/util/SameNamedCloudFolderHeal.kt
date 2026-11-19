@@ -218,16 +218,33 @@ object SameNamedCloudFolderHeal {
 
     /**
      * FORCE_HEAL_DISCOVER_MISS_DRIVE_898: after CloudRoot child paging, which mapped
-     * names still have fewer than [minHits] siblings (canonical Drive id never listed).
+     * names still need SearchEntities merge.
+     *
+     * Need search when:
+     * - fewer than [minHits] siblings, OR
+     * - all hits are empty / low-richness (score &lt; [minRichnessAmongHits]).
+     *
+     * Live FAIL 1.0.85: two empty Android-root MyNotesFolder twins → nameHits=2 so
+     * count-only skipping never ran SearchEntities; Drive 898c1453 never merged.
+     * Soft Ready / minHits must not hide the populated Drive canonical.
      */
     fun namesNeedingMoreHits(
         siblings: List<Sibling>,
         onlyNamesLower: Set<String>,
-        minHits: Int = 2
+        minHits: Int = 2,
+        minRichnessAmongHits: Int = 1
     ): Set<String> {
         if (onlyNamesLower.isEmpty() || minHits < 1) return emptySet()
         return onlyNamesLower.filterTo(linkedSetOf()) { n ->
-            siblings.count { it.name.trim().equals(n, ignoreCase = true) } < minHits
+            val hits = siblings.filter { it.name.trim().equals(n, ignoreCase = true) }
+            if (hits.size < minHits) return@filterTo true
+            val maxRichness = hits.maxOfOrNull {
+                CloudInteractiveListing.healRichnessScore(
+                    it.immediateChildCount,
+                    it.immediateFileCount
+                )
+            } ?: 0
+            maxRichness < minRichnessAmongHits
         }
     }
 
