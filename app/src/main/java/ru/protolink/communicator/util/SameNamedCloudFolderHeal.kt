@@ -122,6 +122,31 @@ object SameNamedCloudFolderHeal {
         return kept + added
     }
 
+    /**
+     * Win [CloudMappedSyncCoordinator.ResolveMappingAfterHeal]: after same-named heal
+     * persists, Force must use the mapping for the requested local path (canonical id),
+     * not the pre-heal twin CloudFolderId the UI still held.
+     */
+    fun resolveMappingAfterHeal(
+        requestedId: String,
+        requestedLocalPath: String,
+        mappings: List<MappingRow>
+    ): MappingRow? {
+        val local = requestedLocalPath.trim()
+        if (local.isNotEmpty()) {
+            val byLocal = mappings.firstOrNull {
+                it.localPath.trim().equals(local, ignoreCase = true)
+            }
+            if (byLocal != null) return byLocal
+        }
+        val byId = mappings.firstOrNull {
+            it.cloudFolderId.equals(requestedId, ignoreCase = true)
+        }
+        if (byId != null) return byId
+        if (requestedId.isBlank()) return null
+        return MappingRow(requestedId, requestedLocalPath, "")
+    }
+
     /** When duplicate names exist in a pick list, show short id so the user can tell them apart. */
     fun displayLabel(name: String, id: String, allNames: Collection<String>): String {
         val n = name.ifBlank { id.take(8) }

@@ -150,4 +150,40 @@ class SameNamedCloudFolderHealTest {
         assertThat(remaps[0].fromId).isEqualTo(dupId)
         assertThat(remaps[0].toId).isEqualTo(winId)
     }
+
+    @Test
+    fun resolveMappingAfterHeal_prefersLocalPathCanonicalId_afterTwinRemap() {
+        // Force UI still holds twin 0bc549dd; heal persisted prefer-populated 898c1453.
+        val twin = "0bc549dd-0000-4000-8000-000000000001"
+        val preferred = "898c1453-0000-4000-8000-000000000002"
+        val healed = listOf(
+            SameNamedCloudFolderHeal.MappingRow(preferred, local, "MyNotesFolder")
+        )
+        val resolved = SameNamedCloudFolderHeal.resolveMappingAfterHeal(
+            requestedId = twin,
+            requestedLocalPath = local,
+            mappings = healed
+        )
+        assertThat(resolved).isNotNull()
+        assertThat(resolved!!.cloudFolderId).isEqualTo(preferred)
+        assertThat(resolved.localPath).isEqualTo(local)
+    }
+
+    @Test
+    fun healBeforeForce_applyRemapsThenResolve_usesPreferredNotTwin() {
+        val remaps = SameNamedCloudFolderHeal.remapsForDuplicateNames(
+            mappings = listOf(SameNamedCloudFolderHeal.MappingRow(dupId, local, "MyNotesFolder")),
+            siblingsByParent = mapOf("parent" to siblingsLiveEmptyOlder),
+            parentIdByMappedId = mapOf(dupId to "parent")
+        )
+        assertThat(remaps).hasSize(1)
+        val rows = listOf(SameNamedCloudFolderHeal.MappingRow(dupId, local, "MyNotesFolder"))
+        val persisted = SameNamedCloudFolderHeal.applyRemaps(rows, remaps)
+        val forForce = SameNamedCloudFolderHeal.resolveMappingAfterHeal(
+            requestedId = dupId,
+            requestedLocalPath = local,
+            mappings = persisted
+        )
+        assertThat(forForce!!.cloudFolderId).isEqualTo(winId)
+    }
 }

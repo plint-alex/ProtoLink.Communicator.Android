@@ -2806,17 +2806,16 @@ class MainViewModel @Inject constructor(
      * Remap Notes/Cloud mappings that point at a duplicate same-named CloudFolder
      * onto the canonical sibling (populated preferred, then oldest CreationTime).
      * Discovers same-named folders across CloudRoots (Android root vs Win Drive).
+     *
+     * Win parity: runs under Force claim (no forcePreferred early bail). Persist
+     * [mappingStore] before exclusive Force/Sync work so twin maps do not Force the empty id.
      */
     private suspend fun healDuplicateSameNamedMappings(): Int {
-        // Heal runs outside SyncFlight mutex so Force can grab the lane — bail when Force
-        // prefers so discovery GetEntities do not starve forcePull (live 1.0.73 heal flash).
-        if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) return 0
         val mappings = mappingStore.load()
         if (mappings.isEmpty()) return 0
         val parentByMapped = linkedMapOf<String, String>()
         val ancestorRootByMapped = linkedMapOf<String, String>()
         for (m in mappings) {
-            if (SyncFlight.forcePreferred.get()) return 0
             val parents = runCatching {
                 api.getEntities(
                     GetEntitiesRequest(
@@ -2847,7 +2846,6 @@ class MainViewModel @Inject constructor(
             .toSet()
         val siblingsByParent = linkedMapOf<String, List<SameNamedCloudFolderHeal.Sibling>>()
         for (parentId in parentByMapped.values.distinctBy { it.lowercase() }) {
-            if (SyncFlight.forcePreferred.get()) return 0
             val siblings = loadChildFolderSiblingsForDiscovery(
                 parentId = parentId,
                 mustIncludeRootIds = mustRoots,
@@ -2862,7 +2860,6 @@ class MainViewModel @Inject constructor(
                 "same-named heal discover parent=$parentId siblings=${siblings.size} nameHits=$nameHits"
             )
         }
-        if (SyncFlight.forcePreferred.get()) return 0
         val rows = mappings.map {
             SameNamedCloudFolderHeal.MappingRow(it.cloudFolderId, it.localPath, it.cloudFolderName)
         }
@@ -2883,6 +2880,7 @@ class MainViewModel @Inject constructor(
         val healed = healedRows.map {
             CloudSyncMappingDto(it.cloudFolderId, it.localPath, it.cloudFolderName)
         }
+        // Disk first — Win heal persist before UI apply (1.0.85 class).
         mappingStore.save(healed)
         _state.update { it.copy(mappings = healed) }
         return remaps.size
@@ -2946,13 +2944,10 @@ class MainViewModel @Inject constructor(
                 }
                 return@launch
             }
-            if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) {
-                // Win parity: defer only — do not overwrite "Force download…" / lock wait.
-                SyncFlight.deferredFull.set(true)
-                return@launch
-            }
+            // Win: heal before exclusive/coalesce so remap persists even when Sync defers to Force.
             runCatching { healDuplicateSameNamedMappings() }
             if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) {
+                // Win parity: defer only — do not overwrite "Force download…" / lock wait.
                 SyncFlight.deferredFull.set(true)
                 return@launch
             }
@@ -3311,8 +3306,10 @@ class MainViewModel @Inject constructor(
         push: Boolean,
         managePreferred: Boolean
     ) {
-        val mapping = mappingStore.load().firstOrNull { it.cloudFolderId == cloudFolderId }
-        if (mapping == null) {
+        val requested = mappingStore.load().firstOrNull {
+            it.cloudFolderId.equals(cloudFolderId, ignoreCase = true)
+        }
+        if (requested == null) {
             _state.update { it.copy(syncError = "Mapped folder not found") }
             return
         }
@@ -3336,6 +3333,39 @@ class MainViewModel @Inject constructor(
         var locked = false
         val exclusive = currentCoroutineContext()[Job]
         try {
+            // Win StartForcePull/Push: HealSameNamedMappingsAsync + ResolveMappingAfterHeal
+            // before exclusive Force work — including under forcePreferred claim.
+            val healed = runCatching { healDuplicateSameNamedMappings() }.getOrDefault(0)
+            if (healed > 0) {
+                android.util.Log.e(
+                    "ProtoLinkSync",
+                    "force ${if (push) "upload" else "download"}: healed $healed same-named duplicate map(s)"
+                )
+            }
+            val resolvedRow = SameNamedCloudFolderHeal.resolveMappingAfterHeal(
+                requestedId = requested.cloudFolderId,
+                requestedLocalPath = requested.localPath,
+                mappings = mappingStore.load().map {
+                    SameNamedCloudFolderHeal.MappingRow(
+                        it.cloudFolderId,
+                        it.localPath,
+                        it.cloudFolderName
+                    )
+                }
+            )
+            val mapping = resolvedRow?.let {
+                CloudSyncMappingDto(it.cloudFolderId, it.localPath, it.cloudFolderName)
+            }
+            if (mapping == null) {
+                _state.update {
+                    it.copy(
+                        forceRunning = false,
+                        status = "Force sync failed",
+                        syncError = "Mapped folder not found after heal"
+                    )
+                }
+                return
+            }
             if (!SyncFlight.mutex.tryLock()) {
                 _state.update { it.copy(status = "Waiting for sync lock…") }
                 // Preempt holder (startup/SignalR/SyncWorker) — do not sit 600s behind reconcile.
@@ -3350,7 +3380,10 @@ class MainViewModel @Inject constructor(
             // Re-assert after lock wait — local push / coalesce may have raced the banner.
             _state.update { it.copy(forceRunning = true, status = forceStatus) }
             if (exclusive != null) SyncFlight.bindExclusiveJob(exclusive)
-            android.util.Log.e("ProtoLinkSync", "force ${if (push) "upload" else "download"} locked, pulling…")
+            android.util.Log.e(
+                "ProtoLinkSync",
+                "force ${if (push) "upload" else "download"} locked cloudFolderId=${mapping.cloudFolderId}, pulling…"
+            )
             // Re-assert banner while pull runs — Contacts/SignalR enrich must not look like silent exit.
             val bannerHeartbeat = viewModelScope.launch {
                 while (isActive) {
