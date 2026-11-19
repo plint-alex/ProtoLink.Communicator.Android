@@ -1685,9 +1685,9 @@ class SyncEngine(
                         relativePath = rel
                     )
                 )
-                // Live 1.0.76 FORCE_MID_INVENTORY: SkipMkdir still BFS-descended into every
-                // Agents open-queue task shell → unbounded GE/materialize after wave≈16.
-                // Register the shell in remotePaths via materialize; do not list under it.
+                // Live 1.0.76/1.0.77 FORCE_MID_INVENTORY: do not BFS under Agents role-queue
+                // task shells (todo|progress|hold|done) — open-queue stop cleared wave16 stall;
+                // done shells + evidence still unbounded past 15m. Register shell via materialize.
                 if (kid.isFolder &&
                     kid.id !in visitedFolderIds &&
                     !AgentsRoleQueuePaths.shouldSkipFolderMaterialize(rel)
@@ -1964,7 +1964,7 @@ class SyncEngine(
                     "ForcePullMapping.AgentsQueueSkipMkdir",
                     path,
                     loc.entry.id,
-                    "skip folder materialize under Agents role open queue"
+                    "skip folder materialize under Agents role queue task shell"
                 )
                 return 0
             }

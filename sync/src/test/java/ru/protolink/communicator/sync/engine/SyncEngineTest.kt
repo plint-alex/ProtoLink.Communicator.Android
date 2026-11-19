@@ -513,7 +513,7 @@ class SyncEngineTest {
     }
 
     @Test
-    fun agentsRoleQueuePaths_protectsOpenQueues_notDone() {
+    fun agentsRoleQueuePaths_protectsRoleQueues_includingDone() {
         assertThat(
             AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(
                 "Protolink.ru/Agents/roles/frontend-developer/todo/P1-task/index.html"
@@ -523,6 +523,11 @@ class SyncEngineTest {
             AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(
                 "Protolink.ru/Agents/roles/frontend-developer/done/P1-old/index.html"
             )
+        ).isTrue()
+        assertThat(
+            AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(
+                "Protolink.ru/Agents/docs/ops/index.html"
+            )
         ).isFalse()
         assertThat(
             AgentsRoleQueuePaths.shouldSkipFolderMaterialize(
@@ -531,7 +536,17 @@ class SyncEngineTest {
         ).isTrue()
         assertThat(
             AgentsRoleQueuePaths.shouldSkipFolderMaterialize(
+                "Protolink.ru/Agents/roles/fe/done/P1-old"
+            )
+        ).isTrue()
+        assertThat(
+            AgentsRoleQueuePaths.shouldSkipFolderMaterialize(
                 "Protolink.ru/Agents/roles/fe/todo"
+            )
+        ).isFalse()
+        assertThat(
+            AgentsRoleQueuePaths.shouldSkipFolderMaterialize(
+                "Protolink.ru/Agents/roles/fe/done"
             )
         ).isFalse()
     }
@@ -625,6 +640,63 @@ class SyncEngineTest {
             fs.exists(
                 root,
                 "Protolink.ru/Agents/roles/frontend-developer/todo/p1-deep-shell/evidence/dump.bin"
+            )
+        ).isFalse()
+    }
+
+    /**
+     * Live 1.0.77 FORCE_MID_INVENTORY: open-queue frontier-stop cleared wave16 stall, but Force
+     * still BFS-listed every Agents role done task shell (+ evidence) for ~15m. Must not
+     * listChildren done shells; AC fill still completes; local done page prune-protected.
+     */
+    @Test
+    fun forcePull_doesNotListUnderAgentsDoneTaskShells() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("films-f", "cloud-root", "films")
+        inner.seedFile("films-i", "films-f", "index.html", "movie".toByteArray())
+        inner.seedFolder("pl-ru", "cloud-root", "Protolink.ru")
+        inner.seedFolder("agents", "pl-ru", "Agents")
+        inner.seedFolder("roles", "agents", "roles")
+        inner.seedFolder("role", "roles", "frontend-developer")
+        inner.seedFolder("done", "role", "done")
+        inner.seedFolder("shell", "done", "p1-done-shell")
+        inner.seedFolder("nested", "shell", "evidence")
+        inner.seedFile("blob", "nested", "dump.bin", ByteArray(64) { 1 })
+        inner.seedFile("page", "shell", "index.html", "done-remote".toByteArray())
+        val planted =
+            "Protolink.ru/Agents/roles/frontend-developer/done/p1-done-shell/index.html"
+        fs.writeFile(root, planted, "done-local".toByteArray())
+        val listedParents = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun listChildrenPaged(
+                parentId: String,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                listedParents.add(parentId)
+                return inner.listChildrenPaged(parentId, includeValues)
+            }
+
+            override suspend fun listChildrenOfParents(
+                parentIds: List<String>,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                listedParents.addAll(parentIds)
+                return parentIds.flatMap { listChildrenPaged(it, includeValues) }
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isAtLeast(1)
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
+        assertThat(listedParents).doesNotContain("shell")
+        assertThat(listedParents).doesNotContain("nested")
+        assertThat(fs.exists(root, planted)).isTrue()
+        assertThat(String(fs.readFile(root, planted))).isEqualTo("done-local")
+        assertThat(
+            fs.exists(
+                root,
+                "Protolink.ru/Agents/roles/frontend-developer/done/p1-done-shell/evidence/dump.bin"
             )
         ).isFalse()
     }
