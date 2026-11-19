@@ -133,24 +133,27 @@ class SyncEngineTest {
     }
 
     @Test
-    fun sameSizeContentChange_uploads_by_hash() = runTest {
+    fun sameSizeContentChange_reconcileSkips_forcePushUploads() = runTest {
         val (store, fs, remote) = harness()
         fs.writeFile(root, "films/index.html", "aaaa".toByteArray())
         SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
         val id = store.getAll("m1").first { it.relativePath == "films/index.html" }.remoteId
         assertThat(String(remote.get(id)!!.bytes!!)).isEqualTo("aaaa")
 
-        // Same byte length, different content — must still upload (Films-style edits).
+        // Win CanSkipCompareWithoutHash: warm reconcile skips same-size silent edits
+        // (interval Push / Force Upload own them).
         fs.writeFile(root, "films/index.html", "bbbb".toByteArray())
         SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+        assertThat(String(remote.get(id)!!.bytes!!)).isEqualTo("aaaa")
 
+        SyncEngine(store, fs, remote).forcePushMapping(mapping)
         assertThat(String(remote.get(id)!!.bytes!!)).isEqualTo("bbbb")
         assertThat(store.getAll("m1").first { it.relativePath == "films/index.html" }.sizeBytes)
             .isEqualTo(4)
     }
 
     @Test
-    fun emptyContentHash_seedsLocalHash_thenSameSizeEditUploads() = runTest {
+    fun emptyContentHash_seedsLocalHash_thenForcePushSameSizeEdit() = runTest {
         val (store, fs, remote) = harness()
         fs.writeFile(root, "films/index.html", "aaaa".toByteArray())
         SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
@@ -166,7 +169,7 @@ class SyncEngineTest {
         assertThat(String(remote.get(id)!!.bytes!!)).isEqualTo("aaaa")
 
         fs.writeFile(root, "films/index.html", "bbbb".toByteArray())
-        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+        SyncEngine(store, fs, remote).forcePushMapping(mapping)
         assertThat(String(remote.get(id)!!.bytes!!)).isEqualTo("bbbb")
     }
 
@@ -194,15 +197,18 @@ class SyncEngineTest {
         val failId = store.getAll("m1").first { it.relativePath == "fail.html" }.remoteId
         val keepRemoteOld = "keep-remote-old"
         inner.uploadFile(keepId, "keep.html", keepRemoteOld.toByteArray(), "text/html")
+        // sizeBytes mismatch defeats CanSkipCompareWithoutHash so compare still downloads.
         store.upsert(
             store.getAll("m1").first { it.relativePath == "keep.html" }.copy(
                 contentHash = ContentHashUtil.sha256Hex(keepRemoteOld.toByteArray()),
+                sizeBytes = 1,
                 remoteUpdateTime = Instant.EPOCH
             )
         )
         store.upsert(
             store.getAll("m1").first { it.relativePath == "fail.html" }.copy(
                 contentHash = "bb",
+                sizeBytes = 1,
                 remoteUpdateTime = Instant.EPOCH
             )
         )
@@ -299,9 +305,11 @@ class SyncEngineTest {
         SyncEngine(store, fs, inner).reconcileAll(listOf(mapping))
         val id = store.getAll("m1").first { it.relativePath == "note/index.html" }.remoteId
         inner.uploadFile(id, "index.html", ByteArray(0), "text/html")
+        // sizeBytes mismatch so warm CanSkipCompareWithoutHash does not skip empty-remote decide.
         store.upsert(
             store.getAll("m1").first { it.relativePath == "note/index.html" }.copy(
                 contentHash = "aa",
+                sizeBytes = 1,
                 remoteUpdateTime = Instant.EPOCH
             )
         )
@@ -338,16 +346,20 @@ class SyncEngineTest {
     }
 
     @Test
-    fun localMatchesMeta_remoteChanged_downloads() = runTest {
+    fun localMatchesMeta_remoteChanged_forcePullDownloads() = runTest {
         val (store, fs, remote) = harness()
         fs.writeFile(root, "films/index.html", "Test4".toByteArray())
         SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
         val meta = store.getAll("m1").first { it.relativePath == "films/index.html" }
         val id = meta.remoteId
-        // Other device uploaded Test5; local still Test4 matching meta.
+        // Other device uploaded Test5; warm WalkRemote nulls UpdateTime so reconcile skips
+        // getFile (Win 1.0.77). Force Download is the repair path.
         remote.uploadFile(id, "index.html", "Test5".toByteArray(), "text/html")
 
         SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("Test4")
+
+        SyncEngine(store, fs, remote).forcePullMapping(mapping)
 
         assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("Test5")
         assertThat(String(remote.get(id)!!.bytes!!)).isEqualTo("Test5")
@@ -980,6 +992,157 @@ class SyncEngineTest {
         assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
         assertThat(withoutValues.get()).isAtLeast(1)
         assertThat(withValues.get()).isEqualTo(0)
+    }
+
+    /**
+     * Warm values-light must null listing UpdateTime so structure-only "newer" times do not
+     * force getFile (Win 1.0.77 quiet-meta hang class). Unchanged size+hash → skip download.
+     */
+    @Test
+    fun reconcile_warmMeta_nullsListingUpdateTime_skipsGetFile() = runTest {
+        val (store, fs, inner) = harness()
+        val body = "stable-note-body-xxxxxxxx"
+        val hash = ContentHashUtil.sha256Hex(body.toByteArray())
+        val stamped = Instant.parse("2026-11-16T12:00:00Z")
+        inner.seedFolder("films", "cloud-root", "Films")
+        inner.seedFile("idx", "films", "index.html", body.toByteArray())
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "films",
+                parentRemoteId = "cloud-root",
+                relativePath = "Films",
+                isFolder = true,
+                sizeBytes = 0,
+                contentHash = "",
+                remoteUpdateTime = stamped
+            )
+        )
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "idx",
+                parentRemoteId = "films",
+                relativePath = "Films/index.html",
+                isFolder = false,
+                sizeBytes = body.length.toLong(),
+                contentHash = hash,
+                remoteUpdateTime = stamped
+            )
+        )
+        fs.writeFile(root, "Films/index.html", body.toByteArray())
+
+        val downloads = java.util.concurrent.atomic.AtomicInteger(0)
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun listChildrenPaged(
+                parentId: String,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> =
+                inner.listChildrenPaged(parentId, includeValues).map {
+                    // Structure-only listing advertises a newer UpdateTime — warm walk must ignore it.
+                    if (!includeValues) {
+                        it.copy(
+                            name = if (it.isFolder) "folder-${it.id}" else "file-${it.id}",
+                            updateTime = Instant.parse("2026-11-16T18:00:00Z")
+                        )
+                    } else {
+                        it
+                    }
+                }
+
+            override suspend fun downloadFile(entityId: String): ByteArray? {
+                downloads.incrementAndGet()
+                return inner.downloadFile(entityId)
+            }
+        }
+
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo(body)
+        assertThat(downloads.get()).isEqualTo(0)
+        assertThat(store.getLastSyncUtc("m1")).isNotNull()
+    }
+
+    /**
+     * Ids IncludeValues soft-fail must not silently drop Force folders — Win folder-{id} policy.
+     * Sibling named AC still fills.
+     */
+    @Test
+    fun forcePull_idsNamesSoftFail_keepsFolderSyntheticAndFillsSibling() = runTest {
+        val (store, fs, inner) = harness()
+        inner.seedFolder("films", "cloud-root", "Films")
+        inner.seedFile("idx", "films", "index.html", "movie".toByteArray())
+        inner.seedFolder("orphan", "cloud-root", "OrphanBranch")
+        inner.seedFile("orphan-idx", "orphan", "index.html", "o".toByteArray())
+
+        val remote = object : ru.protolink.communicator.sync.ports.RemoteCloud by inner {
+            override suspend fun getEntitiesByIds(
+                ids: List<String>,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                // Soft-fail orphan* only — siblings in the same Ids batch must still resolve.
+                return inner.getEntitiesByIds(ids, includeValues)
+                    .filter { it.id != "orphan" && it.id != "orphan-idx" }
+            }
+        }
+
+        val count = SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(count).isEqualTo(1)
+        assertThat(String(fs.readFile(root, "Films/index.html"))).isEqualTo("movie")
+        assertThat(fs.exists(root, "folder-orphan")).isTrue()
+        assertThat(fs.exists(root, "OrphanBranch")).isFalse()
+    }
+
+    /**
+     * Mid-pass FileNotFound during compare must soft-fail the item and still stamp LastSync.
+     */
+    @Test
+    fun reconcile_missingLocalDuringCompare_softFailsAndContinues() = runTest {
+        val (store, fs, inner) = harness()
+        val body = "keep-me"
+        val hash = ContentHashUtil.sha256Hex(body.toByteArray())
+        val stamped = Instant.parse("2026-11-16T12:00:00Z")
+        inner.seedFile("keep", "cloud-root", "keep.txt", body.toByteArray())
+        inner.seedFile("gone", "cloud-root", "gone.txt", "x".toByteArray())
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "keep",
+                parentRemoteId = "cloud-root",
+                relativePath = "keep.txt",
+                isFolder = false,
+                sizeBytes = body.length.toLong(),
+                contentHash = "",
+                remoteUpdateTime = stamped
+            )
+        )
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "gone",
+                parentRemoteId = "cloud-root",
+                relativePath = "gone.txt",
+                isFolder = false,
+                sizeBytes = 1,
+                contentHash = "",
+                remoteUpdateTime = stamped
+            )
+        )
+        fs.writeFile(root, "keep.txt", body.toByteArray())
+        fs.writeFile(root, "gone.txt", "x".toByteArray())
+
+        val vanishing = object : ru.protolink.communicator.sync.ports.LocalFileSystem by fs {
+            override fun readFile(rootPath: String, relativePath: String): ByteArray {
+                if (relativePath == "gone.txt") error("Missing gone.txt")
+                return fs.readFile(rootPath, relativePath)
+            }
+        }
+
+        SyncEngine(store, vanishing, inner).reconcileAll(listOf(mapping))
+
+        assertThat(String(fs.readFile(root, "keep.txt"))).isEqualTo(body)
+        assertThat(store.getLastSyncUtc("m1")).isNotNull()
     }
 
     /**
@@ -1844,7 +2007,7 @@ class SyncEngineTest {
     @Test
     fun reconcile_comparePhase_abortsPromptlyOnCancel() = runTest {
         val (store, fs, inner) = harness()
-        // Seed many same-sized files so compare phase downloads each (hash converge).
+        // Empty meta hash + size mismatch so compare must getFile (warm null UpdateTime skips otherwise).
         repeat(40) { i ->
             val id = "f$i"
             val name = "n$i.txt"
@@ -1858,9 +2021,9 @@ class SyncEngineTest {
                     parentRemoteId = "cloud-root",
                     relativePath = name,
                     isFolder = false,
-                    sizeBytes = bytes.size.toLong(),
-                    contentHash = ContentHashUtil.sha256Hex(bytes),
-                    remoteUpdateTime = Instant.now()
+                    sizeBytes = 1,
+                    contentHash = "",
+                    remoteUpdateTime = Instant.EPOCH
                 )
             )
         }

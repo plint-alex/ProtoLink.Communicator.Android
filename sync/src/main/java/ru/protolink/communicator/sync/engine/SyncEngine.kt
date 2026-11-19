@@ -232,7 +232,16 @@ class SyncEngine(
             if (localSize == 0L || (localSize < 64L && (located.entry.sizeBytes ?: 0L) > localSize)) {
                 val bytes = remote.downloadFile(meta.remoteId)
                 if (bytes != null && bytes.isNotEmpty()) {
-                    fs.writeFile(mapping.localRootPath, meta.relativePath, bytes)
+                    try {
+                        fs.writeFile(mapping.localRootPath, meta.relativePath, bytes)
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        if (SyncMissingLocalPath.isMissing(e)) {
+                            SyncMissingLocalPath.log("ApplyComparePhase", path, path, e)
+                            continue
+                        }
+                        throw e
+                    }
                     store.upsert(
                         meta.copy(
                             sizeBytes = bytes.size.toLong(),
@@ -246,8 +255,36 @@ class SyncEngine(
                 continue
             }
 
-            val localBytes = fs.readFile(mapping.localRootPath, path)
-            val localHash = ContentHashUtil.sha256Hex(localBytes)
+            // Size+baseline+listing fast path: avoid SHA-256 of every unchanged file (Win 1.0.75).
+            if (ContentHashUtil.canSkipCompareWithoutHash(
+                    localSize,
+                    meta.sizeBytes,
+                    meta.contentHash,
+                    located.entry.updateTime,
+                    meta.remoteUpdateTime
+                )
+            ) {
+                continue
+            }
+
+            val localHash = ContentHashUtil.trySha256Hex {
+                fs.readFile(mapping.localRootPath, path)
+            }
+            if (localHash == null) {
+                SyncMissingLocalPath.log("ApplyComparePhase", path, path)
+                continue
+            }
+
+            // Unchanged local + remote listing not newer → skip getFile (Win CanSkipRemoteContentDownload).
+            if (ContentHashUtil.canSkipRemoteContentDownload(
+                    localHash,
+                    meta.contentHash,
+                    located.entry.updateTime,
+                    meta.remoteUpdateTime
+                )
+            ) {
+                continue
+            }
 
             // Always download remote bytes and compare hashes. Never forge remoteHash from
             // meta or upload when remote content is unknown.
@@ -259,55 +296,65 @@ class SyncEngine(
             }
 
             val remoteHash = ContentHashUtil.sha256Hex(remoteBytes)
-            when (
-                ContentHashUtil.decideByHash(
-                    localHash,
-                    remoteHash,
-                    meta.contentHash,
-                    located.entry.updateTime,
-                    meta.remoteUpdateTime
-                )
-            ) {
-                SyncDirectionDecide.Action.Write -> {
-                    val name = PathUtil.nameOf(meta.relativePath)
-                    if (localBytes.isEmpty() && (located.entry.sizeBytes ?: 0L) > 0L) {
-                        throw SyncException(
-                            "Refusing to upload empty local file over non-empty remote.",
-                            relativePath = path,
-                            localHash = localHash,
-                            remoteHash = remoteHash
+            try {
+                when (
+                    ContentHashUtil.decideByHash(
+                        localHash,
+                        remoteHash,
+                        meta.contentHash,
+                        located.entry.updateTime,
+                        meta.remoteUpdateTime
+                    )
+                ) {
+                    SyncDirectionDecide.Action.Write -> {
+                        val name = PathUtil.nameOf(meta.relativePath)
+                        val localBytes = fs.readFile(mapping.localRootPath, path)
+                        if (localBytes.isEmpty() && (located.entry.sizeBytes ?: 0L) > 0L) {
+                            throw SyncException(
+                                "Refusing to upload empty local file over non-empty remote.",
+                                relativePath = path,
+                                localHash = localHash,
+                                remoteHash = remoteHash
+                            )
+                        }
+                        remote.uploadFile(meta.remoteId, name, localBytes, mimeOf(name))
+                        store.upsert(
+                            meta.copy(
+                                sizeBytes = localBytes.size.toLong(),
+                                contentHash = localHash,
+                                remoteUpdateTime = Instant.now()
+                            )
+                        )
+                        dirty.add(path)
+                        writes++
+                    }
+                    SyncDirectionDecide.Action.Read -> {
+                        fs.writeFile(mapping.localRootPath, meta.relativePath, remoteBytes)
+                        store.upsert(
+                            meta.copy(
+                                sizeBytes = remoteBytes.size.toLong(),
+                                contentHash = remoteHash,
+                                remoteUpdateTime = located.entry.updateTime ?: Instant.now()
+                            )
+                        )
+                        dirty.add(path)
+                        reads++
+                    }
+                    SyncDirectionDecide.Action.Skip -> {
+                        store.upsert(
+                            meta.copy(
+                                contentHash = localHash,
+                                remoteUpdateTime = located.entry.updateTime ?: meta.remoteUpdateTime
+                            )
                         )
                     }
-                    remote.uploadFile(meta.remoteId, name, localBytes, mimeOf(name))
-                    store.upsert(
-                        meta.copy(
-                            sizeBytes = localBytes.size.toLong(),
-                            contentHash = localHash,
-                            remoteUpdateTime = Instant.now()
-                        )
-                    )
-                    dirty.add(path)
-                    writes++
                 }
-                SyncDirectionDecide.Action.Read -> {
-                    fs.writeFile(mapping.localRootPath, meta.relativePath, remoteBytes)
-                    store.upsert(
-                        meta.copy(
-                            sizeBytes = remoteBytes.size.toLong(),
-                            contentHash = remoteHash,
-                            remoteUpdateTime = located.entry.updateTime ?: Instant.now()
-                        )
-                    )
-                    dirty.add(path)
-                    reads++
-                }
-                SyncDirectionDecide.Action.Skip -> {
-                    store.upsert(
-                        meta.copy(
-                            contentHash = localHash,
-                            remoteUpdateTime = located.entry.updateTime ?: meta.remoteUpdateTime
-                        )
-                    )
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                if (SyncMissingLocalPath.isMissing(e)) {
+                    SyncMissingLocalPath.log("ApplyComparePhase", path, path, e)
+                } else {
+                    throw e
                 }
             }
         }
@@ -480,14 +527,32 @@ class SyncEngine(
                         )
                     )
                 } else {
-                    val bytes = fs.readFile(mapping.localRootPath, a.entry.relativePath)
+                    val bytes = try {
+                        fs.readFile(mapping.localRootPath, a.entry.relativePath)
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        if (SyncMissingLocalPath.isMissing(e)) {
+                            SyncMissingLocalPath.log("ApplyLocalPhase.Added", path, path, e)
+                            continue
+                        }
+                        throw e
+                    }
                     val remoteSize = existingRemote.entry.sizeBytes
                     val localLooksStub =
                         bytes.isEmpty() || (bytes.size < 64 && remoteSize != null && remoteSize > bytes.size)
                     if (localLooksStub) {
                         val cloud = remote.downloadFile(existingRemote.entry.id)
                         if (cloud != null && cloud.isNotEmpty()) {
-                            fs.writeFile(mapping.localRootPath, a.entry.relativePath, cloud)
+                            try {
+                                fs.writeFile(mapping.localRootPath, a.entry.relativePath, cloud)
+                            } catch (e: Exception) {
+                                if (e is CancellationException) throw e
+                                if (SyncMissingLocalPath.isMissing(e)) {
+                                    SyncMissingLocalPath.log("ApplyLocalPhase.Added", path, path, e)
+                                    continue
+                                }
+                                throw e
+                            }
                             store.upsert(
                                 SyncItemMeta(
                                     mappingId = mapping.id,
@@ -516,46 +581,56 @@ class SyncEngine(
                     }
                     val localHash = ContentHashUtil.sha256Hex(bytes)
                     val remoteHash = ContentHashUtil.sha256Hex(cloud)
-                    when (
-                        ContentHashUtil.decideByHash(
-                            localHash, remoteHash, metaHash = null,
-                            existingRemote.entry.updateTime, metaUpdateTime = null
-                        )
-                    ) {
-                        SyncDirectionDecide.Action.Write -> {
-                            remote.uploadFile(existingRemote.entry.id, name, bytes, mimeOf(name))
-                            store.upsert(
-                                SyncItemMeta(
-                                    mappingId = mapping.id,
-                                    remoteId = existingRemote.entry.id,
-                                    parentRemoteId = existingRemote.entry.parentId,
-                                    relativePath = path,
-                                    isFolder = false,
-                                    sizeBytes = bytes.size.toLong(),
-                                    contentHash = localHash,
-                                    remoteUpdateTime = Instant.now()
-                                )
+                    try {
+                        when (
+                            ContentHashUtil.decideByHash(
+                                localHash, remoteHash, metaHash = null,
+                                existingRemote.entry.updateTime, metaUpdateTime = null
                             )
-                        }
-                        SyncDirectionDecide.Action.Read,
-                        SyncDirectionDecide.Action.Skip -> {
-                            // Read / Skip → adopt cloud when hashes differ (cloud-wins).
-                            if (!localHash.equals(remoteHash, ignoreCase = true)) {
-                                fs.writeFile(mapping.localRootPath, a.entry.relativePath, cloud)
+                        ) {
+                            SyncDirectionDecide.Action.Write -> {
+                                remote.uploadFile(existingRemote.entry.id, name, bytes, mimeOf(name))
+                                store.upsert(
+                                    SyncItemMeta(
+                                        mappingId = mapping.id,
+                                        remoteId = existingRemote.entry.id,
+                                        parentRemoteId = existingRemote.entry.parentId,
+                                        relativePath = path,
+                                        isFolder = false,
+                                        sizeBytes = bytes.size.toLong(),
+                                        contentHash = localHash,
+                                        remoteUpdateTime = Instant.now()
+                                    )
+                                )
                             }
-                            store.upsert(
-                                SyncItemMeta(
-                                    mappingId = mapping.id,
-                                    remoteId = existingRemote.entry.id,
-                                    parentRemoteId = existingRemote.entry.parentId,
-                                    relativePath = path,
-                                    isFolder = false,
-                                    sizeBytes = cloud.size.toLong(),
-                                    contentHash = remoteHash,
-                                    remoteUpdateTime = existingRemote.entry.updateTime ?: Instant.now()
+                            SyncDirectionDecide.Action.Read,
+                            SyncDirectionDecide.Action.Skip -> {
+                                // Read / Skip → adopt cloud when hashes differ (cloud-wins).
+                                if (!localHash.equals(remoteHash, ignoreCase = true)) {
+                                    fs.writeFile(mapping.localRootPath, a.entry.relativePath, cloud)
+                                }
+                                store.upsert(
+                                    SyncItemMeta(
+                                        mappingId = mapping.id,
+                                        remoteId = existingRemote.entry.id,
+                                        parentRemoteId = existingRemote.entry.parentId,
+                                        relativePath = path,
+                                        isFolder = false,
+                                        sizeBytes = cloud.size.toLong(),
+                                        contentHash = remoteHash,
+                                        remoteUpdateTime = existingRemote.entry.updateTime
+                                            ?: Instant.now()
+                                    )
                                 )
-                            )
+                            }
                         }
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        if (SyncMissingLocalPath.isMissing(e)) {
+                            SyncMissingLocalPath.log("ApplyLocalPhase.Added", path, path, e)
+                            continue
+                        }
+                        throw e
                     }
                 }
                 dirty.add(path)
@@ -596,22 +671,43 @@ class SyncEngine(
                 continue
             }
             val id: String
-            if (reuse != null) {
-                id = reuse.id
-                if (!a.entry.isFolder) {
+            try {
+                if (reuse != null) {
+                    id = reuse.id
+                    if (!a.entry.isFolder) {
+                        val bytes = fs.readFile(mapping.localRootPath, a.entry.relativePath)
+                        if (bytes.isEmpty()) continue
+                        remote.uploadFile(id, name, bytes, mimeOf(name))
+                    }
+                } else if (a.entry.isFolder) {
+                    id = remote.addFolder(parentId, name)
+                    rememberSibling(siblingCache, parentId, id, name, isFolder = true)
+                } else {
                     val bytes = fs.readFile(mapping.localRootPath, a.entry.relativePath)
+                    // Never push an empty / editor stub when we are about to adopt cloud content.
                     if (bytes.isEmpty()) continue
-                    remote.uploadFile(id, name, bytes, mimeOf(name))
+                    id = remote.addFile(parentId, name, bytes, mimeOf(name))
+                    rememberSibling(siblingCache, parentId, id, name, isFolder = false)
                 }
-            } else if (a.entry.isFolder) {
-                id = remote.addFolder(parentId, name)
-                rememberSibling(siblingCache, parentId, id, name, isFolder = true)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                if (SyncMissingLocalPath.isMissing(e)) {
+                    SyncMissingLocalPath.log("ApplyLocalPhase.Added", path, path, e)
+                    continue
+                }
+                throw e
+            }
+            val addHash = if (a.entry.isFolder) {
+                ""
             } else {
-                val bytes = fs.readFile(mapping.localRootPath, a.entry.relativePath)
-                // Never push an empty / editor stub when we are about to adopt cloud content.
-                if (bytes.isEmpty()) continue
-                id = remote.addFile(parentId, name, bytes, mimeOf(name))
-                rememberSibling(siblingCache, parentId, id, name, isFolder = false)
+                a.entry.contentHash.ifEmpty {
+                    ContentHashUtil.trySha256Hex {
+                        fs.readFile(mapping.localRootPath, a.entry.relativePath)
+                    } ?: run {
+                        SyncMissingLocalPath.log("ApplyLocalPhase.Added", path, path)
+                        ""
+                    }
+                }
             }
             store.upsert(
                 SyncItemMeta(
@@ -621,9 +717,7 @@ class SyncEngine(
                     relativePath = PathUtil.normalize(a.entry.relativePath),
                     isFolder = a.entry.isFolder,
                     sizeBytes = a.entry.sizeBytes,
-                    contentHash = if (a.entry.isFolder) "" else a.entry.contentHash.ifEmpty {
-                        ContentHashUtil.sha256Hex(fs.readFile(mapping.localRootPath, a.entry.relativePath))
-                    },
+                    contentHash = addHash,
                     remoteUpdateTime = Instant.now()
                 )
             )
@@ -634,22 +728,32 @@ class SyncEngine(
         if (!skipSizeUpdates) {
             for (u in updates) {
                 coroutineContext.ensureActive()
-                if (u.meta.isFolder) {
-                    store.upsert(u.meta.copy(sizeBytes = u.newSize))
-                } else {
-                    val name = PathUtil.nameOf(u.meta.relativePath)
-                    val bytes = fs.readFile(mapping.localRootPath, u.meta.relativePath)
-                    remote.uploadFile(u.meta.remoteId, name, bytes, mimeOf(name))
-                    store.upsert(
-                        u.meta.copy(
-                            sizeBytes = u.newSize,
-                            contentHash = ContentHashUtil.sha256Hex(bytes),
-                            remoteUpdateTime = Instant.now()
+                val updatedPath = PathUtil.normalize(u.meta.relativePath)
+                try {
+                    if (u.meta.isFolder) {
+                        store.upsert(u.meta.copy(sizeBytes = u.newSize))
+                    } else {
+                        val name = PathUtil.nameOf(u.meta.relativePath)
+                        val bytes = fs.readFile(mapping.localRootPath, u.meta.relativePath)
+                        remote.uploadFile(u.meta.remoteId, name, bytes, mimeOf(name))
+                        store.upsert(
+                            u.meta.copy(
+                                sizeBytes = u.newSize,
+                                contentHash = ContentHashUtil.sha256Hex(bytes),
+                                remoteUpdateTime = Instant.now()
+                            )
                         )
-                    )
+                    }
+                    dirty.add(updatedPath)
+                    applied++
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    if (SyncMissingLocalPath.isMissing(e)) {
+                        SyncMissingLocalPath.log("ApplyLocalPhase.Updated", updatedPath, updatedPath, e)
+                    } else {
+                        throw e
+                    }
                 }
-                dirty.add(PathUtil.normalize(u.meta.relativePath))
-                applied++
             }
         } else {
             // Folder size bookkeeping + same-size content uploads (hash-driven).
@@ -900,14 +1004,23 @@ class SyncEngine(
                     val known = metaByRemoteId[child.id]
                     if (known != null) PathUtil.nameOf(known.relativePath) else child.name
                 } else {
+                    // IncludeValues listing: skip synthetic file-{id} (Win IsSyntheticCloudFileDisplayName).
+                    if (!child.isFolder && isSyntheticCloudFileDisplayName(child.id, child.name)) continue
                     child.name
                 }
                 if (name.isEmpty()) continue
                 val rel = PathUtil.join(relativeParent, name)
                 if (!seenPaths.add(PathUtil.normalize(rel))) continue
+                // Warm values-light (useMetaNames): structure-only UpdateTime must not drive
+                // ApplyCompare getFile. Trust meta baseline; IncludeValues re-list keeps time.
+                val listingUpdate = if (useMetaNames) null else child.updateTime
                 out.add(
                     RemoteChangeClassifier.RemoteLocated(
-                        entry = child.copy(parentId = folderId, name = name),
+                        entry = child.copy(
+                            parentId = folderId,
+                            name = name,
+                            updateTime = listingUpdate
+                        ),
                         mappingId = mappingId,
                         relativePath = rel
                     )
@@ -966,7 +1079,7 @@ class SyncEngine(
             }
             val next = mutableListOf<Pair<String, String>>()
             for ((kid, folderId, relativeParent) in waveKids) {
-                val name = names[kid.id] ?: continue
+                val name = forceResolveChildName(kid.id, kid.isFolder, names) ?: continue
                 if (name.isEmpty()) continue
                 val rel = PathUtil.join(relativeParent, name)
                 if (!seenPaths.add(PathUtil.normalize(rel))) continue
@@ -1007,6 +1120,47 @@ class SyncEngine(
             val name = PathUtil.nameOf(meta.relativePath).trim()
             if (name.isEmpty()) null else meta.remoteId to name
         }.toMap()
+
+    /** Win GetDisplayName / Id:N — GUID without dashes. */
+    private fun cloudIdCompact(id: String): String = id.replace("-", "")
+
+    /** Win IsSyntheticCloudFileDisplayName — file-{id:N} is not a real on-disk name. */
+    private fun isSyntheticCloudFileDisplayName(id: String, displayName: String): Boolean =
+        displayName.equals("file-${cloudIdCompact(id)}", ignoreCase = true)
+
+    /**
+     * Force inventory name after Ids IncludeValues (and soft-fail). Win IncludeValues policy:
+     * folders keep [folder-{id}]; synthetic files only when IncludeValues returned a real Values
+     * name — never invent file-{id} after Ids soft-fail (that silently dropped Force children).
+     */
+    private fun forceResolveChildName(
+        id: String,
+        isFolder: Boolean,
+        names: Map<String, String>
+    ): String? {
+        val known = names[id]?.trim().orEmpty()
+        if (known.isNotEmpty()) {
+            if (!isFolder && isSyntheticCloudFileDisplayName(id, known)) {
+                SyncInventoryFetch.logSoftFail(
+                    "ForceIdsNames",
+                    id,
+                    "synthetic file name skipped"
+                )
+                return null
+            }
+            return known
+        }
+        if (isFolder) {
+            SyncInventoryFetch.logSoftFail(
+                "ForceIdsNames",
+                id,
+                "missing name — using folder-${cloudIdCompact(id)}"
+            )
+            return "folder-${cloudIdCompact(id)}"
+        }
+        SyncInventoryFetch.logSoftFail("ForceIdsNames", id, "missing name — skip file")
+        return null
+    }
 
     /**
      * Root listed alone (hard). Nested parents BFS-batched via [listChildrenOfParentsForceInventory]
@@ -1522,24 +1676,42 @@ class SyncEngine(
                 )
                 continue
             }
-            val bytes = fs.readFile(mapping.localRootPath, path)
+            val bytes = try {
+                fs.readFile(mapping.localRootPath, path)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                if (SyncMissingLocalPath.isMissing(e)) {
+                    SyncMissingLocalPath.log("ForcePush", path, path, e)
+                    continue
+                }
+                throw e
+            }
             val hash = ContentHashUtil.sha256Hex(bytes)
-            val remoteId = if (existing != null) {
-                remote.uploadFile(existing.remoteId, name, bytes, mimeOf(name))
-                existing.remoteId
-            } else {
-                val (reuseFile, fileListingOk) = resolveExistingSibling(
-                    parentId, name, isFolder = false, emptyList(), siblingCache
-                )
-                if (reuseFile == null && !fileListingOk) continue
-                if (reuseFile != null) {
-                    remote.uploadFile(reuseFile.id, name, bytes, mimeOf(name))
-                    reuseFile.id
+            val remoteId = try {
+                if (existing != null) {
+                    remote.uploadFile(existing.remoteId, name, bytes, mimeOf(name))
+                    existing.remoteId
                 } else {
-                    remote.addFile(parentId, name, bytes, mimeOf(name)).also {
-                        rememberSibling(siblingCache, parentId, it, name, isFolder = false)
+                    val (reuseFile, fileListingOk) = resolveExistingSibling(
+                        parentId, name, isFolder = false, emptyList(), siblingCache
+                    )
+                    if (reuseFile == null && !fileListingOk) continue
+                    if (reuseFile != null) {
+                        remote.uploadFile(reuseFile.id, name, bytes, mimeOf(name))
+                        reuseFile.id
+                    } else {
+                        remote.addFile(parentId, name, bytes, mimeOf(name)).also {
+                            rememberSibling(siblingCache, parentId, it, name, isFolder = false)
+                        }
                     }
                 }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                if (SyncMissingLocalPath.isMissing(e)) {
+                    SyncMissingLocalPath.log("ForcePush", path, path, e)
+                    continue
+                }
+                throw e
             }
             store.upsert(
                 SyncItemMeta(
@@ -1667,7 +1839,7 @@ class SyncEngine(
             val next = mutableListOf<Pair<String, String>>()
             val waveLocated = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
             for ((kid, folderId, relativeParent) in waveKids) {
-                val name = names[kid.id] ?: continue
+                val name = forceResolveChildName(kid.id, kid.isFolder, names) ?: continue
                 if (name.isEmpty()) continue
                 val rel = PathUtil.join(relativeParent, name)
                 val norm = PathUtil.normalize(rel)
