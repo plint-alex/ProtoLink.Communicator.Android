@@ -380,6 +380,16 @@ class MainViewModel @Inject constructor(
     /** Monotonic id so a slower older SAF walk cannot apply after a newer refresh. */
     private val notesTreeRefreshGeneration = java.util.concurrent.atomic.AtomicInteger(0)
 
+    /**
+     * Win CloudViewModel._listingLoadGeneration — Refresh / navigate must not paint a
+     * superseded GetEntities (live CLOUD_BROWSE_EMPTY_DESPITE_API_KIDS under sync GE flood).
+     * Declared above [init]: ensureCloudRoot → openCloudHub → loadCloudFolder from init.
+     */
+    private val listingLoadGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** Win _listingHydrateGeneration — supersede in-flight IncludeValues when Refresh stacks. */
+    private val listingHydrateGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+
     init {
         refreshAuth()
         _state.update {
@@ -808,8 +818,32 @@ class MainViewModel @Inject constructor(
                 )
             )
 
-    /** Win-parity: values-light pages to structure-complete, then IncludeValues hydrate merge. */
-    private suspend fun loadCloudFolderChildren(folderId: String): List<CloudItem> {
+    /** Sync-meta Soft Ready rows for a mapped folder (empty when unmapped / meta cold). */
+    private fun softReadyCloudItems(folderId: String): List<CloudItem> {
+        val mapping = mappingStore.load()
+            .firstOrNull { it.cloudFolderId.equals(folderId, ignoreCase = true) }
+            ?: return emptyList()
+        val mappingId = mapping.cloudFolderId.replace("-", "")
+        val soft = CloudInteractiveListing.buildSoftReadyRows(
+            folderRemoteId = folderId,
+            children = runCatching { metadataStore.getAll(mappingId) }.getOrDefault(emptyList()),
+            maxRows = CloudInteractiveListing.MAX_ROWS
+        )
+        return soft.map { row ->
+            CloudItem(
+                id = row.id,
+                name = row.name,
+                isFolder = row.isFolder,
+                typeLabel = if (row.isFolder) "Folder" else "File",
+                sizeDisplay = "—",
+                dateDisplay = ChatTime.formatListMeta(row.updateTimeMillis),
+                updateTimeMillis = row.updateTimeMillis
+            )
+        }
+    }
+
+    /** Values-light pages only (structure-complete). Soft Ready when API empty — Win Ready paint. */
+    private suspend fun loadCloudFolderChildrenLight(folderId: String): List<CloudItem> {
         val metaLeaf = syncMetaLeafLookup(folderId)
         val pageSize = CloudInteractiveListing.PAGE_SIZE
         val maxPages = CloudInteractiveListing.MAX_PAGES
@@ -829,36 +863,86 @@ class MainViewModel @Inject constructor(
             if (batch.size < pageSize) break
             skip += pageSize
         }
-        var items = sortCloudListing(light.mapNotNull { cloudChildItem(it, metaLeaf) })
-        // Soft Ready from sync-meta when GetEntities returned empty (Win TryApplySyncMetaSoftReady).
-        if (items.isEmpty() && metaLeaf != null) {
-            val mapping = mappingStore.load()
-                .firstOrNull { it.cloudFolderId.equals(folderId, ignoreCase = true) }
-            if (mapping != null) {
-                val mappingId = mapping.cloudFolderId.replace("-", "")
-                val soft = CloudInteractiveListing.buildSoftReadyRows(
-                    folderRemoteId = folderId,
-                    children = runCatching { metadataStore.getAll(mappingId) }.getOrDefault(emptyList()),
-                    maxRows = CloudInteractiveListing.MAX_ROWS
-                )
-                items = soft.map { row ->
-                    CloudItem(
-                        id = row.id,
-                        name = row.name,
-                        isFolder = row.isFolder,
-                        typeLabel = if (row.isFolder) "Folder" else "File",
-                        sizeDisplay = "—",
-                        dateDisplay = ChatTime.formatListMeta(row.updateTimeMillis),
-                        updateTimeMillis = row.updateTimeMillis
+        val apiItems = sortCloudListing(light.mapNotNull { cloudChildItem(it, metaLeaf) })
+        // Soft Ready when GetEntities returned empty (Win TryApplySyncMetaSoftReady).
+        return CloudInteractiveListing.preferApiOrSoftReady(apiItems, softReadyCloudItems(folderId))
+    }
+
+    /**
+     * Soft IncludeValues after Ready paint (Win HydrateListingValuesAsync). Never blanks a
+     * Ready listing; merge by id so a shorter hydrate page cannot drop structural folders.
+     */
+    private fun hydrateCloudListingAsync(folderId: String, loadGen: Int) {
+        val hydrateGen = listingHydrateGeneration.incrementAndGet()
+        viewModelScope.launch {
+            runCatching {
+                val metaLeaf = syncMetaLeafLookup(folderId)
+                val pageSize = CloudInteractiveListing.PAGE_SIZE
+                val maxPages = CloudInteractiveListing.MAX_PAGES
+                val hydrated = ArrayList<EntityDto>()
+                var skip = 0
+                for (page in 0 until maxPages) {
+                    if (!CloudInteractiveListing.shouldApplyListingResult(
+                            loadGen,
+                            listingLoadGeneration.get(),
+                            currentFolderId,
+                            folderId
+                        )
+                    ) {
+                        return@runCatching
+                    }
+                    if (hydrateGen != listingHydrateGeneration.get()) return@runCatching
+                    val batch = api.getEntities(
+                        GetEntitiesRequest(
+                            parentIds = listOf(folderId),
+                            includeValues = true,
+                            skip = skip,
+                            take = pageSize
+                        )
                     )
+                    if (batch.isEmpty()) break
+                    hydrated.addAll(batch)
+                    if (batch.size < pageSize) break
+                    skip += pageSize
                 }
+                if (hydrated.isEmpty()) return@runCatching
+                if (hydrateGen != listingHydrateGeneration.get()) return@runCatching
+                if (!CloudInteractiveListing.shouldApplyListingResult(
+                        loadGen,
+                        listingLoadGeneration.get(),
+                        currentFolderId,
+                        folderId
+                    )
+                ) {
+                    return@runCatching
+                }
+                val hydratedItems = hydrated.mapNotNull { cloudChildItem(it, metaLeaf) }
+                if (hydratedItems.isEmpty()) return@runCatching
+                val merged = sortCloudListing(
+                    CloudInteractiveListing.mergeHydrateUnionById(
+                        light = _state.value.cloudItems,
+                        hydrated = hydratedItems,
+                        id = { it.id },
+                        merge = { _, h -> h }
+                    )
+                )
+                _state.update { it.copy(cloudItems = merged) }
+                Log.i("ProtoLinkCloud", "listing hydrate id=$folderId count=${merged.size}")
+            }.onFailure { e ->
+                Log.w("ProtoLinkCloud", "values hydrate soft-fail id=$folderId: ${e.message}")
             }
         }
-        // Soft hydrate IncludeValues (Win HydrateListingValuesAsync) — merge by id so a shorter
-        // hydrate page cannot drop structural folders already painted from values-light.
+    }
+
+    /** Full light+hydrate for callers that need a snapshot (entity open / breadcrumb restore). */
+    private suspend fun loadCloudFolderChildren(folderId: String): List<CloudItem> {
+        var items = loadCloudFolderChildrenLight(folderId)
         runCatching {
+            val metaLeaf = syncMetaLeafLookup(folderId)
+            val pageSize = CloudInteractiveListing.PAGE_SIZE
+            val maxPages = CloudInteractiveListing.MAX_PAGES
             val hydrated = ArrayList<EntityDto>()
-            skip = 0
+            var skip = 0
             for (page in 0 until maxPages) {
                 val batch = api.getEntities(
                     GetEntitiesRequest(
@@ -876,7 +960,7 @@ class MainViewModel @Inject constructor(
             if (hydrated.isNotEmpty()) {
                 val hydratedItems = hydrated.mapNotNull { cloudChildItem(it, metaLeaf) }
                 items = sortCloudListing(
-                    CloudInteractiveListing.mergeHydrateById(
+                    CloudInteractiveListing.mergeHydrateUnionById(
                         light = items,
                         hydrated = hydratedItems,
                         id = { it.id },
@@ -888,6 +972,18 @@ class MainViewModel @Inject constructor(
             Log.w("ProtoLinkCloud", "values hydrate soft-fail id=$folderId: ${e.message}")
         }
         return items
+    }
+
+    private fun applyCloudListingItems(items: List<CloudItem>, statusAfterLoad: String?) {
+        _state.update { cur ->
+            val proposed = CloudListingStatus.afterReload(statusAfterLoad)
+            val status = ForceStatusGuard.statusOrNull(
+                forceRunning = cur.forceRunning,
+                forcePreferred = SyncFlight.forcePreferred.get(),
+                proposed = proposed
+            ) ?: cur.status
+            cur.copy(cloudItems = items, status = status)
+        }
     }
 
     suspend fun ensureCloudRoot() {
@@ -917,6 +1013,9 @@ class MainViewModel @Inject constructor(
     }
 
     fun loadCloudFolder(folderId: String, statusAfterLoad: String? = null) = viewModelScope.launch {
+        val loadGen = listingLoadGeneration.incrementAndGet()
+        // Supersede any in-flight values hydrate so Refresh cannot stack IncludeValues Take.
+        listingHydrateGeneration.incrementAndGet()
         currentFolderId = folderId
         clearCloudFileOpen()
         // Force must not gate browse (vision #cloud-unmapped-list / #cloud-folder-responsiveness).
@@ -926,6 +1025,9 @@ class MainViewModel @Inject constructor(
             if (folderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true)) {
                 ensurePhotosLibraryId()
             }
+            // Win-parity: Ready paint from values-light (or Soft Ready) BEFORE IncludeValues hydrate
+            // + folder tree — hydrate must not block first paint under sync GetEntities flood
+            // (CLOUD_BROWSE_EMPTY_DESPITE_API_KIDS / Win 1.0.93 STUCK_LISTING).
             val items = when {
                 folderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true) -> buildHubListing(lang)
                 folderId.equals(CloudVirtualNodes.SHARED_WITH_ME_ID, ignoreCase = true) ->
@@ -934,21 +1036,52 @@ class MainViewModel @Inject constructor(
                     loadSharedByMeListing(lang)
                 folderId.equals(CloudVirtualNodes.RECENT_ID, ignoreCase = true) ->
                     loadRecentListing()
-                else -> loadCloudFolderChildren(folderId)
+                else -> loadCloudFolderChildrenLight(folderId)
+            }
+            if (!CloudInteractiveListing.shouldApplyListingResult(
+                    loadGen,
+                    listingLoadGeneration.get(),
+                    currentFolderId,
+                    folderId
+                )
+            ) {
+                return@launch
             }
             // Browse stays live during Force (1.0.60) — but never clobber Force banner with
             // "Cloud loaded" (live 1.0.73 FORCE_NO_PROGRESS: Download all disabled + Cloud loaded).
-            _state.update { cur ->
-                val proposed = CloudListingStatus.afterReload(statusAfterLoad)
-                val status = ForceStatusGuard.statusOrNull(
-                    forceRunning = cur.forceRunning,
-                    forcePreferred = SyncFlight.forcePreferred.get(),
-                    proposed = proposed
-                ) ?: cur.status
-                cur.copy(cloudItems = items, status = status)
-            }
+            applyCloudListingItems(items, statusAfterLoad)
+            Log.i("ProtoLinkCloud", "listing Ready id=$folderId count=${items.size} gen=$loadGen")
+            // Serialize post-paint: tree then soft values hydrate (Win ContinueAfterListingReady).
             refreshFolderTree()
+            if (!CloudVirtualNodes.isVirtual(folderId)) {
+                hydrateCloudListingAsync(folderId, loadGen)
+            }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
+            if (!CloudInteractiveListing.shouldApplyListingResult(
+                    loadGen,
+                    listingLoadGeneration.get(),
+                    currentFolderId,
+                    folderId
+                )
+            ) {
+                return@launch
+            }
+            // Soft Ready from sync-meta when mapped Notes exist — sticks past GetEntities timeout.
+            if (!CloudVirtualNodes.isVirtual(folderId)) {
+                val soft = softReadyCloudItems(folderId)
+                if (soft.isNotEmpty()) {
+                    Log.w(
+                        "ProtoLinkCloud",
+                        "listing Soft Ready after fail id=$folderId count=${soft.size}: ${e.message}"
+                    )
+                    applyCloudListingItems(soft, statusAfterLoad)
+                    refreshFolderTree()
+                    hydrateCloudListingAsync(folderId, loadGen)
+                    return@launch
+                }
+            }
             Log.e("ProtoLinkCloud", "loadCloudFolder failed id=$folderId", e)
             _state.update { cur ->
                 val proposed = "Cloud load failed: ${e.message ?: e.javaClass.simpleName}"
@@ -1681,11 +1814,13 @@ class MainViewModel @Inject constructor(
             folderTreeLoaded.add(parentId)
             return
         }
+        // Smaller Take after Ready paint — avoid Take=200 IncludeValues contending with
+        // listing hydrate under sync GetEntities flood (Win InteractiveListingPageSize).
         val list = api.getEntities(
             GetEntitiesRequest(
                 parentIds = listOf(parentId),
                 includeValues = true,
-                take = 200
+                take = CloudInteractiveListing.PAGE_SIZE
             )
         )
         val folderKids = ArrayList<CloudFolderTree.Node>()

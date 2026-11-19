@@ -158,4 +158,46 @@ object CloudInteractiveListing {
             merge(row, h)
         }
     }
+
+    /**
+     * Soft Ready / partial light + fuller hydrate: overlay matching ids, then append
+     * hydrate-only rows (Win MergeListing reset:false). Never drops light-only rows when
+     * hydrate is shorter; never leaves Soft Ready stuck when hydrate has Api kids.
+     */
+    fun <T> mergeHydrateUnionById(
+        light: List<T>,
+        hydrated: List<T>,
+        id: (T) -> String,
+        merge: (lightRow: T, hydratedRow: T) -> T
+    ): List<T> {
+        if (hydrated.isEmpty()) return light
+        if (light.isEmpty()) return hydrated
+        val overlaid = mergeHydrateById(light, hydrated, id, merge)
+        val lightIds = overlaid.map { id(it).lowercase() }.filter { it.isNotEmpty() }.toHashSet()
+        val extras = hydrated.filter { id(it).lowercase() !in lightIds }
+        return if (extras.isEmpty()) overlaid else overlaid + extras
+    }
+
+    /**
+     * CLOUD_BROWSE_EMPTY_DESPITE_API_KIDS: when values-light is empty (timeout / race /
+     * cold map), Soft Ready sync-meta rows must paint if present — Win
+     * TryApplySyncMetaSoftReady. API rows always win when non-empty.
+     */
+    fun <T> preferApiOrSoftReady(apiRows: List<T>, softReadyRows: List<T>): List<T> =
+        if (apiRows.isNotEmpty()) apiRows else softReadyRows
+
+    /**
+     * Win CloudViewModel listingLoadGeneration: stale Refresh / navigate-away must not
+     * apply (including empty) over a newer in-flight load.
+     */
+    fun shouldApplyListingResult(
+        loadGen: Int,
+        currentGen: Int,
+        listedFolderId: String?,
+        folderId: String
+    ): Boolean {
+        if (loadGen != currentGen) return false
+        if (folderId.isBlank()) return false
+        return listedFolderId != null && listedFolderId.equals(folderId, ignoreCase = true)
+    }
 }

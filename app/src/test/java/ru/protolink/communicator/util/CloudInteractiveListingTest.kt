@@ -194,6 +194,66 @@ class CloudInteractiveListingTest {
             .isGreaterThan(CloudInteractiveListing.healRichnessScore(0, 132))
     }
 
+    @Test
+    fun preferApiOrSoftReady_emptyBrowseUsesSoftReadyStructural() {
+        // CLOUD_BROWSE_EMPTY_DESPITE_API_KIDS: values-light empty / timeout while Api has kids —
+        // Soft Ready meta for canonical 898 must paint structural folders (not lasting 0 items).
+        val folder = "898c1453-4034-4b9f-96f6-430b4ceca476"
+        val soft = CloudInteractiveListing.buildSoftReadyRows(
+            folderRemoteId = folder,
+            children = listOf(
+                SyncItemMeta("m", "d1", folder, "dev ops", true, 0, Instant.parse("2026-11-17T02:44:38Z")),
+                SyncItemMeta("m", "d2", folder, "docusign", true, 0, Instant.parse("2026-11-17T02:44:39Z")),
+                SyncItemMeta("m", "d3", folder, "ef commands", true, 0, Instant.parse("2026-11-17T02:44:40Z"))
+            ),
+            maxRows = CloudInteractiveListing.MAX_ROWS
+        )
+        val painted = CloudInteractiveListing.preferApiOrSoftReady(emptyList(), soft)
+        assertThat(painted.map { it.name }).containsAtLeast("dev ops", "docusign", "ef commands")
+        assertThat(CloudInteractiveListing.preferApiOrSoftReady(soft.take(1), soft)).hasSize(1)
+    }
+
+    @Test
+    fun shouldApplyListingResult_rejectsStaleOrNavigatedAway() {
+        assertThat(
+            CloudInteractiveListing.shouldApplyListingResult(1, 2, "898", "898")
+        ).isFalse()
+        assertThat(
+            CloudInteractiveListing.shouldApplyListingResult(1, 1, "other", "898")
+        ).isFalse()
+        assertThat(
+            CloudInteractiveListing.shouldApplyListingResult(3, 3, "898", "898")
+        ).isTrue()
+    }
+
+    @Test
+    fun mergeHydrateUnionById_softReadyGainsApiKids() {
+        data class Row(val id: String, val name: String)
+        val softReady = listOf(Row("d1", "dev ops"), Row("d2", "docusign"))
+        val hydrated = listOf(
+            Row("d1", "dev ops"),
+            Row("d2", "docusign"),
+            Row("d3", "ef commands"),
+            Row("f1", "note.txt")
+        )
+        val merged = CloudInteractiveListing.mergeHydrateUnionById(
+            softReady,
+            hydrated,
+            id = { it.id },
+            merge = { _, h -> h }
+        )
+        assertThat(merged.map { it.name })
+            .containsAtLeast("dev ops", "docusign", "ef commands", "note.txt")
+        // Shorter hydrate must not drop soft-ready-only folders:
+        val partial = CloudInteractiveListing.mergeHydrateUnionById(
+            softReady,
+            listOf(Row("d1", "dev ops")),
+            id = { it.id },
+            merge = { _, h -> h }
+        )
+        assertThat(partial.map { it.name }).containsExactly("dev ops", "docusign").inOrder()
+    }
+
     private fun parseUpdateMillis(update: String?): Long {
         if (update.isNullOrBlank()) return 0L
         return runCatching { Instant.parse(update).toEpochMilli() }.getOrDefault(0L)
