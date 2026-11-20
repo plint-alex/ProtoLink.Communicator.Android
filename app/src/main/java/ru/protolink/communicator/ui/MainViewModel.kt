@@ -4170,18 +4170,27 @@ class MainViewModel @Inject constructor(
             }
             userContactsBagId = bagId
 
-            val contacts = withTimeoutOrNull(MessengerContactsLoad.InteractiveHttpTimeoutMs) {
+            // Timeout ≠ empty bag: do not treat Interactive cancel as authoritative empty online
+            // (that left planted stale sticky under shrink-guard after ensureSelf merge).
+            val contactsOrTimeout = withTimeoutOrNull(MessengerContactsLoad.InteractiveHttpTimeoutMs) {
                 api.getEntities(
                     GetEntitiesRequest(parentIds = listOf(bagId), includeValues = true, take = 2000)
                 )
-            } ?: emptyList()
+            }
             if (gen != contactsLoadGeneration.get()) return@launch
+            if (contactsOrTimeout == null) {
+                _state.update { cur ->
+                    cur.copy(isContactsLoading = false)
+                }
+                launch { continueContactsAfterPaint(userId, bagId, gen) }
+                return@launch
+            }
 
             // Prefer-online ASAP: self row uses signed-in login immediately (not UUID), so planted
             // stale disk names are replaced before background GetUserById finishes (Win parity).
             val meLogin = auth.current()?.login?.takeIf { it.isNotBlank() }
             val items = mutableListOf<ContactItem>()
-            for (e in contacts) {
+            for (e in contactsOrTimeout) {
                 val uid = MessengerContactsLoad.tryParseContactUserId(e.values, e.code) ?: continue
                 val provisional =
                     if (uid.equals(userId, ignoreCase = true) && meLogin != null) meLogin else uid
@@ -4189,34 +4198,7 @@ class MainViewModel @Inject constructor(
             }
 
             val ready = items.distinctBy { c -> c.userId.lowercase() }
-            val paintedCount = _state.value.contacts.size
-            if (PreferOnlineUiCache.shouldReplaceContactsList(ready.size, paintedCount)) {
-                // Live 1.0.74: enrich/list must not clobber "Force download…" (FORCE_NO_PROGRESS).
-                _state.update { cur ->
-                    val proposed = "Contacts: ${ready.size}"
-                    val status = ForceStatusGuard.statusOrNull(
-                        forceRunning = cur.forceRunning,
-                        forcePreferred = SyncFlight.forcePreferred.get(),
-                        proposed = proposed
-                    ) ?: cur.status
-                    cur.copy(contacts = ready, status = status, isContactsLoading = false)
-                }
-            } else {
-                // Keep painted partners; merge any online ids not yet shown.
-                _state.update { cur ->
-                    val merged = cur.contacts.toMutableList()
-                    for (c in ready) {
-                        if (merged.none { it.userId.equals(c.userId, true) }) merged.add(c)
-                    }
-                    val proposed = "Contacts: ${merged.size}"
-                    val status = ForceStatusGuard.statusOrNull(
-                        forceRunning = cur.forceRunning,
-                        forcePreferred = SyncFlight.forcePreferred.get(),
-                        proposed = proposed
-                    ) ?: cur.status
-                    cur.copy(contacts = merged, status = status, isContactsLoading = false)
-                }
-            }
+            applyOnlineContactsToState(ready)
             persistContactsDiskAsap(userId)
             // Stay on chat list until the user opens a conversation (phones show list first).
             refreshUnreadBadges()
@@ -4282,7 +4264,16 @@ class MainViewModel @Inject constructor(
             } else {
                 null
             }
-        if (!PreferOnlineUiCache.shouldReplaceContactsCache(contacts.size, existing.size)) {
+        val incomingSubset = PreferOnlineUiCache.isOnlineSubsetOfPainted(
+            contacts.map { it.userId },
+            existing.map { it.id }
+        )
+        if (!PreferOnlineUiCache.shouldReplaceContactsCache(
+                contacts.size,
+                existing.size,
+                incomingSubset
+            )
+        ) {
             if (!bagToPersist.isNullOrBlank()) {
                 messengerDiskCache.saveContactsAsap(
                     ownerUserId,
@@ -4301,6 +4292,25 @@ class MainViewModel @Inject constructor(
             contacts.map { MessengerDiskCache.CachedContact(it.userId, it.displayName) },
             bagToPersist
         )
+    }
+
+    /** Apply online bag kids with prefer-online reconcile (subset-aware replace + name upsert). */
+    private fun applyOnlineContactsToState(ready: List<ContactItem>) {
+        val painted = _state.value.contacts
+        val reconciled = PreferOnlineUiCache.reconcileContactsAfterOnline(
+            painted = painted,
+            online = ready,
+            idOf = { it.userId }
+        )
+        _state.update { cur ->
+            val proposed = "Contacts: ${reconciled.size}"
+            val status = ForceStatusGuard.statusOrNull(
+                forceRunning = cur.forceRunning,
+                forcePreferred = SyncFlight.forcePreferred.get(),
+                proposed = proposed
+            ) ?: cur.status
+            cur.copy(contacts = reconciled, status = status, isContactsLoading = false)
+        }
     }
 
     /**
@@ -4370,32 +4380,8 @@ class MainViewModel @Inject constructor(
             items.add(ContactItem(uid, provisional))
         }
         val ready = items.distinctBy { c -> c.userId.lowercase() }
-        val paintedCount = _state.value.contacts.size
-        if (PreferOnlineUiCache.shouldReplaceContactsList(ready.size, paintedCount)) {
-            _state.update { cur ->
-                val proposed = "Contacts: ${ready.size}"
-                val status = ForceStatusGuard.statusOrNull(
-                    forceRunning = cur.forceRunning,
-                    forcePreferred = SyncFlight.forcePreferred.get(),
-                    proposed = proposed
-                ) ?: cur.status
-                cur.copy(contacts = ready, status = status)
-            }
-        } else {
-            _state.update { cur ->
-                val merged = cur.contacts.toMutableList()
-                for (c in ready) {
-                    if (merged.none { it.userId.equals(c.userId, true) }) merged.add(c)
-                }
-                val proposed = "Contacts: ${merged.size}"
-                val status = ForceStatusGuard.statusOrNull(
-                    forceRunning = cur.forceRunning,
-                    forcePreferred = SyncFlight.forcePreferred.get(),
-                    proposed = proposed
-                ) ?: cur.status
-                cur.copy(contacts = merged, status = status)
-            }
-        }
+        // Shrink-guard inside reconcile keeps Tina when thin ⊆ rich.
+        applyOnlineContactsToState(ready)
         ensureSelfContactRow(userId, bagId, gen)
         if (gen != contactsLoadGeneration.get()) return
         enrichContactDisplayNames(userId, gen)
@@ -4408,17 +4394,29 @@ class MainViewModel @Inject constructor(
     private suspend fun enrichContactDisplayNames(userId: String, gen: Int) {
         val meLogin = auth.current()?.login?.takeIf { it.isNotBlank() }
         val current = _state.value.contacts
-        val enriched = current.map { c ->
+        val forceRefresh = PreferOnlineUiCache.ShouldForceLoginRefreshAfterCachePaint
+        val enriched = current.mapNotNull { c ->
             when {
                 c.userId.equals(userId, true) && meLogin != null ->
                     c.copy(displayName = meLogin)
-                c.userId.equals(userId, true) && !c.displayName.equals(c.userId, true) -> c
+                c.userId.equals(userId, true) -> c
                 else -> {
-                    val display = runCatching {
-                        val u = api.getUserById(c.userId)
-                        u.name?.takeIf { it.isNotBlank() } ?: u.login
-                    }.getOrNull()?.takeIf { it.isNotBlank() } ?: c.displayName
-                    c.copy(displayName = display)
+                    val lookup = runCatching { api.getUserById(c.userId) }
+                    val u = lookup.getOrNull()
+                    val display = u?.name?.takeIf { it.isNotBlank() }
+                        ?: u?.login?.takeIf { it.isNotBlank() }
+                    val connectivity = lookup.exceptionOrNull()?.let {
+                        ApiConnectivity.isExpectedConnectivityFailure(it)
+                    } == true
+                    when {
+                        display != null -> c.copy(displayName = display)
+                        PreferOnlineUiCache.shouldDropUnknownContactAfterLoginRefresh(
+                            forceLoginRefresh = forceRefresh,
+                            userLookupSucceeded = false,
+                            isExpectedConnectivityFailure = connectivity
+                        ) -> null
+                        else -> c
+                    }
                 }
             }
         }.sortedBy { it.displayName.lowercase() }

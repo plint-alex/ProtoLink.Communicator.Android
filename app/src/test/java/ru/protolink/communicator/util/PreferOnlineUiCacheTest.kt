@@ -73,10 +73,109 @@ class PreferOnlineUiCacheTest {
     }
 
     @Test
+    fun replaceContactsList_plantDisjoint_replacesEvenWhenOnlineSmaller() {
+        // Planted fake ids (online ⊈ painted): prefer live self even if count shrinks.
+        assertThat(
+            PreferOnlineUiCache.shouldReplaceContactsList(
+                onlineContactCount = 1,
+                paintedContactCount = 2,
+                onlineIsSubsetOfPainted = false
+            )
+        ).isTrue()
+        // Tina thin bag (online ⊆ painted): keep rich paint.
+        assertThat(
+            PreferOnlineUiCache.shouldReplaceContactsList(
+                onlineContactCount = 1,
+                paintedContactCount = 2,
+                onlineIsSubsetOfPainted = true
+            )
+        ).isFalse()
+    }
+
+    @Test
+    fun onlineSubsetOfPainted_caseInsensitive() {
+        assertThat(
+            PreferOnlineUiCache.isOnlineSubsetOfPainted(
+                listOf("AAA"),
+                listOf("aaa", "bbb")
+            )
+        ).isTrue()
+        assertThat(
+            PreferOnlineUiCache.isOnlineSubsetOfPainted(
+                listOf("ccc"),
+                listOf("aaa", "bbb")
+            )
+        ).isFalse()
+    }
+
+    @Test
     fun replaceContactsCache_blocksShrink() {
         assertThat(PreferOnlineUiCache.shouldReplaceContactsCache(2, 2)).isTrue()
         assertThat(PreferOnlineUiCache.shouldReplaceContactsCache(1, 2)).isFalse()
         assertThat(PreferOnlineUiCache.shouldReplaceContactsCache(3, 1)).isTrue()
+        assertThat(
+            PreferOnlineUiCache.shouldReplaceContactsCache(
+                incomingCount = 1,
+                existingCachedCount = 2,
+                incomingIsSubsetOfExisting = false
+            )
+        ).isTrue()
+    }
+
+    @Test
+    fun reconcile_replaceAfterStalePlant_disjointIds() {
+        data class Row(val id: String, val name: String)
+        val painted = listOf(Row("00000000-0000-0000-0000-000000000099", "STALE_CACHE_TEST_NAME@test.local"))
+        val online = listOf(Row("a52b6095-7952-4535-90a1-ce8bdaf7f9c7", "alex.plint@gmail.com"))
+        val out = PreferOnlineUiCache.reconcileContactsAfterOnline(painted, online) { it.id }
+        assertThat(out).hasSize(1)
+        assertThat(out[0].name).isEqualTo("alex.plint@gmail.com")
+        assertThat(out[0].id).doesNotContain("00000000")
+    }
+
+    @Test
+    fun reconcile_tinaThinBag_keepsRichPaintPartners() {
+        data class Row(val id: String, val name: String)
+        val painted = listOf(
+            Row("self", "alex.plint@gmail.com"),
+            Row("tina", "tina@example.com")
+        )
+        val online = listOf(Row("self", "alex.plint@gmail.com"))
+        val out = PreferOnlineUiCache.reconcileContactsAfterOnline(painted, online) { it.id }
+        assertThat(out.map { it.id }).containsExactly("self", "tina").inOrder()
+    }
+
+    @Test
+    fun reconcile_emptyOnline_keepsPaint() {
+        data class Row(val id: String, val name: String)
+        val painted = listOf(Row("stale", "STALE_CACHE_TEST_NAME@test.local"))
+        val out = PreferOnlineUiCache.reconcileContactsAfterOnline(painted, emptyList()) { it.id }
+        assertThat(out).isEqualTo(painted)
+    }
+
+    @Test
+    fun dropUnknownContact_afterLoginRefresh_notOnConnectivity() {
+        assertThat(
+            PreferOnlineUiCache.shouldDropUnknownContactAfterLoginRefresh(
+                forceLoginRefresh = true,
+                userLookupSucceeded = false,
+                isExpectedConnectivityFailure = false
+            )
+        ).isTrue()
+        assertThat(
+            PreferOnlineUiCache.shouldDropUnknownContactAfterLoginRefresh(
+                forceLoginRefresh = true,
+                userLookupSucceeded = false,
+                isExpectedConnectivityFailure = true
+            )
+        ).isFalse()
+        assertThat(
+            PreferOnlineUiCache.shouldDropUnknownContactAfterLoginRefresh(
+                forceLoginRefresh = true,
+                userLookupSucceeded = true,
+                isExpectedConnectivityFailure = false
+            )
+        ).isFalse()
     }
 
     @Test

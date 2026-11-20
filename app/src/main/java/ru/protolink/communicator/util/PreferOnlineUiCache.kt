@@ -72,18 +72,90 @@ object PreferOnlineUiCache {
     fun shouldClearChromeForLoad(hasCachedPayloadForTarget: Boolean): Boolean =
         !hasCachedPayloadForTarget
 
-    /**
-     * Replace painted Messenger contacts only when online is at least as complete.
-     * Blocks thin StartupFast / self-only bags from wiping a richer disk paint.
-     */
-    fun shouldReplaceContactsList(onlineContactCount: Int, paintedContactCount: Int): Boolean =
-        onlineContactCount >= paintedContactCount
+    /** True when every online id already appears in painted (Tina thin-bag ⊆ rich paint). */
+    fun isOnlineSubsetOfPainted(
+        onlineIds: Collection<String>,
+        paintedIds: Collection<String>
+    ): Boolean {
+        if (onlineIds.isEmpty()) return true
+        val painted = paintedIds.map { it.lowercase() }.toHashSet()
+        return onlineIds.all { painted.contains(it.lowercase()) }
+    }
 
     /**
-     * Persist contacts cache only when the new list is not a shrink vs last-good disk.
+     * Replace painted Messenger contacts when online is at least as complete, or when online
+     * is not a subset of painted (planted/foreign ids — prefer live even if count shrinks).
+     * Blocks thin StartupFast / self-only bags from wiping a richer disk paint (Tina) when
+     * online ⊆ painted.
      */
-    fun shouldReplaceContactsCache(incomingCount: Int, existingCachedCount: Int): Boolean =
-        incomingCount >= existingCachedCount
+    fun shouldReplaceContactsList(
+        onlineContactCount: Int,
+        paintedContactCount: Int,
+        onlineIsSubsetOfPainted: Boolean = true
+    ): Boolean {
+        if (onlineContactCount <= 0) return false
+        if (onlineContactCount >= paintedContactCount) return true
+        return !onlineIsSubsetOfPainted
+    }
+
+    /**
+     * Persist contacts cache when incoming is not a shrink, or when incoming is not a subset
+     * of existing disk (overwrite planted/foreign stale rows).
+     */
+    fun shouldReplaceContactsCache(
+        incomingCount: Int,
+        existingCachedCount: Int,
+        incomingIsSubsetOfExisting: Boolean = true
+    ): Boolean {
+        if (incomingCount <= 0) return false
+        if (incomingCount >= existingCachedCount) return true
+        return !incomingIsSubsetOfExisting
+    }
+
+    /**
+     * Prefer-online reconcile after a completed bag fetch (not interactive timeout).
+     * Empty online keeps paint (Tina / last-good); non-empty uses subset-aware replace;
+     * online names win on id match. Callers must not pass timeout-as-empty here.
+     */
+    fun <T> reconcileContactsAfterOnline(
+        painted: List<T>,
+        online: List<T>,
+        idOf: (T) -> String
+    ): List<T> {
+        if (online.isEmpty()) return painted
+        val onlineIds = online.map(idOf)
+        val paintedIds = painted.map(idOf)
+        val subset = isOnlineSubsetOfPainted(onlineIds, paintedIds)
+        if (shouldReplaceContactsList(online.size, painted.size, subset)) {
+            return distinctById(online, idOf)
+        }
+        // Keep painted partners; upsert online ids/names (prefer-online name win).
+        val merged = LinkedHashMap<String, T>()
+        for (p in painted) merged[idOf(p).lowercase()] = p
+        for (o in online) merged[idOf(o).lowercase()] = o
+        return merged.values.toList()
+    }
+
+    private fun <T> distinctById(items: List<T>, idOf: (T) -> String): List<T> {
+        val seen = HashSet<String>()
+        val out = ArrayList<T>(items.size)
+        for (item in items) {
+            val key = idOf(item).lowercase()
+            if (seen.add(key)) out.add(item)
+        }
+        return out
+    }
+
+    /**
+     * After force login refresh, drop painted contacts Api does not recognize (planted fakes).
+     * Keep on expected connectivity failure so sick paint is not wiped mid-enrich.
+     */
+    fun shouldDropUnknownContactAfterLoginRefresh(
+        forceLoginRefresh: Boolean,
+        userLookupSucceeded: Boolean,
+        isExpectedConnectivityFailure: Boolean
+    ): Boolean =
+        forceLoginRefresh && !userLookupSucceeded && !isExpectedConnectivityFailure
 
     /**
      * Hard Sync error OK modal only for unexpected failures — expected connectivity stays soft banner.
