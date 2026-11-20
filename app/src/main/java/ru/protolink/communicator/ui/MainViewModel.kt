@@ -14,8 +14,10 @@ import ru.protolink.communicator.data.AuthRepository
 import ru.protolink.communicator.data.TokenRefresher
 import ru.protolink.communicator.data.CloudCodes
 import ru.protolink.communicator.data.CloudSyncMappingDto
+import ru.protolink.communicator.data.CloudListingDiskCache
 import ru.protolink.communicator.data.CloudRecentStore
 import ru.protolink.communicator.data.MappingStore
+import ru.protolink.communicator.data.MessengerDiskCache
 import ru.protolink.communicator.data.MessengerNotifier
 import ru.protolink.communicator.data.MessengerReadStore
 import ru.protolink.communicator.data.NotesSiblingFiles
@@ -44,6 +46,7 @@ import ru.protolink.communicator.syncadapt.SyncFlight
 import ru.protolink.communicator.data.messenger.MessengerChatFolderResolver
 import ru.protolink.communicator.data.messenger.PendingAttachmentDraft
 import ru.protolink.communicator.data.messenger.ProgressRequestBody
+import ru.protolink.communicator.util.ApiConnectivity
 import ru.protolink.communicator.util.ChatTime
 import ru.protolink.communicator.util.CloudFileTypeCue
 import ru.protolink.communicator.util.CloudFolderDelete
@@ -67,6 +70,7 @@ import ru.protolink.communicator.util.MessengerContactsLoad
 import ru.protolink.communicator.util.MessengerImageDownscale
 import ru.protolink.communicator.util.MessengerMediaLimits
 import ru.protolink.communicator.util.MessengerSendStateMachine
+import ru.protolink.communicator.util.PreferOnlineUiCache
 import ru.protolink.communicator.util.UserContactsBagHelpers
 import androidx.core.content.FileProvider
 import ru.protolink.communicator.util.NoteRemoteIdResolver
@@ -345,6 +349,16 @@ class MainViewModel @Inject constructor(
     @Volatile private var loadMessagesQueuedContactId: String? = null
     private val readReceiptNotified = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val chatFolderResolver by lazy { MessengerChatFolderResolver(api, settingsStore) }
+    /** Last-good Messenger contacts + chat pages (#comm-win-sick-connection Android parity). */
+    private val messengerDiskCache by lazy {
+        MessengerDiskCache(File(appContext.filesDir, "messenger-cache"))
+    }
+    /** Last-good Cloud folder listings for sick-connection paint. */
+    private val cloudListingDiskCache by lazy {
+        CloudListingDiskCache(File(appContext.filesDir, "cloud-listing-cache"))
+    }
+    /** Current UserContacts bag id (prefer-online ASAP persist). */
+    @Volatile private var userContactsBagId: String? = null
     private val uploadGates = ConcurrentHashMap<String, Mutex>()
     /** RemoteId (lowercase) → has external share (Notes tree lazy glyph). */
     private val notesExternalShareByRemoteId = ConcurrentHashMap<String, Boolean>()
@@ -956,6 +970,7 @@ class MainViewModel @Inject constructor(
                     )
                 )
                 _state.update { it.copy(cloudItems = merged) }
+                persistCloudListingDiskAsap(folderId, merged)
                 Log.i("ProtoLinkCloud", "listing hydrate id=$folderId count=${merged.size}")
             }.onFailure { e ->
                 Log.w("ProtoLinkCloud", "values hydrate soft-fail id=$folderId: ${e.message}")
@@ -964,23 +979,67 @@ class MainViewModel @Inject constructor(
     }
 
     /**
-     * Win BeginFolderListingLoad + Soft Ready on folder change: clear prior hub chrome
-     * immediately so mapped browse never lasts hub siblings as kids while GetEntities
-     * is in flight / superseded under sync GE flood.
+     * Win BeginFolderListingLoad + Soft Ready on folder change: paint last-good disk cache
+     * when present (#comm-win-sick-connection); else Soft Ready / clear hub chrome so mapped
+     * browse never lasts hub siblings as kids while GetEntities is in flight.
      */
     private fun beginFolderListingLoad(folderId: String) {
         if (CloudVirtualNodes.isVirtual(folderId)) {
             _state.update { it.copy(cloudItems = emptyList()) }
             return
         }
+        val fromDisk = cloudListingDiskCache.tryLoad(folderId)
+        if (PreferOnlineUiCache.shouldPaintCacheBeforeOnline(fromDisk.isNotEmpty())) {
+            val painted = sortCloudListing(
+                fromDisk.map {
+                    CloudItem(
+                        id = it.id,
+                        name = it.name,
+                        isFolder = it.isFolder,
+                        mimeType = it.mimeType,
+                        updateTimeMillis = it.updateTimeUtcMillis
+                    )
+                }
+            )
+            _state.update { it.copy(cloudItems = painted) }
+            Log.i(
+                "ProtoLinkCloud",
+                "listing disk paint navigate id=$folderId count=${painted.size}"
+            )
+            return
+        }
         val soft = softReadyCloudItems(folderId)
-        _state.update { it.copy(cloudItems = soft) }
+        if (PreferOnlineUiCache.shouldClearChromeForLoad(soft.isNotEmpty())) {
+            _state.update { it.copy(cloudItems = emptyList()) }
+        } else {
+            _state.update { it.copy(cloudItems = soft) }
+        }
         if (soft.isNotEmpty()) {
             Log.i(
                 "ProtoLinkCloud",
                 "listing Soft Ready navigate id=$folderId count=${soft.size}"
             )
         }
+    }
+
+    private fun persistCloudListingDiskAsap(folderId: String, items: List<CloudItem>) {
+        if (CloudVirtualNodes.isVirtual(folderId)) return
+        if (!PreferOnlineUiCache.shouldWriteCacheAsap(onlineFetchSucceeded = true)) return
+        if (items.isEmpty()) return
+        cloudListingDiskCache.saveAsap(
+            folderId,
+            items
+                .filter { !it.isVirtualEntry }
+                .map {
+                    CloudListingDiskCache.CachedListingItem(
+                        id = it.id,
+                        name = it.name,
+                        isFolder = it.isFolder,
+                        mimeType = it.mimeType,
+                        updateTimeUtcMillis = it.updateTimeMillis
+                    )
+                }
+        )
     }
 
     /** Full light+hydrate for callers that need a snapshot (entity open / breadcrumb restore). */
@@ -1119,6 +1178,7 @@ class MainViewModel @Inject constructor(
             // Browse stays live during Force (1.0.60) — but never clobber Force banner with
             // "Cloud loaded" (live 1.0.73 FORCE_NO_PROGRESS: Download all disabled + Cloud loaded).
             applyCloudListingItems(items, statusAfterLoad)
+            persistCloudListingDiskAsap(folderId, items)
             Log.i("ProtoLinkCloud", "listing Ready id=$folderId count=${items.size} gen=$loadGen")
             // Serialize post-paint: tree then soft values hydrate (Win ContinueAfterListingReady).
             refreshFolderTree()
@@ -1148,6 +1208,55 @@ class MainViewModel @Inject constructor(
                     applyCloudListingItems(soft, statusAfterLoad)
                     refreshFolderTree()
                     hydrateCloudListingAsync(folderId, loadGen, lightItems = soft)
+                    return@launch
+                }
+                // Sick-connection: keep last-good disk paint + soft banner (do not hub-wipe).
+                val connectivity = ApiConnectivity.isExpectedConnectivityFailure(e)
+                val fromDisk = cloudListingDiskCache.tryLoad(folderId)
+                if (PreferOnlineUiCache.shouldPaintCacheBeforeOnline(fromDisk.isNotEmpty())) {
+                    val painted = sortCloudListing(
+                        fromDisk.map {
+                            CloudItem(
+                                id = it.id,
+                                name = it.name,
+                                isFolder = it.isFolder,
+                                mimeType = it.mimeType,
+                                updateTimeMillis = it.updateTimeUtcMillis
+                            )
+                        }
+                    )
+                    Log.w(
+                        "ProtoLinkCloud",
+                        "listing disk paint after fail id=$folderId count=${painted.size}: ${e.message}"
+                    )
+                    applyCloudListingItems(painted, null)
+                    _state.update { cur ->
+                        val proposed = ShareSheetStrings.offlineBanner(uiLang())
+                        val status = ForceStatusGuard.statusOrNull(
+                            forceRunning = cur.forceRunning,
+                            forcePreferred = SyncFlight.forcePreferred.get(),
+                            proposed = proposed
+                        ) ?: cur.status
+                        cur.copy(status = status)
+                    }
+                    refreshFolderTree()
+                    return@launch
+                }
+                // Already painted (navigate disk paint) + connectivity soft-fail: keep rows.
+                if (PreferOnlineUiCache.shouldKeepCacheOnSoftFail(
+                        connectivity,
+                        _state.value.cloudItems.isNotEmpty()
+                    )
+                ) {
+                    _state.update { cur ->
+                        val proposed = ShareSheetStrings.offlineBanner(uiLang())
+                        val status = ForceStatusGuard.statusOrNull(
+                            forceRunning = cur.forceRunning,
+                            forcePreferred = SyncFlight.forcePreferred.get(),
+                            proposed = proposed
+                        ) ?: cur.status
+                        cur.copy(status = status)
+                    }
                     return@launch
                 }
             }
@@ -3957,30 +4066,68 @@ class MainViewModel @Inject constructor(
         val userId = auth.current()?.userId ?: return@launch
         val gen = contactsLoadGeneration.incrementAndGet()
         _state.update { it.copy(isContactsLoading = true) }
+        // Sick/cold: paint last-good disk contacts before online prefer (never blank wipe).
+        if (_state.value.contacts.isEmpty()) {
+            tryPaintContactsFromDisk(userId)
+        }
         // Leave Loading chrome if Interactive budget elapses (never silent empty forever).
+        // Budget ≠ connectivity — do not sticky OfflineBanner (Win PreferOnlineUiCache).
         launch {
             delay(MessengerContactsLoad.InteractiveHttpTimeoutMs)
             if (gen == contactsLoadGeneration.get() && _state.value.isContactsLoading) {
-                _state.update { it.copy(isContactsLoading = false) }
-            }
-        }
-        try {
-            val bagId = withTimeoutOrNull(MessengerContactsLoad.InteractiveHttpTimeoutMs) {
-                ensureUserContactsBagIdStartupFast(userId)
-            }
-            if (gen != contactsLoadGeneration.get()) return@launch
-            if (bagId.isNullOrBlank()) {
                 _state.update { cur ->
-                    val proposed = MessengerContactsLoad.LoadFailedSoft
+                    val proposed = when {
+                        PreferOnlineUiCache.ShouldShowOfflineBannerOnInteractiveBudgetElapsed &&
+                            PreferOnlineUiCache.shouldKeepCacheOnSoftFail(true, cur.contacts.isNotEmpty()) ->
+                            ShareSheetStrings.offlineBanner(uiLang())
+                        cur.contacts.isEmpty() -> MessengerContactsLoad.LoadFailedSoft
+                        else -> cur.status
+                    }
                     val status = ForceStatusGuard.statusOrNull(
                         forceRunning = cur.forceRunning,
                         forcePreferred = SyncFlight.forcePreferred.get(),
                         proposed = proposed
                     ) ?: cur.status
-                    cur.copy(contacts = emptyList(), status = status, isContactsLoading = false)
+                    cur.copy(isContactsLoading = false, status = status)
+                }
+            }
+        }
+        try {
+            val bagFromCache =
+                if (PreferOnlineUiCache.ShouldPreferCachedUserContactsBag) {
+                    messengerDiskCache.tryLoadUserContactsBagId(userId)
+                } else {
+                    null
+                }
+            val bagId = if (!bagFromCache.isNullOrBlank()) {
+                bagFromCache
+            } else {
+                withTimeoutOrNull(MessengerContactsLoad.InteractiveHttpTimeoutMs) {
+                    ensureUserContactsBagIdStartupFast(userId)
+                }
+            }
+            if (gen != contactsLoadGeneration.get()) return@launch
+            if (bagId.isNullOrBlank()) {
+                _state.update { cur ->
+                    val proposed = if (cur.contacts.isEmpty()) {
+                        MessengerContactsLoad.LoadFailedSoft
+                    } else {
+                        ShareSheetStrings.offlineBanner(uiLang())
+                    }
+                    val status = ForceStatusGuard.statusOrNull(
+                        forceRunning = cur.forceRunning,
+                        forcePreferred = SyncFlight.forcePreferred.get(),
+                        proposed = proposed
+                    ) ?: cur.status
+                    cur.copy(
+                        contacts = if (cur.contacts.isEmpty()) emptyList() else cur.contacts,
+                        status = status,
+                        isContactsLoading = false
+                    )
                 }
                 return@launch
             }
+            userContactsBagId = bagId
 
             val contacts = withTimeoutOrNull(MessengerContactsLoad.InteractiveHttpTimeoutMs) {
                 api.getEntities(
@@ -3997,16 +4144,35 @@ class MainViewModel @Inject constructor(
             }
 
             val ready = items.distinctBy { c -> c.userId.lowercase() }
-            // Live 1.0.74: enrich/list must not clobber "Force download…" (FORCE_NO_PROGRESS).
-            _state.update { cur ->
-                val proposed = "Contacts: ${ready.size}"
-                val status = ForceStatusGuard.statusOrNull(
-                    forceRunning = cur.forceRunning,
-                    forcePreferred = SyncFlight.forcePreferred.get(),
-                    proposed = proposed
-                ) ?: cur.status
-                cur.copy(contacts = ready, status = status, isContactsLoading = false)
+            val paintedCount = _state.value.contacts.size
+            if (PreferOnlineUiCache.shouldReplaceContactsList(ready.size, paintedCount)) {
+                // Live 1.0.74: enrich/list must not clobber "Force download…" (FORCE_NO_PROGRESS).
+                _state.update { cur ->
+                    val proposed = "Contacts: ${ready.size}"
+                    val status = ForceStatusGuard.statusOrNull(
+                        forceRunning = cur.forceRunning,
+                        forcePreferred = SyncFlight.forcePreferred.get(),
+                        proposed = proposed
+                    ) ?: cur.status
+                    cur.copy(contacts = ready, status = status, isContactsLoading = false)
+                }
+            } else {
+                // Keep painted partners; merge any online ids not yet shown.
+                _state.update { cur ->
+                    val merged = cur.contacts.toMutableList()
+                    for (c in ready) {
+                        if (merged.none { it.userId.equals(c.userId, true) }) merged.add(c)
+                    }
+                    val proposed = "Contacts: ${merged.size}"
+                    val status = ForceStatusGuard.statusOrNull(
+                        forceRunning = cur.forceRunning,
+                        forcePreferred = SyncFlight.forcePreferred.get(),
+                        proposed = proposed
+                    ) ?: cur.status
+                    cur.copy(contacts = merged, status = status, isContactsLoading = false)
+                }
             }
+            persistContactsDiskAsap(userId)
             // Stay on chat list until the user opens a conversation (phones show list first).
             refreshUnreadBadges()
             if (_state.value.shareSheet.showAddPeople) rebuildShareContactPicker()
@@ -4020,11 +4186,13 @@ class MainViewModel @Inject constructor(
         } catch (e: Exception) {
             Log.e("ProtoLinkContacts", "loadContacts failed", e)
             if (gen != contactsLoadGeneration.get()) return@launch
+            val connectivity = ApiConnectivity.isExpectedConnectivityFailure(e)
             _state.update { cur ->
-                val proposed = if (cur.contacts.isEmpty()) {
-                    MessengerContactsLoad.LoadFailedSoft
-                } else {
-                    "Contacts failed: ${e.message}"
+                val proposed = when {
+                    PreferOnlineUiCache.shouldKeepCacheOnSoftFail(connectivity, cur.contacts.isNotEmpty()) ->
+                        ShareSheetStrings.offlineBanner(uiLang())
+                    cur.contacts.isEmpty() -> MessengerContactsLoad.LoadFailedSoft
+                    else -> "Contacts failed: ${e.message}"
                 }
                 val status = ForceStatusGuard.statusOrNull(
                     forceRunning = cur.forceRunning,
@@ -4033,11 +4201,61 @@ class MainViewModel @Inject constructor(
                 ) ?: cur.status
                 cur.copy(status = status, isContactsLoading = false)
             }
+            if (PreferOnlineUiCache.shouldKeepCacheOnSoftFail(connectivity, _state.value.contacts.isNotEmpty())) {
+                val softBag = userContactsBagId
+                    ?: messengerDiskCache.tryLoadUserContactsBagId(userId)
+                if (!softBag.isNullOrBlank()) {
+                    launch { continueContactsAfterPaint(userId, softBag, gen) }
+                }
+            }
         } finally {
             if (gen == contactsLoadGeneration.get() && _state.value.isContactsLoading) {
                 _state.update { it.copy(isContactsLoading = false) }
             }
         }
+    }
+
+    private fun tryPaintContactsFromDisk(ownerUserId: String) {
+        val cached = messengerDiskCache.tryLoadContacts(ownerUserId)
+        if (!PreferOnlineUiCache.shouldPaintCacheBeforeOnline(cached.isNotEmpty())) return
+        _state.update { cur ->
+            if (cur.contacts.isNotEmpty()) cur
+            else cur.copy(
+                contacts = cached.map { ContactItem(it.id, it.name) }
+            )
+        }
+        Log.i("ProtoLinkContacts", "disk paint contacts count=${cached.size}")
+    }
+
+    private fun persistContactsDiskAsap(ownerUserId: String) {
+        val contacts = _state.value.contacts
+        if (contacts.isEmpty()) return
+        val existing = messengerDiskCache.tryLoadContacts(ownerUserId)
+        val bagToPersist =
+            if (PreferOnlineUiCache.shouldPersistUserContactsBagId(contacts.size)) {
+                userContactsBagId
+            } else {
+                null
+            }
+        if (!PreferOnlineUiCache.shouldReplaceContactsCache(contacts.size, existing.size)) {
+            if (!bagToPersist.isNullOrBlank()) {
+                messengerDiskCache.saveContactsAsap(
+                    ownerUserId,
+                    if (existing.isNotEmpty()) {
+                        existing
+                    } else {
+                        contacts.map { MessengerDiskCache.CachedContact(it.userId, it.displayName) }
+                    },
+                    bagToPersist
+                )
+            }
+            return
+        }
+        messengerDiskCache.saveContactsAsap(
+            ownerUserId,
+            contacts.map { MessengerDiskCache.CachedContact(it.userId, it.displayName) },
+            bagToPersist
+        )
     }
 
     /**
@@ -4121,11 +4339,25 @@ class MainViewModel @Inject constructor(
             }
             refreshUnreadBadges()
             if (_state.value.shareSheet.showAddPeople) rebuildShareContactPicker()
+            persistContactsDiskAsap(userId)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             // Soft: provisional list already shown.
             Log.w("ProtoLinkContacts", "continueContactsAfterPaint soft-fail", e)
+            if (ApiConnectivity.isExpectedConnectivityFailure(e) &&
+                PreferOnlineUiCache.shouldKeepCacheOnSoftFail(true, _state.value.contacts.isNotEmpty())
+            ) {
+                _state.update { cur ->
+                    val proposed = ShareSheetStrings.offlineBanner(uiLang())
+                    val status = ForceStatusGuard.statusOrNull(
+                        forceRunning = cur.forceRunning,
+                        forcePreferred = SyncFlight.forcePreferred.get(),
+                        proposed = proposed
+                    ) ?: cur.status
+                    cur.copy(status = status)
+                }
+            }
         }
     }
 
@@ -4167,9 +4399,55 @@ class MainViewModel @Inject constructor(
     }
 
     fun selectContact(c: ContactItem) {
-        _state.update { it.copy(selectedContact = c) }
+        val me = auth.current()?.userId
+        _state.update { it.copy(selectedContact = c, messages = emptyList()) }
+        if (me != null) tryPaintMessagesFromDisk(me, c.userId)
         loadMessages(c)
         startChatPoll()
+    }
+
+    private fun tryPaintMessagesFromDisk(ownerUserId: String, partnerUserId: String) {
+        val cached = messengerDiskCache.tryLoadMessages(ownerUserId, partnerUserId)
+        if (!PreferOnlineUiCache.shouldPaintCacheBeforeOnline(cached.isNotEmpty())) return
+        val painted = cached.map {
+            MessageItem(
+                id = it.entityId,
+                text = it.text,
+                mine = it.isFromMe,
+                timestampMillis = it.timestampUtcMillis,
+                deliveryStatus = DeliveryStatus.Sent,
+                attachmentIds = it.attachmentIds
+            )
+        }.sortedWith(compareBy({ it.timestampMillis }, { it.id }))
+        _state.update { cur ->
+            if (cur.selectedContact?.userId.equals(partnerUserId, true) != true) cur
+            else if (cur.messages.isNotEmpty()) cur
+            else cur.copy(messages = painted)
+        }
+        Log.i("ProtoLinkChat", "disk paint messages partner=$partnerUserId count=${painted.size}")
+    }
+
+    private fun persistMessagesDiskAsap(
+        ownerUserId: String,
+        partnerUserId: String,
+        serverMsgs: List<MessageItem>
+    ) {
+        if (!PreferOnlineUiCache.shouldWriteCacheAsap(onlineFetchSucceeded = true)) return
+        if (serverMsgs.isEmpty()) return
+        messengerDiskCache.saveMessagesAsap(
+            ownerUserId,
+            partnerUserId,
+            serverMsgs.map {
+                MessengerDiskCache.CachedMessage(
+                    entityId = it.id,
+                    text = it.text,
+                    senderName = if (it.mine) ownerUserId else partnerUserId,
+                    timestampUtcMillis = it.timestampMillis,
+                    isFromMe = it.mine,
+                    attachmentIds = it.attachmentIds
+                )
+            }
+        )
     }
 
     fun clearSelectedContact() {
@@ -4211,6 +4489,11 @@ class MainViewModel @Inject constructor(
                 }
                 Log.i("ProtoLinkChat", "loadMessages start contact=$targetContactId")
                 try {
+                    // Sick/cold: paint last-good disk page before online prefer (always refresh after).
+                    if (_state.value.messages.isEmpty()) {
+                        tryPaintMessagesFromDisk(me, targetContactId)
+                    }
+
                     val all = api.getEntities(
                         GetEntitiesRequest(
                             parentIds = listOf(SystemEntities.MESSAGE),
@@ -4306,9 +4589,37 @@ class MainViewModel @Inject constructor(
                         }
                         markOpenChatRead(targetContactId, merged)
                     }
+                    persistMessagesDiskAsap(me, targetContactId, msgs)
                 } catch (ex: Exception) {
                     if (ex is kotlinx.coroutines.CancellationException) throw ex
-                    showError("Load messages failed", httpDetail(ex), ex)
+                    if (ApiConnectivity.isExpectedConnectivityFailure(ex) &&
+                        PreferOnlineUiCache.shouldKeepCacheOnSoftFail(true, _state.value.messages.isNotEmpty())
+                    ) {
+                        Log.w("ProtoLinkChat", "loadMessages soft-fail keep cache", ex)
+                        _state.update { cur ->
+                            val proposed = ShareSheetStrings.offlineBanner(uiLang())
+                            val status = ForceStatusGuard.statusOrNull(
+                                forceRunning = cur.forceRunning,
+                                forcePreferred = SyncFlight.forcePreferred.get(),
+                                proposed = proposed
+                            ) ?: cur.status
+                            cur.copy(status = status)
+                        }
+                    } else if (_state.value.messages.isEmpty()) {
+                        showError("Load messages failed", httpDetail(ex), ex)
+                    } else if (ApiConnectivity.isExpectedConnectivityFailure(ex)) {
+                        _state.update { cur ->
+                            val proposed = ShareSheetStrings.offlineBanner(uiLang())
+                            val status = ForceStatusGuard.statusOrNull(
+                                forceRunning = cur.forceRunning,
+                                forcePreferred = SyncFlight.forcePreferred.get(),
+                                proposed = proposed
+                            ) ?: cur.status
+                            cur.copy(status = status)
+                        }
+                    } else {
+                        showError("Load messages failed", httpDetail(ex), ex)
+                    }
                 }
 
                 val queued = loadMessagesQueuedContactId ?: break

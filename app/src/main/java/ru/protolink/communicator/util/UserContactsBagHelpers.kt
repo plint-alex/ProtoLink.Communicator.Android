@@ -9,6 +9,9 @@ import ru.protolink.communicator.data.api.EntityDto
 object UserContactsBagHelpers {
     const val ListPageSize = 50
 
+    /** Partner-bearing list: self + ≥1 peer (Win PartnerRowThreshold). */
+    const val PartnerRowThreshold = 2
+
     data class BagSnapshot(
         val id: String,
         val creationTime: String? = null,
