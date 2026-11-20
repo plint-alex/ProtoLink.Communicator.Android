@@ -148,7 +148,9 @@ import android.webkit.JavascriptInterface
 @Composable
 fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
     val state by vm.state.collectAsState()
-    // Notes-without-login: unsigned boot lands on Notes, not Messenger.
+    // Cold start: signed-in → Messenger; unsigned → Notes (#messenger-startup-priority / #notes-without-login).
+    var shellBootstrapped by remember { mutableStateOf(false) }
+    var wasAuthenticated by remember { mutableStateOf(false) }
     var tab by remember { mutableIntStateOf(AuthShellGate.NOTES_TAB) }
     var showAuthFlow by remember { mutableStateOf(false) }
     val config = LocalConfiguration.current
@@ -170,8 +172,25 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
     }
 
     LaunchedEffect(state.authenticated) {
-        if (state.authenticated) showAuthFlow = false
-        tab = AuthShellGate.resolveTabAfterAuthChange(state.authenticated, tab)
+        if (!shellBootstrapped) {
+            tab = AuthShellGate.resolveInitialTab(state.authenticated)
+            shellBootstrapped = true
+            wasAuthenticated = state.authenticated
+            if (state.authenticated) showAuthFlow = false
+            return@LaunchedEffect
+        }
+        when {
+            state.authenticated && !wasAuthenticated -> {
+                // After login land on Messenger (main signed-in tab).
+                tab = AuthShellGate.signedInDefaultTab()
+                showAuthFlow = false
+            }
+            else -> {
+                tab = AuthShellGate.resolveTabAfterAuthChange(state.authenticated, tab)
+                if (state.authenticated) showAuthFlow = false
+            }
+        }
+        wasAuthenticated = state.authenticated
     }
 
     LaunchedEffect(state.preferCloudTabNonce) {
@@ -1659,6 +1678,7 @@ fun MessengerScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = t
         if (showContacts) {
             MessengerContactsPane(
                 contacts = state.contacts,
+                isContactsLoading = state.isContactsLoading,
                 selectedId = null,
                 onRefresh = { vm.loadContacts() },
                 onSelect = { vm.selectContact(it) },
@@ -1693,6 +1713,7 @@ fun MessengerScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = t
         Row(Modifier.fillMaxSize()) {
             MessengerContactsPane(
                 contacts = state.contacts,
+                isContactsLoading = state.isContactsLoading,
                 selectedId = state.selectedContact?.userId,
                 onRefresh = { vm.loadContacts() },
                 onSelect = { vm.selectContact(it) },
@@ -1737,6 +1758,7 @@ private val TgTickSent = Color(0xFF667781)
 @Composable
 private fun MessengerContactsPane(
     contacts: List<ContactItem>,
+    isContactsLoading: Boolean,
     selectedId: String?,
     onRefresh: () -> Unit,
     onSelect: (ContactItem) -> Unit,
@@ -1745,6 +1767,11 @@ private fun MessengerContactsPane(
     uiLang: String,
     modifier: Modifier = Modifier
 ) {
+    val showLoading = ru.protolink.communicator.util.MessengerContactsLoad.shouldShowLoading(isContactsLoading)
+    val showEmpty = ru.protolink.communicator.util.MessengerContactsLoad.shouldShowEmpty(
+        isContactsLoading,
+        contacts.size
+    )
     Column(modifier.background(MaterialTheme.colorScheme.surface)) {
         Row(
             Modifier
@@ -1756,67 +1783,116 @@ private fun MessengerContactsPane(
             TextButton(onClick = onRefresh) { Text("Refresh") }
         }
         Divider()
-        LazyColumn(Modifier.fillMaxSize()) {
-            items(contacts, key = { it.userId }) { c ->
-                var menuOpen by remember(c.userId) { mutableStateOf(false) }
-                val selected = selectedId != null && selectedId.equals(c.userId, true)
-                Box {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(if (selected) Color(0x142AABEE) else Color.Transparent)
-                            .combinedClickable(
-                                onClick = { onSelect(c) },
-                                onLongClick = { menuOpen = true }
-                            )
-                            .padding(horizontal = 12.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        ContactAvatar(c.displayName)
-                        Spacer(Modifier.width(12.dp))
+        when {
+            showLoading && contacts.isEmpty() -> {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        CircularProgressIndicator(color = TgAccent)
+                        Spacer(Modifier.height(12.dp))
                         Text(
-                            c.displayName,
-                            style = MaterialTheme.typography.titleMedium,
-                            maxLines = 1,
-                            modifier = Modifier.weight(1f)
+                            ru.protolink.communicator.util.MessengerContactsLoad.LoadingStatus,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        if (c.hasUnread) {
-                            Box(
-                                modifier = Modifier
-                                    .background(TgAccent, RoundedCornerShape(percent = 50))
-                                    .padding(horizontal = 8.dp, vertical = 3.dp),
-                                contentAlignment = Alignment.Center
+                    }
+                }
+            }
+            showEmpty -> {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text(
+                        ru.protolink.communicator.util.MessengerContactsLoad.EmptyHint,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(24.dp)
+                    )
+                }
+            }
+            else -> {
+                LazyColumn(Modifier.fillMaxSize()) {
+                    if (showLoading) {
+                        item(key = "__contacts_loading") {
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp),
+                                    strokeWidth = 2.dp,
+                                    color = TgAccent
+                                )
+                                Spacer(Modifier.width(10.dp))
                                 Text(
-                                    c.unreadLabel,
-                                    color = Color.White,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.SemiBold
+                                    ru.protolink.communicator.util.MessengerContactsLoad.LoadingStatus,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                         }
                     }
-                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                        val idResolved = ShareAccountStrings.formatUserIdForClipboard(c.userId) != null
-                        DropdownMenuItem(
-                            text = { Text(ShareAccountStrings.contactInformationLabel(uiLang)) },
-                            onClick = {
-                                menuOpen = false
-                                onOpenContactInformation(c)
-                            },
-                            enabled = idResolved
-                        )
-                        DropdownMenuItem(
-                            text = { Text(ShareAccountStrings.copyContactIdLabel(uiLang)) },
-                            onClick = {
-                                menuOpen = false
-                                onCopyContactId(c)
-                            },
-                            enabled = idResolved
-                        )
+                    items(contacts, key = { it.userId }) { c ->
+                        var menuOpen by remember(c.userId) { mutableStateOf(false) }
+                        val selected = selectedId != null && selectedId.equals(c.userId, true)
+                        Box {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(if (selected) Color(0x142AABEE) else Color.Transparent)
+                                    .combinedClickable(
+                                        onClick = { onSelect(c) },
+                                        onLongClick = { menuOpen = true }
+                                    )
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                ContactAvatar(c.displayName)
+                                Spacer(Modifier.width(12.dp))
+                                Text(
+                                    c.displayName,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    maxLines = 1,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                if (c.hasUnread) {
+                                    Box(
+                                        modifier = Modifier
+                                            .background(TgAccent, RoundedCornerShape(percent = 50))
+                                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            c.unreadLabel,
+                                            color = Color.White,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    }
+                                }
+                            }
+                            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                                val idResolved = ShareAccountStrings.formatUserIdForClipboard(c.userId) != null
+                                DropdownMenuItem(
+                                    text = { Text(ShareAccountStrings.contactInformationLabel(uiLang)) },
+                                    onClick = {
+                                        menuOpen = false
+                                        onOpenContactInformation(c)
+                                    },
+                                    enabled = idResolved
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(ShareAccountStrings.copyContactIdLabel(uiLang)) },
+                                    onClick = {
+                                        menuOpen = false
+                                        onCopyContactId(c)
+                                    },
+                                    enabled = idResolved
+                                )
+                            }
+                        }
+                        Divider(modifier = Modifier.padding(start = 68.dp), color = Color(0x14000000))
                     }
                 }
-                Divider(modifier = Modifier.padding(start = 68.dp), color = Color(0x14000000))
             }
         }
     }

@@ -1,8 +1,8 @@
 package ru.protolink.communicator.util
 
 /**
- * Notes-without-login shell policy (#notes-without-login).
- * Unsigned users keep the tab shell; Messenger / Cloud require login (Settings/Auth).
+ * Notes-without-login shell policy (#notes-without-login) + signed-in Messenger main tab
+ * (#messenger-startup-priority). Unsigned users keep the tab shell; Messenger / Cloud require login.
  */
 object AuthShellGate {
     const val MESSENGER_TAB = 0
@@ -17,7 +17,20 @@ object AuthShellGate {
 
     fun unsignedDefaultTab(): Int = NOTES_TAB
 
-    /** After logout (or unsigned boot), bounce Messenger/Cloud selection to Notes. */
+    /** Cold start / after login: Messenger is the main signed-in tab (Job #2). */
+    fun signedInDefaultTab(): Int = MESSENGER_TAB
+
+    /**
+     * Initial tab for a fresh shell: signed-in → Messenger; unsigned → Notes.
+     * Does not bounce intentional Notes/Cloud selection while already authenticated.
+     */
+    fun resolveInitialTab(authenticated: Boolean): Int =
+        if (authenticated) signedInDefaultTab() else unsignedDefaultTab()
+
+    /**
+     * After logout (or unsigned boot), bounce Messenger/Cloud selection to Notes.
+     * Signed-in users keep their current tab (Notes stays reachable after cold Messenger land).
+     */
     fun resolveTabAfterAuthChange(authenticated: Boolean, currentTab: Int): Int =
         if (shouldPromptLoginForTab(authenticated, currentTab)) unsignedDefaultTab() else currentTab
 }

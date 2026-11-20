@@ -41,4 +41,23 @@ class AuthShellGateTest {
     fun unsignedDefaultTab_isNotes() {
         assertThat(AuthShellGate.unsignedDefaultTab()).isEqualTo(AuthShellGate.NOTES_TAB)
     }
+
+    @Test
+    fun signedInDefaultTab_isMessenger() {
+        assertThat(AuthShellGate.signedInDefaultTab()).isEqualTo(AuthShellGate.MESSENGER_TAB)
+    }
+
+    @Test
+    fun resolveInitialTab_signedInMessenger_unsignedNotes() {
+        assertThat(AuthShellGate.resolveInitialTab(true)).isEqualTo(AuthShellGate.MESSENGER_TAB)
+        assertThat(AuthShellGate.resolveInitialTab(false)).isEqualTo(AuthShellGate.NOTES_TAB)
+    }
+
+    @Test
+    fun resolveTabAfterAuthChange_keepsNotesWhenSignedIn() {
+        // Intentional Notes while signed-in must not bounce to Messenger on auth refresh.
+        assertThat(
+            AuthShellGate.resolveTabAfterAuthChange(true, AuthShellGate.NOTES_TAB)
+        ).isEqualTo(AuthShellGate.NOTES_TAB)
+    }
 }

@@ -63,9 +63,11 @@ import ru.protolink.communicator.util.MessengerAttachmentRender
 import ru.protolink.communicator.util.MessengerConversationMerge
 import ru.protolink.communicator.util.MessengerConversationScope
 import ru.protolink.communicator.util.MessengerAtomicSend
+import ru.protolink.communicator.util.MessengerContactsLoad
 import ru.protolink.communicator.util.MessengerImageDownscale
 import ru.protolink.communicator.util.MessengerMediaLimits
 import ru.protolink.communicator.util.MessengerSendStateMachine
+import ru.protolink.communicator.util.UserContactsBagHelpers
 import androidx.core.content.FileProvider
 import ru.protolink.communicator.util.NoteRemoteIdResolver
 import ru.protolink.communicator.util.NotesDeleteNavigate
@@ -276,6 +278,8 @@ data class UiState(
     val shareRootCanWrite: Map<String, Boolean> = emptyMap(),
     val mappings: List<CloudSyncMappingDto> = emptyList(),
     val contacts: List<ContactItem> = emptyList(),
+    /** True while the contacts list is fetching (#messenger-startup-priority). */
+    val isContactsLoading: Boolean = false,
     val selectedContact: ContactItem? = null,
     val messages: List<MessageItem> = emptyList(),
     val notesTreeRows: List<NoteTreeRow> = emptyList(),
@@ -389,6 +393,9 @@ class MainViewModel @Inject constructor(
 
     /** Win _listingHydrateGeneration — supersede in-flight IncludeValues when Refresh stacks. */
     private val listingHydrateGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** Messenger contacts load generation — supersede slower older fetches (#messenger-startup-priority). */
+    private val contactsLoadGeneration = java.util.concurrent.atomic.AtomicInteger(0)
 
     init {
         refreshAuth()
@@ -3939,67 +3946,45 @@ class MainViewModel @Inject constructor(
 
     fun loadContacts() = viewModelScope.launch {
         val userId = auth.current()?.userId ?: return@launch
+        val gen = contactsLoadGeneration.incrementAndGet()
+        _state.update { it.copy(isContactsLoading = true) }
+        // Leave Loading chrome if Interactive budget elapses (never silent empty forever).
+        launch {
+            delay(MessengerContactsLoad.InteractiveHttpTimeoutMs)
+            if (gen == contactsLoadGeneration.get() && _state.value.isContactsLoading) {
+                _state.update { it.copy(isContactsLoading = false) }
+            }
+        }
         try {
-            var userContacts = api.getEntities(
-                GetEntitiesRequest(
-                    parentIds = listOf(SystemEntities.CONTACTS, userId),
-                    includeValues = false,
-                    take = 50
-                )
-            ).firstOrNull()
-
-            if (userContacts == null) {
-                val created = api.addEntity(
-                    AddEntityRequest(
-                        code = "UserContacts",
-                        parentIds = listOf(SystemEntities.CONTACTS, userId)
-                    )
-                )
-                val id = created.id ?: return@launch
-                userContacts = EntityDto(id = id, code = "UserContacts")
+            val bagId = withTimeoutOrNull(MessengerContactsLoad.InteractiveHttpTimeoutMs) {
+                ensureUserContactsBagIdStartupFast(userId)
+            }
+            if (gen != contactsLoadGeneration.get()) return@launch
+            if (bagId.isNullOrBlank()) {
+                _state.update { cur ->
+                    val proposed = MessengerContactsLoad.LoadFailedSoft
+                    val status = ForceStatusGuard.statusOrNull(
+                        forceRunning = cur.forceRunning,
+                        forcePreferred = SyncFlight.forcePreferred.get(),
+                        proposed = proposed
+                    ) ?: cur.status
+                    cur.copy(contacts = emptyList(), status = status, isContactsLoading = false)
+                }
+                return@launch
             }
 
-            val parentId = userContacts.id
-            val contacts = api.getEntities(
-                GetEntitiesRequest(parentIds = listOf(parentId), includeValues = true, take = 2000)
-            )
+            val contacts = withTimeoutOrNull(MessengerContactsLoad.InteractiveHttpTimeoutMs) {
+                api.getEntities(
+                    GetEntitiesRequest(parentIds = listOf(bagId), includeValues = true, take = 2000)
+                )
+            } ?: emptyList()
+            if (gen != contactsLoadGeneration.get()) return@launch
+
             val items = mutableListOf<ContactItem>()
             for (e in contacts) {
-                val uid = e.values?.mapNotNull { it.value?.asString }
-                    ?.firstOrNull { it.startsWith("userid:", true) }
-                    ?.substringAfter(":")
-                    ?: e.code?.takeIf { it.length == 36 }
-                    ?: continue
+                val uid = MessengerContactsLoad.tryParseContactUserId(e.values, e.code) ?: continue
                 // Provisional name — resolve logins after the list is visible
                 items.add(ContactItem(uid, uid))
-            }
-
-            val selfHit = api.getEntities(
-                GetEntitiesRequest(
-                    parentIds = listOf(parentId, userId),
-                    includeValues = true,
-                    take = 10
-                )
-            ).firstOrNull()
-            val hasSelf = items.any { it.userId.equals(userId, true) }
-            if (!hasSelf) {
-                val name = selfHit?.code?.takeIf { it.isNotBlank() }
-                    ?: auth.current()?.login?.takeIf { it.isNotBlank() }
-                    ?: "Me"
-                if (selfHit == null) {
-                    runCatching {
-                        api.addEntity(
-                            AddEntityRequest(
-                                code = name,
-                                parentIds = listOf(parentId, userId),
-                                values = listOf(
-                                    AddValueRequest(value = "userid:$userId", parentIds = emptyList())
-                                )
-                            )
-                        )
-                    }
-                }
-                items.add(0, ContactItem(userId, name))
             }
 
             val ready = items.distinctBy { c -> c.userId.lowercase() }
@@ -4011,59 +3996,164 @@ class MainViewModel @Inject constructor(
                     forcePreferred = SyncFlight.forcePreferred.get(),
                     proposed = proposed
                 ) ?: cur.status
-                cur.copy(contacts = ready, status = status)
+                cur.copy(contacts = ready, status = status, isContactsLoading = false)
             }
             // Stay on chat list until the user opens a conversation (phones show list first).
             refreshUnreadBadges()
             if (_state.value.shareSheet.showAddPeople) rebuildShareContactPicker()
 
-            // Enrich display names without blocking list/chat
+            // Self-row + name enrich after first paint (Background OK; do not starve Interactive).
             launch {
-                val enriched = ready.map { c ->
-                    if (c.userId.equals(userId, true) && !c.displayName.equals(c.userId, true)) c
-                    else {
-                        val display = runCatching {
-                            val u = api.getUserById(c.userId)
-                            u.name?.takeIf { it.isNotBlank() } ?: u.login
-                        }.getOrNull()?.takeIf { it.isNotBlank() } ?: c.displayName
-                        c.copy(displayName = display)
-                    }
-                }.sortedBy { it.displayName.lowercase() }
-                val selectedId = _state.value.selectedContact?.userId
-                _state.update { s ->
-                    val proposed = "Contacts: ${enriched.size}"
-                    val status = ForceStatusGuard.statusOrNull(
-                        forceRunning = s.forceRunning,
-                        forcePreferred = SyncFlight.forcePreferred.get(),
-                        proposed = proposed
-                    ) ?: s.status
-                    s.copy(
-                        contacts = enriched.map { e ->
-                            val prev = s.contacts.firstOrNull { it.userId.equals(e.userId, true) }
-                            e.copy(unreadCount = prev?.unreadCount ?: 0)
-                        },
-                        selectedContact = selectedId?.let { id ->
-                            val hit = enriched.firstOrNull { it.userId.equals(id, true) }
-                            val prev = s.selectedContact
-                            hit?.copy(unreadCount = prev?.unreadCount ?: 0) ?: s.selectedContact
-                        } ?: s.selectedContact,
-                        status = status
-                    )
-                }
-                refreshUnreadBadges()
-                if (_state.value.shareSheet.showAddPeople) rebuildShareContactPicker()
+                continueContactsAfterPaint(userId, bagId, gen)
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e("ProtoLinkContacts", "loadContacts failed", e)
+            if (gen != contactsLoadGeneration.get()) return@launch
             _state.update { cur ->
-                val proposed = "Contacts failed: ${e.message}"
+                val proposed = if (cur.contacts.isEmpty()) {
+                    MessengerContactsLoad.LoadFailedSoft
+                } else {
+                    "Contacts failed: ${e.message}"
+                }
                 val status = ForceStatusGuard.statusOrNull(
                     forceRunning = cur.forceRunning,
                     forcePreferred = SyncFlight.forcePreferred.get(),
                     proposed = proposed
                 ) ?: cur.status
-                cur.copy(status = status)
+                cur.copy(status = status, isContactsLoading = false)
             }
+        } finally {
+            if (gen == contactsLoadGeneration.get() && _state.value.isContactsLoading) {
+                _state.update { it.copy(isContactsLoading = false) }
+            }
+        }
+    }
+
+    /**
+     * Startup-fast bag for Messenger contacts ASAP (#messenger-startup-priority):
+     * first list page only, pick without kid-count enrich. Race-guard recheck before create.
+     */
+    private suspend fun ensureUserContactsBagIdStartupFast(userId: String): String? {
+        val first = api.getEntities(
+            GetEntitiesRequest(
+                parentIds = listOf(SystemEntities.CONTACTS, userId),
+                includeValues = false,
+                take = UserContactsBagHelpers.ListPageSize,
+                skip = 0
+            )
+        )
+        if (!UserContactsBagHelpers.shouldCreateBag(first)) {
+            return UserContactsBagHelpers.pickBagId(UserContactsBagHelpers.toSnapshots(first))
+        }
+        // Race guard: empty first page — recheck before create.
+        val recheck = api.getEntities(
+            GetEntitiesRequest(
+                parentIds = listOf(SystemEntities.CONTACTS, userId),
+                includeValues = false,
+                take = UserContactsBagHelpers.ListPageSize,
+                skip = 0
+            )
+        )
+        if (!UserContactsBagHelpers.shouldCreateBag(recheck)) {
+            return UserContactsBagHelpers.pickBagId(UserContactsBagHelpers.toSnapshots(recheck))
+        }
+        val created = api.addEntity(
+            AddEntityRequest(
+                code = "UserContacts",
+                parentIds = listOf(SystemEntities.CONTACTS, userId)
+            )
+        )
+        return created.id?.takeIf { it.isNotBlank() }
+    }
+
+    private suspend fun continueContactsAfterPaint(
+        userId: String,
+        bagId: String,
+        gen: Int
+    ) {
+        try {
+            ensureSelfContactRow(userId, bagId, gen)
+            if (gen != contactsLoadGeneration.get()) return
+
+            val current = _state.value.contacts
+            val enriched = current.map { c ->
+                if (c.userId.equals(userId, true) && !c.displayName.equals(c.userId, true)) c
+                else {
+                    val display = runCatching {
+                        val u = api.getUserById(c.userId)
+                        u.name?.takeIf { it.isNotBlank() } ?: u.login
+                    }.getOrNull()?.takeIf { it.isNotBlank() } ?: c.displayName
+                    c.copy(displayName = display)
+                }
+            }.sortedBy { it.displayName.lowercase() }
+            if (gen != contactsLoadGeneration.get()) return
+            val selectedId = _state.value.selectedContact?.userId
+            _state.update { s ->
+                val proposed = "Contacts: ${enriched.size}"
+                val status = ForceStatusGuard.statusOrNull(
+                    forceRunning = s.forceRunning,
+                    forcePreferred = SyncFlight.forcePreferred.get(),
+                    proposed = proposed
+                ) ?: s.status
+                s.copy(
+                    contacts = enriched.map { e ->
+                        val prev = s.contacts.firstOrNull { it.userId.equals(e.userId, true) }
+                        e.copy(unreadCount = prev?.unreadCount ?: 0)
+                    },
+                    selectedContact = selectedId?.let { id ->
+                        val hit = enriched.firstOrNull { it.userId.equals(id, true) }
+                        val prev = s.selectedContact
+                        hit?.copy(unreadCount = prev?.unreadCount ?: 0) ?: s.selectedContact
+                    } ?: s.selectedContact,
+                    status = status
+                )
+            }
+            refreshUnreadBadges()
+            if (_state.value.shareSheet.showAddPeople) rebuildShareContactPicker()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // Soft: provisional list already shown.
+            Log.w("ProtoLinkContacts", "continueContactsAfterPaint soft-fail", e)
+        }
+    }
+
+    private suspend fun ensureSelfContactRow(userId: String, bagId: String, gen: Int) {
+        if (gen != contactsLoadGeneration.get()) return
+        val selfHit = runCatching {
+            api.getEntities(
+                GetEntitiesRequest(
+                    parentIds = listOf(bagId, userId),
+                    includeValues = true,
+                    take = 10
+                )
+            ).firstOrNull()
+        }.getOrNull()
+        if (gen != contactsLoadGeneration.get()) return
+        val hasSelf = _state.value.contacts.any { it.userId.equals(userId, true) }
+        if (hasSelf) return
+        val name = selfHit?.code?.takeIf { it.isNotBlank() }
+            ?: auth.current()?.login?.takeIf { it.isNotBlank() }
+            ?: "Me"
+        if (selfHit == null) {
+            runCatching {
+                api.addEntity(
+                    AddEntityRequest(
+                        code = name,
+                        parentIds = listOf(bagId, userId),
+                        values = listOf(
+                            AddValueRequest(value = "userid:$userId", parentIds = emptyList())
+                        )
+                    )
+                )
+            }
+        }
+        if (gen != contactsLoadGeneration.get()) return
+        _state.update { cur ->
+            if (cur.contacts.any { it.userId.equals(userId, true) }) cur
+            else cur.copy(contacts = listOf(ContactItem(userId, name)) + cur.contacts)
         }
     }
 
