@@ -871,8 +871,14 @@ class MainViewModel @Inject constructor(
     /**
      * Soft IncludeValues after Ready paint (Win HydrateListingValuesAsync). Never blanks a
      * Ready listing; merge by id so a shorter hydrate page cannot drop structural folders.
+     * [lightItems] is the Ready paint for this folder — never merge against stale hub chrome
+     * still sitting in state (CLOUD_BROWSE_HUB_CHROME_INSTEAD_OF_MAP_KIDS).
      */
-    private fun hydrateCloudListingAsync(folderId: String, loadGen: Int) {
+    private fun hydrateCloudListingAsync(
+        folderId: String,
+        loadGen: Int,
+        lightItems: List<CloudItem>
+    ) {
         val hydrateGen = listingHydrateGeneration.incrementAndGet()
         viewModelScope.launch {
             runCatching {
@@ -918,9 +924,25 @@ class MainViewModel @Inject constructor(
                 }
                 val hydratedItems = hydrated.mapNotNull { cloudChildItem(it, metaLeaf) }
                 if (hydratedItems.isEmpty()) return@runCatching
+                // Stale hub chrome must not union into mapped kids (My Cloud/Photos are
+                // non-virtual ids — strip-virtual alone is not enough).
+                val lightForMerge =
+                    if (CloudInteractiveListing.looksLikeHubChromeListing(
+                            lightItems.map { it.id },
+                            CloudVirtualNodes::isVirtual
+                        )
+                    ) {
+                        emptyList()
+                    } else {
+                        CloudInteractiveListing.withoutVirtualHubRows(
+                            lightItems,
+                            id = { it.id },
+                            isVirtual = CloudVirtualNodes::isVirtual
+                        )
+                    }
                 val merged = sortCloudListing(
                     CloudInteractiveListing.mergeHydrateUnionById(
-                        light = _state.value.cloudItems,
+                        light = lightForMerge,
                         hydrated = hydratedItems,
                         id = { it.id },
                         merge = { _, h -> h }
@@ -931,6 +953,26 @@ class MainViewModel @Inject constructor(
             }.onFailure { e ->
                 Log.w("ProtoLinkCloud", "values hydrate soft-fail id=$folderId: ${e.message}")
             }
+        }
+    }
+
+    /**
+     * Win BeginFolderListingLoad + Soft Ready on folder change: clear prior hub chrome
+     * immediately so mapped browse never lasts hub siblings as kids while GetEntities
+     * is in flight / superseded under sync GE flood.
+     */
+    private fun beginFolderListingLoad(folderId: String) {
+        if (CloudVirtualNodes.isVirtual(folderId)) {
+            _state.update { it.copy(cloudItems = emptyList()) }
+            return
+        }
+        val soft = softReadyCloudItems(folderId)
+        _state.update { it.copy(cloudItems = soft) }
+        if (soft.isNotEmpty()) {
+            Log.i(
+                "ProtoLinkCloud",
+                "listing Soft Ready navigate id=$folderId count=${soft.size}"
+            )
         }
     }
 
@@ -1013,11 +1055,19 @@ class MainViewModel @Inject constructor(
     }
 
     fun loadCloudFolder(folderId: String, statusAfterLoad: String? = null) = viewModelScope.launch {
+        val previousFolderId = currentFolderId
+        val folderChanged = previousFolderId == null ||
+            !previousFolderId.equals(folderId, ignoreCase = true)
         val loadGen = listingLoadGeneration.incrementAndGet()
         // Supersede any in-flight values hydrate so Refresh cannot stack IncludeValues Take.
         listingHydrateGeneration.incrementAndGet()
         currentFolderId = folderId
         clearCloudFileOpen()
+        // Win BeginFolderListingLoad: clear hub chrome before await so mapped kids never last hub rows
+        // (CLOUD_BROWSE_HUB_CHROME_INSTEAD_OF_MAP_KIDS). Same-folder Refresh keeps current paint.
+        if (folderChanged) {
+            beginFolderListingLoad(folderId)
+        }
         // Force must not gate browse (vision #cloud-unmapped-list / #cloud-folder-responsiveness).
         // Live 1.0.57 FATAL was uncaught HttpException on Main — keep soft-fail catch below; never skip GetEntities.
         val lang = uiLang()
@@ -1028,7 +1078,7 @@ class MainViewModel @Inject constructor(
             // Win-parity: Ready paint from values-light (or Soft Ready) BEFORE IncludeValues hydrate
             // + folder tree — hydrate must not block first paint under sync GetEntities flood
             // (CLOUD_BROWSE_EMPTY_DESPITE_API_KIDS / Win 1.0.93 STUCK_LISTING).
-            val items = when {
+            val rawItems = when {
                 folderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true) -> buildHubListing(lang)
                 folderId.equals(CloudVirtualNodes.SHARED_WITH_ME_ID, ignoreCase = true) ->
                     loadSharedWithMeListing(lang)
@@ -1037,6 +1087,16 @@ class MainViewModel @Inject constructor(
                 folderId.equals(CloudVirtualNodes.RECENT_ID, ignoreCase = true) ->
                     loadRecentListing()
                 else -> loadCloudFolderChildrenLight(folderId)
+            }
+            // Real CloudFolder: strip any leaked virtual hub siblings before paint.
+            val items = if (CloudVirtualNodes.isVirtual(folderId)) {
+                rawItems
+            } else {
+                CloudInteractiveListing.withoutVirtualHubRows(
+                    rawItems,
+                    id = { it.id },
+                    isVirtual = CloudVirtualNodes::isVirtual
+                )
             }
             if (!CloudInteractiveListing.shouldApplyListingResult(
                     loadGen,
@@ -1054,7 +1114,7 @@ class MainViewModel @Inject constructor(
             // Serialize post-paint: tree then soft values hydrate (Win ContinueAfterListingReady).
             refreshFolderTree()
             if (!CloudVirtualNodes.isVirtual(folderId)) {
-                hydrateCloudListingAsync(folderId, loadGen)
+                hydrateCloudListingAsync(folderId, loadGen, lightItems = items)
             }
         } catch (e: CancellationException) {
             throw e
@@ -1078,7 +1138,7 @@ class MainViewModel @Inject constructor(
                     )
                     applyCloudListingItems(soft, statusAfterLoad)
                     refreshFolderTree()
-                    hydrateCloudListingAsync(folderId, loadGen)
+                    hydrateCloudListingAsync(folderId, loadGen, lightItems = soft)
                     return@launch
                 }
             }

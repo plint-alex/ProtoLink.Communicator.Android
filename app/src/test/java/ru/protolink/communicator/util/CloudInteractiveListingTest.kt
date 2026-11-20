@@ -254,6 +254,113 @@ class CloudInteractiveListingTest {
         assertThat(partial.map { it.name }).containsExactly("dev ops", "docusign").inOrder()
     }
 
+    @Test
+    fun looksLikeHubChromeListing_detectsHubSiblingsNotMappedKids() {
+        // Live FAIL: MyNotesFolder crumb + 5 hub rows (Моё облако/Фото/Shared/Recent).
+        val hubIds = listOf(
+            "cloud-root-id",
+            "photos-lib-id",
+            CloudVirtualNodes.SHARED_WITH_ME_ID,
+            CloudVirtualNodes.SHARED_BY_ME_ID,
+            CloudVirtualNodes.RECENT_ID
+        )
+        assertThat(
+            CloudInteractiveListing.looksLikeHubChromeListing(hubIds, CloudVirtualNodes::isVirtual)
+        ).isTrue()
+        val mappedKids = listOf("d1", "d2", "d3", "f1", "f2", "f3", "f4")
+        assertThat(
+            CloudInteractiveListing.looksLikeHubChromeListing(mappedKids, CloudVirtualNodes::isVirtual)
+        ).isFalse()
+    }
+
+    @Test
+    fun withoutVirtualHubRows_andHydrate_doesNotKeepHubChromeAsMappedKids() {
+        // CLOUD_BROWSE_HUB_CHROME_INSTEAD_OF_MAP_KIDS: hydrate must not union hub chrome
+        // left in state with Api kids — detect hub shape and discard light entirely
+        // (My Cloud/Photos are non-virtual; strip-virtual alone leaves them).
+        data class Row(val id: String, val name: String)
+        val staleHub = listOf(
+            Row("cloud-root", "Моё облако"),
+            Row("photos", "Фото"),
+            Row(CloudVirtualNodes.SHARED_WITH_ME_ID, "Доступные мне"),
+            Row(CloudVirtualNodes.SHARED_BY_ME_ID, "Я поделился"),
+            Row(CloudVirtualNodes.RECENT_ID, "Недавние")
+        )
+        assertThat(
+            CloudInteractiveListing.looksLikeHubChromeListing(
+                staleHub.map { it.id },
+                CloudVirtualNodes::isVirtual
+            )
+        ).isTrue()
+        val light = if (CloudInteractiveListing.looksLikeHubChromeListing(
+                staleHub.map { it.id },
+                CloudVirtualNodes::isVirtual
+            )
+        ) {
+            emptyList()
+        } else {
+            CloudInteractiveListing.withoutVirtualHubRows(
+                staleHub,
+                id = { it.id },
+                isVirtual = CloudVirtualNodes::isVirtual
+            )
+        }
+        val hydrated = listOf(
+            Row("d1", "dev ops"),
+            Row("d2", "docusign"),
+            Row("d3", "ef commands")
+        )
+        val merged = CloudInteractiveListing.mergeHydrateUnionById(
+            light,
+            hydrated,
+            id = { it.id },
+            merge = { _, h -> h }
+        )
+        assertThat(merged.map { it.name })
+            .containsExactly("dev ops", "docusign", "ef commands").inOrder()
+        assertThat(merged.map { it.name })
+            .containsNoneOf("Моё облако", "Фото", "Доступные мне", "Я поделился", "Недавние")
+        assertThat(
+            CloudInteractiveListing.looksLikeHubChromeListing(
+                merged.map { it.id },
+                CloudVirtualNodes::isVirtual
+            )
+        ).isFalse()
+    }
+
+    @Test
+    fun softReadyNavigate_replacesHubChromeWithMappedStructural() {
+        // beginFolderListingLoad Soft Ready: hub chrome must not last after open map 898.
+        val folder = "898c1453-4034-4b9f-96f6-430b4ceca476"
+        val hubIds = listOf(
+            "cloud-root",
+            CloudVirtualNodes.SHARED_WITH_ME_ID,
+            CloudVirtualNodes.SHARED_BY_ME_ID,
+            CloudVirtualNodes.RECENT_ID
+        )
+        assertThat(
+            CloudInteractiveListing.looksLikeHubChromeListing(hubIds, CloudVirtualNodes::isVirtual)
+        ).isTrue()
+        val soft = CloudInteractiveListing.buildSoftReadyRows(
+            folderRemoteId = folder,
+            children = listOf(
+                SyncItemMeta("m", "d1", folder, "dev ops", true, 0, Instant.parse("2026-11-17T02:44:38Z")),
+                SyncItemMeta("m", "d2", folder, "docusign", true, 0, Instant.parse("2026-11-17T02:44:39Z")),
+                SyncItemMeta("m", "d3", folder, "ef commands", true, 0, Instant.parse("2026-11-17T02:44:40Z"))
+            ),
+            maxRows = CloudInteractiveListing.MAX_ROWS
+        )
+        // Soft Ready replaces hub (prefer Soft when navigating before Api Ready).
+        val painted = CloudInteractiveListing.preferApiOrSoftReady(emptyList(), soft)
+        assertThat(painted.map { it.name }).containsAtLeast("dev ops", "docusign", "ef commands")
+        assertThat(
+            CloudInteractiveListing.looksLikeHubChromeListing(
+                painted.map { it.id },
+                CloudVirtualNodes::isVirtual
+            )
+        ).isFalse()
+    }
+
     private fun parseUpdateMillis(update: String?): Long {
         if (update.isNullOrBlank()) return 0L
         return runCatching { Instant.parse(update).toEpochMilli() }.getOrDefault(0L)

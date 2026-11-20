@@ -187,6 +187,30 @@ object CloudInteractiveListing {
         if (apiRows.isNotEmpty()) apiRows else softReadyRows
 
     /**
+     * CLOUD_BROWSE_HUB_CHROME_INSTEAD_OF_MAP_KIDS: hub listing always includes ≥3 virtual
+     * siblings (Shared with me / Shared by me / Recent) and ≤6 rows total. Mapped folder
+     * kids must never match this shape.
+     */
+    fun looksLikeHubChromeListing(
+        itemIds: List<String>,
+        isVirtual: (String) -> Boolean
+    ): Boolean {
+        if (itemIds.isEmpty()) return false
+        val virtualCount = itemIds.count { id -> id.isNotBlank() && isVirtual(id) }
+        return virtualCount >= 3 && itemIds.size <= 6
+    }
+
+    /** Drop virtual hub siblings so they cannot linger as mapped-folder kids. */
+    fun <T> withoutVirtualHubRows(
+        items: List<T>,
+        id: (T) -> String,
+        isVirtual: (String) -> Boolean
+    ): List<T> = items.filterNot { row ->
+        val rowId = id(row)
+        rowId.isNotBlank() && isVirtual(rowId)
+    }
+
+    /**
      * Win CloudViewModel listingLoadGeneration: stale Refresh / navigate-away must not
      * apply (including empty) over a newer in-flight load.
      */
