@@ -51,4 +51,26 @@ class MessengerContactsLoadTest {
             )
         ).isNull()
     }
+
+    @Test
+    fun tryParseContactUserId_mapsSelfLoginEmailCode() {
+        val selfId = "a52b6095-7952-4535-90a1-ce8bdaf7f9c7"
+        val login = "alex.plint@gmail.com"
+        assertThat(
+            MessengerContactsLoad.tryParseContactUserId(
+                values = null,
+                code = login,
+                selfUserId = selfId,
+                selfLogin = login
+            )
+        ).isEqualTo(selfId)
+        assertThat(
+            MessengerContactsLoad.tryParseContactUserId(
+                values = null,
+                code = login,
+                selfUserId = selfId,
+                selfLogin = "other@example.com"
+            )
+        ).isNull()
+    }
 }

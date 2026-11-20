@@ -4200,7 +4200,12 @@ class MainViewModel @Inject constructor(
             val meLogin = auth.current()?.login?.takeIf { it.isNotBlank() }
             val items = mutableListOf<ContactItem>()
             for (e in contactsOrTimeout) {
-                val uid = MessengerContactsLoad.tryParseContactUserId(e.values, e.code) ?: continue
+                val uid = MessengerContactsLoad.tryParseContactUserId(
+                    e.values,
+                    e.code,
+                    selfUserId = userId,
+                    selfLogin = meLogin
+                ) ?: continue
                 val provisional =
                     if (uid.equals(userId, ignoreCase = true) && meLogin != null) meLogin else uid
                 items.add(ContactItem(uid, provisional))
@@ -4328,7 +4333,11 @@ class MainViewModel @Inject constructor(
      * page-all + early-exit enrich so partner bags off-page (Tina) are not hidden.
      */
     private suspend fun ensureUserContactsBagIdStartupFast(userId: String): String? =
-        UserContactsBagClient.ensureBagIdStartupFast(api, userId)
+        UserContactsBagClient.ensureBagIdStartupFast(
+            api,
+            userId,
+            selfLogin = auth.current()?.login?.takeIf { it.isNotBlank() }
+        )
 
     private suspend fun continueContactsAfterPaint(
         userId: String,
@@ -4337,7 +4346,11 @@ class MainViewModel @Inject constructor(
     ) {
         try {
             // Richest-bag first (before login enrich) so Tina lands before Refresh bumps generation.
-            val rich = UserContactsBagClient.ensureBagId(api, userId)
+            val rich = UserContactsBagClient.ensureBagId(
+                api,
+                userId,
+                selfLogin = auth.current()?.login?.takeIf { it.isNotBlank() }
+            )
             if (gen != contactsLoadGeneration.get()) return
             if (!rich.isNullOrBlank() && (
                     userContactsBagId.isNullOrBlank() ||
@@ -4394,7 +4407,12 @@ class MainViewModel @Inject constructor(
         val meLogin = auth.current()?.login?.takeIf { it.isNotBlank() }
         val items = mutableListOf<ContactItem>()
         for (e in contacts) {
-            val uid = MessengerContactsLoad.tryParseContactUserId(e.values, e.code) ?: continue
+            val uid = MessengerContactsLoad.tryParseContactUserId(
+                e.values,
+                e.code,
+                selfUserId = userId,
+                selfLogin = meLogin
+            ) ?: continue
             val provisional =
                 if (uid.equals(userId, ignoreCase = true) && meLogin != null) meLogin else uid
             items.add(ContactItem(uid, provisional))
@@ -4423,6 +4441,7 @@ class MainViewModel @Inject constructor(
                 else -> {
                     val lookup = runCatching { api.getUserById(c.userId) }
                     val u = lookup.getOrNull()
+                    val lookupSucceeded = lookup.isSuccess && u != null
                     val display = u?.name?.takeIf { it.isNotBlank() }
                         ?: u?.login?.takeIf { it.isNotBlank() }
                     val connectivity = lookup.exceptionOrNull()?.let {
@@ -4432,7 +4451,7 @@ class MainViewModel @Inject constructor(
                         display != null -> c.copy(displayName = display)
                         PreferOnlineUiCache.shouldDropUnknownContactAfterLoginRefresh(
                             forceLoginRefresh = forceRefresh,
-                            userLookupSucceeded = false,
+                            userLookupSucceeded = lookupSucceeded,
                             isExpectedConnectivityFailure = connectivity
                         ) -> null
                         else -> c

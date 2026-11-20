@@ -1,8 +1,10 @@
 package ru.protolink.communicator.util
 
 import com.google.common.truth.Truth.assertThat
+import com.google.gson.JsonPrimitive
 import org.junit.Test
 import ru.protolink.communicator.data.api.EntityDto
+import ru.protolink.communicator.data.api.EntityValueDto
 
 class UserContactsBagHelpersTest {
     @Test
@@ -125,5 +127,65 @@ class UserContactsBagHelpersTest {
             "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         ).inOrder()
+    }
+
+    @Test
+    fun countDistinctContactUserIds_duplicateSelfIsNotPartnerBearing() {
+        // Bag 9a58b29e-style: kids=2 raw but both alex — must not trip PartnerRowThreshold.
+        val selfId = "a52b6095-7952-4535-90a1-ce8bdaf7f9c7"
+        val kids = listOf(
+            EntityDto(
+                id = "11111111-1111-4111-8111-111111111111",
+                code = "alex.plint@gmail.com",
+                values = listOf(EntityValueDto(value = JsonPrimitive("userid:$selfId"), parents = null))
+            ),
+            EntityDto(
+                id = "22222222-2222-4222-8222-222222222222",
+                code = "alex.plint@gmail.com",
+                values = listOf(EntityValueDto(value = JsonPrimitive("userid:$selfId"), parents = null))
+            )
+        )
+        val distinct = UserContactsBagHelpers.countDistinctContactUserIds(kids)
+        assertThat(distinct).isEqualTo(1)
+        assertThat(distinct >= UserContactsBagHelpers.PartnerRowThreshold).isFalse()
+    }
+
+    @Test
+    fun countDistinctContactUserIds_tinaPlusSelfIsPartnerBearing() {
+        val selfId = "a52b6095-7952-4535-90a1-ce8bdaf7f9c7"
+        val tinaId = "3a9a71a3-8c00-4b68-bf41-99f4a12245f1"
+        val kids = listOf(
+            EntityDto(
+                id = "11111111-1111-4111-8111-111111111111",
+                code = tinaId,
+                values = listOf(EntityValueDto(value = JsonPrimitive("userid:$tinaId"), parents = null))
+            ),
+            EntityDto(
+                id = "22222222-2222-4222-8222-222222222222",
+                code = "alex.plint@gmail.com",
+                values = listOf(EntityValueDto(value = JsonPrimitive("userid:$selfId"), parents = null))
+            )
+        )
+        val distinct = UserContactsBagHelpers.countDistinctContactUserIds(kids)
+        assertThat(distinct).isEqualTo(2)
+        assertThat(distinct >= UserContactsBagHelpers.PartnerRowThreshold).isTrue()
+    }
+
+    @Test
+    fun countDistinctContactUserIds_emptyValuesSelfLoginCode() {
+        // Bag 0559e5ef-style: Tina GUID code + alex email code, empty values.
+        val selfId = "a52b6095-7952-4535-90a1-ce8bdaf7f9c7"
+        val tinaId = "3a9a71a3-8c00-4b68-bf41-99f4a12245f1"
+        val login = "alex.plint@gmail.com"
+        val kids = listOf(
+            EntityDto(id = "11111111-1111-4111-8111-111111111111", code = tinaId, values = emptyList()),
+            EntityDto(id = "22222222-2222-4222-8222-222222222222", code = login, values = emptyList())
+        )
+        assertThat(
+            UserContactsBagHelpers.countDistinctContactUserIds(kids, selfId, login)
+        ).isEqualTo(2)
+        assertThat(
+            UserContactsBagHelpers.countDistinctContactUserIds(kids)
+        ).isEqualTo(1) // without selfLogin, email code does not parse
     }
 }

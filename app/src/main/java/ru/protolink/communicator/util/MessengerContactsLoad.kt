@@ -22,8 +22,17 @@ object MessengerContactsLoad {
     fun shouldShowEmpty(isLoading: Boolean, contactCount: Int): Boolean =
         !isLoading && contactCount <= 0
 
-    /** Extract contact user id from a UserContacts child entity (values or code). */
-    fun tryParseContactUserId(values: List<EntityValueDto>?, code: String?): String? {
+    /**
+     * Extract contact user id from a UserContacts child entity (values or code).
+     * Oldest bags sometimes store the self row as login email with empty values —
+     * pass [selfUserId]/[selfLogin] so that row still counts as a distinct person.
+     */
+    fun tryParseContactUserId(
+        values: List<EntityValueDto>?,
+        code: String?,
+        selfUserId: String? = null,
+        selfLogin: String? = null
+    ): String? {
         if (values != null) {
             for (ev in values) {
                 val s = ev.value?.asString
@@ -37,6 +46,12 @@ object MessengerContactsLoad {
         }
         val c = code?.trim().orEmpty()
         if (c.length == 36) return c
+        if (!selfUserId.isNullOrBlank()
+            && !selfLogin.isNullOrBlank()
+            && c.equals(selfLogin, ignoreCase = true)
+        ) {
+            return selfUserId
+        }
         return null
     }
 }

@@ -18,14 +18,41 @@ object UserContactsBagHelpers {
     /** Kids page size when enriching person-row counts for pick. */
     const val KidsTake = 500
 
-    /** Partner-bearing list: self + ≥1 peer (Win PartnerRowThreshold). */
+    /**
+     * Partner-bearing list: self + ≥1 peer.
+     * Count **distinct parseable contact user ids**, not raw kid rows — duplicate self
+     * rows (kids=2, same uid) must not trip early-exit / PreferCached (UC_BAG_PICK_STARTUPFAST).
+     */
     const val PartnerRowThreshold = 2
 
     data class BagSnapshot(
         val id: String,
         val creationTime: String? = null,
+        /** Distinct parseable contact user ids under the bag (null = not enriched yet). */
         var personRowCount: Int? = null
     )
+
+    /**
+     * Distinct contact user ids among bag kids (userid: values, GUID code, or self login code).
+     */
+    fun countDistinctContactUserIds(
+        kids: List<EntityDto>?,
+        selfUserId: String? = null,
+        selfLogin: String? = null
+    ): Int {
+        if (kids.isNullOrEmpty()) return 0
+        val ids = LinkedHashSet<String>()
+        for (kid in kids) {
+            val uid = MessengerContactsLoad.tryParseContactUserId(
+                kid.values,
+                kid.code,
+                selfUserId,
+                selfLogin
+            ) ?: continue
+            ids.add(uid.lowercase())
+        }
+        return ids.size
+    }
 
     fun shouldCreateBag(bags: List<EntityDto>?): Boolean {
         if (bags.isNullOrEmpty()) return true

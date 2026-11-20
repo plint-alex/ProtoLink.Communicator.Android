@@ -16,13 +16,23 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Shared UC bag list / pick / stop-spawn for Messenger (Win UserContactsBagClient parity).
  * Page-all + enrich counts; StartupFast escalates when newest-first first page is full.
+ * Partner-bearing = distinct parseable contact user ids (not raw kid rows).
  */
 object UserContactsBagClient {
 
-    suspend fun ensureBagIdStartupFast(api: ProtoLinkApi, ownerUserId: String): String? {
+    suspend fun ensureBagIdStartupFast(
+        api: ProtoLinkApi,
+        ownerUserId: String,
+        selfLogin: String? = null
+    ): String? {
         val first = listFirstPageBags(api, ownerUserId)
         if (UserContactsBagHelpers.shouldCreateBag(first)) {
-            val pickedEmpty = tryPickEnriched(api, ownerUserId, earlyExitOnPartner = true)
+            val pickedEmpty = tryPickEnriched(
+                api,
+                ownerUserId,
+                earlyExitOnPartner = true,
+                selfLogin = selfLogin
+            )
             if (!pickedEmpty.isNullOrBlank()) return pickedEmpty
             return createBag(api, ownerUserId)
         }
@@ -33,23 +43,45 @@ object UserContactsBagClient {
                 api,
                 ownerUserId,
                 earlyExitOnPartner = true,
-                seedFirstPage = first
+                seedFirstPage = first,
+                selfLogin = selfLogin
             )
         }
 
         val snapshots = UserContactsBagHelpers.toSnapshots(first).toMutableList()
-        enrichPersonRowCounts(api, snapshots, earlyExitOnPartner = true)
+        enrichPersonRowCounts(
+            api,
+            snapshots,
+            ownerUserId = ownerUserId,
+            selfLogin = selfLogin,
+            earlyExitOnPartner = true
+        )
         return UserContactsBagHelpers.pickBagId(snapshots)
     }
 
     /**
      * Full enrich pick (ContinueContacts richest-bag reconcile). Create only when no bags.
+     * Distinct-person early-exit (not raw kid count) so duplicate-self bags do not hide Tina.
      */
-    suspend fun ensureBagId(api: ProtoLinkApi, ownerUserId: String): String? {
-        var picked = tryPickEnriched(api, ownerUserId, earlyExitOnPartner = true)
+    suspend fun ensureBagId(
+        api: ProtoLinkApi,
+        ownerUserId: String,
+        selfLogin: String? = null
+    ): String? {
+        var picked = tryPickEnriched(
+            api,
+            ownerUserId,
+            earlyExitOnPartner = true,
+            selfLogin = selfLogin
+        )
         if (!picked.isNullOrBlank()) return picked
 
-        picked = tryPickEnriched(api, ownerUserId, earlyExitOnPartner = true)
+        picked = tryPickEnriched(
+            api,
+            ownerUserId,
+            earlyExitOnPartner = true,
+            selfLogin = selfLogin
+        )
         if (!picked.isNullOrBlank()) return picked
 
         return createBag(api, ownerUserId)
@@ -105,12 +137,15 @@ object UserContactsBagClient {
     }
 
     /**
-     * When 2+ bags, count kids so pick prefers the richest (Tina/person rows).
-     * Oldest-first; early-exit after first partner-bearing bag.
+     * When 2+ bags, count **distinct** contact user ids so pick prefers the richest
+     * (Tina/person rows). Oldest-first; early-exit after first true partner-bearing bag
+     * (duplicate-self kids=2 must not stop the scan).
      */
     suspend fun enrichPersonRowCounts(
         api: ProtoLinkApi,
         bags: MutableList<UserContactsBagHelpers.BagSnapshot>,
+        ownerUserId: String,
+        selfLogin: String? = null,
         earlyExitOnPartner: Boolean = false
     ) {
         if (bags.size < 2) return
@@ -132,11 +167,15 @@ object UserContactsBagClient {
                                         parentIds = listOf(bag.id),
                                         skip = 0,
                                         take = UserContactsBagHelpers.KidsTake,
-                                        includeValues = false
+                                        includeValues = true
                                     )
                                 )
                             }.getOrNull()
-                            bag.personRowCount = kids?.size ?: 0
+                            bag.personRowCount = UserContactsBagHelpers.countDistinctContactUserIds(
+                                kids,
+                                selfUserId = ownerUserId,
+                                selfLogin = selfLogin
+                            )
                             if (earlyExitOnPartner &&
                                 (bag.personRowCount ?: 0) >= UserContactsBagHelpers.PartnerRowThreshold
                             ) {
@@ -157,13 +196,20 @@ object UserContactsBagClient {
         api: ProtoLinkApi,
         ownerUserId: String,
         earlyExitOnPartner: Boolean,
-        seedFirstPage: List<EntityDto>? = null
+        seedFirstPage: List<EntityDto>? = null,
+        selfLogin: String? = null
     ): String? {
         val entities = listAllBags(api, ownerUserId, seedFirstPage)
         if (UserContactsBagHelpers.shouldCreateBag(entities)) return null
 
         val snapshots = UserContactsBagHelpers.toSnapshots(entities).toMutableList()
-        enrichPersonRowCounts(api, snapshots, earlyExitOnPartner)
+        enrichPersonRowCounts(
+            api,
+            snapshots,
+            ownerUserId = ownerUserId,
+            selfLogin = selfLogin,
+            earlyExitOnPartner = earlyExitOnPartner
+        )
         return UserContactsBagHelpers.pickBagId(snapshots)
     }
 
