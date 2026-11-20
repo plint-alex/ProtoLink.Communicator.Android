@@ -4,10 +4,19 @@ import ru.protolink.communicator.data.api.EntityDto
 
 /**
  * Pure helpers: pick one stable UserContacts bag under CONTACTS+owner.
- * Startup-fast path skips kid-count enrich (parity with Win UserContactsBagHelpers + EnsureBagIdStartupFast).
+ * Parity with Win UserContactsBagHelpers + EnsureBagIdStartupFast escalate.
  */
 object UserContactsBagHelpers {
     const val ListPageSize = 50
+
+    /** Hard cap on pages so a broken API cannot loop forever (~25k bags). */
+    const val ListMaxPages = 500
+
+    /** Parallel dual-parent list wave size (Messenger Interactive budget). */
+    const val ListPageParallelism = 4
+
+    /** Kids page size when enriching person-row counts for pick. */
+    const val KidsTake = 500
 
     /** Partner-bearing list: self + ≥1 peer (Win PartnerRowThreshold). */
     const val PartnerRowThreshold = 2
@@ -15,7 +24,7 @@ object UserContactsBagHelpers {
     data class BagSnapshot(
         val id: String,
         val creationTime: String? = null,
-        val personRowCount: Int? = null
+        var personRowCount: Int? = null
     )
 
     fun shouldCreateBag(bags: List<EntityDto>?): Boolean {
@@ -33,6 +42,52 @@ object UserContactsBagHelpers {
         return entities
             .filter { it.id.isNotBlank() }
             .map { BagSnapshot(id = it.id, creationTime = it.creationTime) }
+    }
+
+    /**
+     * StartupFast may use first-page-only pick only when the newest-first page is short
+     * (no hidden older siblings). A full page can hide partner bags (Tina) → escalate.
+     */
+    fun canPickFromStartupFastFirstPage(firstPage: List<EntityDto>?): Boolean =
+        !isListPageFull(firstPage)
+
+    fun isListPageFull(page: List<EntityDto>?, pageSize: Int = ListPageSize): Boolean {
+        val take = if (pageSize > 0) pageSize else ListPageSize
+        return (page?.size ?: 0) >= take
+    }
+
+    /** Merge pages by entity id (later pages do not overwrite earlier). */
+    fun mergeBagPages(
+        existing: List<EntityDto>?,
+        page: List<EntityDto>?
+    ): List<EntityDto> {
+        val out = existing?.toMutableList() ?: mutableListOf()
+        val seen = out.mapNotNull { it.id.takeIf { id -> id.isNotBlank() }?.lowercase() }.toMutableSet()
+        if (page == null) return out
+        for (bag in page) {
+            val id = bag.id.takeIf { it.isNotBlank() } ?: continue
+            if (!seen.add(id.lowercase())) continue
+            out.add(bag)
+        }
+        return out
+    }
+
+    /**
+     * Enrich oldest-first so partner bags (Tina) surface before thin newest spawns —
+     * enables early-exit.
+     */
+    fun orderBagsForEnrich(bags: List<BagSnapshot>?): List<BagSnapshot> {
+        if (bags.isNullOrEmpty()) return emptyList()
+        return bags.sortedWith(
+            compareBy<BagSnapshot> { it.creationTime?.takeIf { t -> t.isNotBlank() } ?: "\uFFFF" }
+                .thenBy { it.id.lowercase() }
+        )
+    }
+
+    /** True when known kid counts show at least one partner-bearing bag. */
+    fun hasPartnerBearingBag(bags: List<BagSnapshot>?): Boolean {
+        if (bags.isNullOrEmpty()) return false
+        return bags.any { (it.personRowCount ?: 0) >= PartnerRowThreshold }
     }
 
     /**

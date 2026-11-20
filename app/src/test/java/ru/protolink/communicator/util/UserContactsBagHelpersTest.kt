@@ -46,4 +46,84 @@ class UserContactsBagHelpersTest {
         assertThat(UserContactsBagHelpers.pickBagId(listOf(thin, rich)))
             .isEqualTo("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
     }
+
+    @Test
+    fun startupFastFirstPage_insufficientWhenFull_tinaOffPage() {
+        val full = (1..UserContactsBagHelpers.ListPageSize).map { i ->
+            EntityDto(
+                id = "00000000-0000-4000-8000-${i.toString().padStart(12, '0')}",
+                code = "UserContacts"
+            )
+        }
+        assertThat(UserContactsBagHelpers.canPickFromStartupFastFirstPage(full)).isFalse()
+        assertThat(UserContactsBagHelpers.canPickFromStartupFastFirstPage(full.take(3))).isTrue()
+        assertThat(UserContactsBagHelpers.canPickFromStartupFastFirstPage(emptyList())).isTrue()
+    }
+
+    @Test
+    fun isListPageFull_atPageSize() {
+        val page = (1..50).map {
+            EntityDto(id = "id-$it", code = "UserContacts")
+        }
+        assertThat(UserContactsBagHelpers.isListPageFull(page)).isTrue()
+        assertThat(UserContactsBagHelpers.isListPageFull(page.take(49))).isFalse()
+    }
+
+    @Test
+    fun orderBagsForEnrich_oldestFirst() {
+        val newer = UserContactsBagHelpers.BagSnapshot(
+            id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            creationTime = "2025-01-02T00:00:00Z"
+        )
+        val older = UserContactsBagHelpers.BagSnapshot(
+            id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            creationTime = "2024-01-01T00:00:00Z"
+        )
+        val ordered = UserContactsBagHelpers.orderBagsForEnrich(listOf(newer, older))
+        assertThat(ordered.map { it.id }).containsExactly(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        ).inOrder()
+    }
+
+    @Test
+    fun hasPartnerBearingBag_threshold() {
+        val selfOnly = listOf(
+            UserContactsBagHelpers.BagSnapshot(id = "a", personRowCount = 1)
+        )
+        val partner = listOf(
+            UserContactsBagHelpers.BagSnapshot(id = "a", personRowCount = 1),
+            UserContactsBagHelpers.BagSnapshot(id = "b", personRowCount = 3)
+        )
+        assertThat(UserContactsBagHelpers.hasPartnerBearingBag(selfOnly)).isFalse()
+        assertThat(UserContactsBagHelpers.hasPartnerBearingBag(partner)).isTrue()
+    }
+
+    @Test
+    fun pickBagId_prefersPartnerBearingOverThinNewest() {
+        // Newest-first thin spawn vs older Tina bag — enrich counts must win.
+        val thinNewest = UserContactsBagHelpers.BagSnapshot(
+            id = "960f129e-57b8-4654-adb1-a42dc5deec3c",
+            creationTime = "2025-11-20T00:00:00Z",
+            personRowCount = 1
+        )
+        val tinaBag = UserContactsBagHelpers.BagSnapshot(
+            id = "255e17ed-f620-4e0b-8f00-4cf778b513ee",
+            creationTime = "2024-06-01T00:00:00Z",
+            personRowCount = 3
+        )
+        assertThat(UserContactsBagHelpers.pickBagId(listOf(thinNewest, tinaBag)))
+            .isEqualTo("255e17ed-f620-4e0b-8f00-4cf778b513ee")
+    }
+
+    @Test
+    fun mergeBagPages_dedupesById() {
+        val a = EntityDto(id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", code = "UserContacts")
+        val b = EntityDto(id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", code = "UserContacts")
+        val merged = UserContactsBagHelpers.mergeBagPages(listOf(a), listOf(a, b))
+        assertThat(merged.map { it.id }).containsExactly(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        ).inOrder()
+    }
 }

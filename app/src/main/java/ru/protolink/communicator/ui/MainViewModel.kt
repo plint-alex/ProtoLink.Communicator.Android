@@ -71,7 +71,7 @@ import ru.protolink.communicator.util.MessengerImageDownscale
 import ru.protolink.communicator.util.MessengerMediaLimits
 import ru.protolink.communicator.util.MessengerSendStateMachine
 import ru.protolink.communicator.util.PreferOnlineUiCache
-import ru.protolink.communicator.util.UserContactsBagHelpers
+import ru.protolink.communicator.util.UserContactsBagClient
 import androidx.core.content.FileProvider
 import ru.protolink.communicator.util.NoteRemoteIdResolver
 import ru.protolink.communicator.util.NotesDeleteNavigate
@@ -4304,41 +4304,12 @@ class MainViewModel @Inject constructor(
     }
 
     /**
-     * Startup-fast bag for Messenger contacts ASAP (#messenger-startup-priority):
-     * first list page only, pick without kid-count enrich. Race-guard recheck before create.
+     * Startup-fast bag for Messenger contacts ASAP (#messenger-startup-priority).
+     * Short first page: enrich + pick. Full page (newest-first truncation): escalate
+     * page-all + early-exit enrich so partner bags off-page (Tina) are not hidden.
      */
-    private suspend fun ensureUserContactsBagIdStartupFast(userId: String): String? {
-        val first = api.getEntities(
-            GetEntitiesRequest(
-                parentIds = listOf(SystemEntities.CONTACTS, userId),
-                includeValues = false,
-                take = UserContactsBagHelpers.ListPageSize,
-                skip = 0
-            )
-        )
-        if (!UserContactsBagHelpers.shouldCreateBag(first)) {
-            return UserContactsBagHelpers.pickBagId(UserContactsBagHelpers.toSnapshots(first))
-        }
-        // Race guard: empty first page — recheck before create.
-        val recheck = api.getEntities(
-            GetEntitiesRequest(
-                parentIds = listOf(SystemEntities.CONTACTS, userId),
-                includeValues = false,
-                take = UserContactsBagHelpers.ListPageSize,
-                skip = 0
-            )
-        )
-        if (!UserContactsBagHelpers.shouldCreateBag(recheck)) {
-            return UserContactsBagHelpers.pickBagId(UserContactsBagHelpers.toSnapshots(recheck))
-        }
-        val created = api.addEntity(
-            AddEntityRequest(
-                code = "UserContacts",
-                parentIds = listOf(SystemEntities.CONTACTS, userId)
-            )
-        )
-        return created.id?.takeIf { it.isNotBlank() }
-    }
+    private suspend fun ensureUserContactsBagIdStartupFast(userId: String): String? =
+        UserContactsBagClient.ensureBagIdStartupFast(api, userId)
 
     private suspend fun continueContactsAfterPaint(
         userId: String,
@@ -4349,48 +4320,17 @@ class MainViewModel @Inject constructor(
             ensureSelfContactRow(userId, bagId, gen)
             if (gen != contactsLoadGeneration.get()) return
 
-            val meLogin = auth.current()?.login?.takeIf { it.isNotBlank() }
-            val current = _state.value.contacts
-            val enriched = current.map { c ->
-                when {
-                    // Self: prefer signed-in login over UUID / stale planted name.
-                    c.userId.equals(userId, true) && meLogin != null ->
-                        c.copy(displayName = meLogin)
-                    c.userId.equals(userId, true) && !c.displayName.equals(c.userId, true) -> c
-                    else -> {
-                        val display = runCatching {
-                            val u = api.getUserById(c.userId)
-                            u.name?.takeIf { it.isNotBlank() } ?: u.login
-                        }.getOrNull()?.takeIf { it.isNotBlank() } ?: c.displayName
-                        c.copy(displayName = display)
-                    }
-                }
-            }.sortedBy { it.displayName.lowercase() }
+            enrichContactDisplayNames(userId, gen)
             if (gen != contactsLoadGeneration.get()) return
-            val selectedId = _state.value.selectedContact?.userId
-            _state.update { s ->
-                val proposed = "Contacts: ${enriched.size}"
-                val status = ForceStatusGuard.statusOrNull(
-                    forceRunning = s.forceRunning,
-                    forcePreferred = SyncFlight.forcePreferred.get(),
-                    proposed = proposed
-                ) ?: s.status
-                s.copy(
-                    contacts = enriched.map { e ->
-                        val prev = s.contacts.firstOrNull { it.userId.equals(e.userId, true) }
-                        e.copy(unreadCount = prev?.unreadCount ?: 0)
-                    },
-                    selectedContact = selectedId?.let { id ->
-                        val hit = enriched.firstOrNull { it.userId.equals(id, true) }
-                        val prev = s.selectedContact
-                        hit?.copy(unreadCount = prev?.unreadCount ?: 0) ?: s.selectedContact
-                    } ?: s.selectedContact,
-                    status = status
-                )
-            }
-            refreshUnreadBadges()
-            if (_state.value.shareSheet.showAddPeople) rebuildShareContactPicker()
             persistContactsDiskAsap(userId)
+
+            // Background richest-bag pick — if different from startup-fast, swap kids once.
+            val rich = UserContactsBagClient.ensureBagId(api, userId)
+            if (gen != contactsLoadGeneration.get()) return
+            if (!rich.isNullOrBlank() && !rich.equals(userContactsBagId, ignoreCase = true)) {
+                userContactsBagId = rich
+                replaceContactRowsFromBag(rich, userId, gen)
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -4410,6 +4350,102 @@ class MainViewModel @Inject constructor(
                 }
             }
         }
+    }
+
+    /** Bag swap after EnsureBagId must not shrink a richer startup/disk paint. */
+    private suspend fun replaceContactRowsFromBag(bagId: String, userId: String, gen: Int) {
+        val contacts = runCatching {
+            api.getEntities(
+                GetEntitiesRequest(parentIds = listOf(bagId), includeValues = true, take = 2000)
+            )
+        }.getOrNull() ?: return
+        if (gen != contactsLoadGeneration.get()) return
+
+        val meLogin = auth.current()?.login?.takeIf { it.isNotBlank() }
+        val items = mutableListOf<ContactItem>()
+        for (e in contacts) {
+            val uid = MessengerContactsLoad.tryParseContactUserId(e.values, e.code) ?: continue
+            val provisional =
+                if (uid.equals(userId, ignoreCase = true) && meLogin != null) meLogin else uid
+            items.add(ContactItem(uid, provisional))
+        }
+        val ready = items.distinctBy { c -> c.userId.lowercase() }
+        val paintedCount = _state.value.contacts.size
+        if (PreferOnlineUiCache.shouldReplaceContactsList(ready.size, paintedCount)) {
+            _state.update { cur ->
+                val proposed = "Contacts: ${ready.size}"
+                val status = ForceStatusGuard.statusOrNull(
+                    forceRunning = cur.forceRunning,
+                    forcePreferred = SyncFlight.forcePreferred.get(),
+                    proposed = proposed
+                ) ?: cur.status
+                cur.copy(contacts = ready, status = status)
+            }
+        } else {
+            _state.update { cur ->
+                val merged = cur.contacts.toMutableList()
+                for (c in ready) {
+                    if (merged.none { it.userId.equals(c.userId, true) }) merged.add(c)
+                }
+                val proposed = "Contacts: ${merged.size}"
+                val status = ForceStatusGuard.statusOrNull(
+                    forceRunning = cur.forceRunning,
+                    forcePreferred = SyncFlight.forcePreferred.get(),
+                    proposed = proposed
+                ) ?: cur.status
+                cur.copy(contacts = merged, status = status)
+            }
+        }
+        ensureSelfContactRow(userId, bagId, gen)
+        if (gen != contactsLoadGeneration.get()) return
+        enrichContactDisplayNames(userId, gen)
+        if (gen != contactsLoadGeneration.get()) return
+        persistContactsDiskAsap(userId)
+        refreshUnreadBadges()
+        if (_state.value.shareSheet.showAddPeople) rebuildShareContactPicker()
+    }
+
+    private suspend fun enrichContactDisplayNames(userId: String, gen: Int) {
+        val meLogin = auth.current()?.login?.takeIf { it.isNotBlank() }
+        val current = _state.value.contacts
+        val enriched = current.map { c ->
+            when {
+                c.userId.equals(userId, true) && meLogin != null ->
+                    c.copy(displayName = meLogin)
+                c.userId.equals(userId, true) && !c.displayName.equals(c.userId, true) -> c
+                else -> {
+                    val display = runCatching {
+                        val u = api.getUserById(c.userId)
+                        u.name?.takeIf { it.isNotBlank() } ?: u.login
+                    }.getOrNull()?.takeIf { it.isNotBlank() } ?: c.displayName
+                    c.copy(displayName = display)
+                }
+            }
+        }.sortedBy { it.displayName.lowercase() }
+        if (gen != contactsLoadGeneration.get()) return
+        val selectedId = _state.value.selectedContact?.userId
+        _state.update { s ->
+            val proposed = "Contacts: ${enriched.size}"
+            val status = ForceStatusGuard.statusOrNull(
+                forceRunning = s.forceRunning,
+                forcePreferred = SyncFlight.forcePreferred.get(),
+                proposed = proposed
+            ) ?: s.status
+            s.copy(
+                contacts = enriched.map { e ->
+                    val prev = s.contacts.firstOrNull { it.userId.equals(e.userId, true) }
+                    e.copy(unreadCount = prev?.unreadCount ?: 0)
+                },
+                selectedContact = selectedId?.let { id ->
+                    val hit = enriched.firstOrNull { it.userId.equals(id, true) }
+                    val prev = s.selectedContact
+                    hit?.copy(unreadCount = prev?.unreadCount ?: 0) ?: s.selectedContact
+                } ?: s.selectedContact,
+                status = status
+            )
+        }
+        refreshUnreadBadges()
+        if (_state.value.shareSheet.showAddPeople) rebuildShareContactPicker()
     }
 
     private suspend fun ensureSelfContactRow(userId: String, bagId: String, gen: Int) {
