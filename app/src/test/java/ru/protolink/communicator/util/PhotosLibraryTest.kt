@@ -8,6 +8,12 @@ import ru.protolink.communicator.data.api.EntityValueDto
 
 class PhotosLibraryTest {
     @Test
+    fun surfaceEnabled_pausedForNow() {
+        // Vision #photos-paused-for-now — hub/host product entry off; modules may remain.
+        assertThat(PhotosLibrary.isSurfaceEnabled()).isFalse()
+    }
+
+    @Test
     fun parseFolderId_readsPhotosfolderPointer() {
         val lib = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         val values = listOf(

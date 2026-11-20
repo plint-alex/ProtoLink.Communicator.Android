@@ -1079,7 +1079,9 @@ class MainViewModel @Inject constructor(
         // Live 1.0.57 FATAL was uncaught HttpException on Main — keep soft-fail catch below; never skip GetEntities.
         val lang = uiLang()
         try {
-            if (folderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true)) {
+            if (folderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true) &&
+                PhotosLibrary.isSurfaceEnabled()
+            ) {
                 ensurePhotosLibraryId()
             }
             // Win-parity: Ready paint from values-light (or Soft Ready) BEFORE IncludeValues hydrate
@@ -1185,8 +1187,9 @@ class MainViewModel @Inject constructor(
                 isVirtualEntry = false
             )
         )
+        // Photos hub entry paused (#photos-paused-for-now); keep modules for possible resume.
         val photosLib = photosLibraryId
-        if (!photosLib.isNullOrBlank()) {
+        if (PhotosLibrary.isSurfaceEnabled() && !photosLib.isNullOrBlank()) {
             rows.add(
                 CloudItem(
                     id = photosLib,
@@ -1495,9 +1498,10 @@ class MainViewModel @Inject constructor(
             openCloudFileInCurrentFolder(item)
             return
         }
-        // Hub Photos row → library folder entity (anti-SAP AT-PC6).
+        // Hub Photos row → library folder entity (anti-SAP AT-PC6). Surface paused: row omitted.
         val photosLib = photosLibraryId
-        if (currentFolderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true) &&
+        if (PhotosLibrary.isSurfaceEnabled() &&
+            currentFolderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true) &&
             photosLib != null &&
             item.id.equals(photosLib, ignoreCase = true)
         ) {
@@ -1724,6 +1728,11 @@ class MainViewModel @Inject constructor(
             )
             val entity = found.firstOrNull() ?: return false
             if (entity.code.equals(PhotosLibrary.HOST_CODE, ignoreCase = false)) {
+                if (!PhotosLibrary.isSurfaceEnabled()) {
+                    // Soft-land on Cloud hub — no blank Photos host chrome.
+                    openCloudHub()
+                    return true
+                }
                 val lib = photosLibraryId
                 if (lib != null && !lib.equals(entityId, ignoreCase = true)) {
                     return tryOpenCloudEntity(lib)

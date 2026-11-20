@@ -12,6 +12,13 @@ object PhotosLibrary {
     const val HOST_CODE = "Photos"
     const val FOLDER_PREFIX = "photosfolder:"
 
+    /**
+     * Dedicated Photos product surface (hub row / host chrome). Paused per vision
+     * #photos-paused-for-now — Messenger Cloud attach/send photo stays. Feature modules may remain unused.
+     * Function (not const) so the pause flag stays easy to flip without dead-branch noise.
+     */
+    fun isSurfaceEnabled(): Boolean = false
+
     /** Parse library CloudFolder id from Photos host string values. */
     fun parseFolderId(values: List<EntityValueDto>?): String? {
         if (values.isNullOrEmpty()) return null
