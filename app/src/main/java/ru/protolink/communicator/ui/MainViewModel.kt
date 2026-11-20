@@ -1025,7 +1025,8 @@ class MainViewModel @Inject constructor(
     private fun persistCloudListingDiskAsap(folderId: String, items: List<CloudItem>) {
         if (CloudVirtualNodes.isVirtual(folderId)) return
         if (!PreferOnlineUiCache.shouldWriteCacheAsap(onlineFetchSucceeded = true)) return
-        if (items.isEmpty()) return
+        // Write even empty listings (Win CloudListingDiskCache.SaveAsap parity) so
+        // filesDir/cloud-listing-cache exists after online Cloud load — 1.0.92 skipped empty LastOpen.
         cloudListingDiskCache.saveAsap(
             folderId,
             items
@@ -1040,6 +1041,24 @@ class MainViewModel @Inject constructor(
                     )
                 }
         )
+    }
+
+    /**
+     * Hub is virtual (no disk key). After online Cloud paint, ASAP-fetch My Cloud root so
+     * sick boots have a real listing payload under cloud-listing-cache.
+     */
+    private fun warmCacheMyCloudRootAsap(excludeFolderId: String? = null) {
+        val rootId = cloudRootId ?: return
+        if (excludeFolderId != null && rootId.equals(excludeFolderId, ignoreCase = true)) return
+        viewModelScope.launch {
+            runCatching {
+                val items = loadCloudFolderChildrenLight(rootId)
+                persistCloudListingDiskAsap(rootId, items)
+                Log.i("ProtoLinkCloud", "My Cloud root ASAP cache count=${items.size}")
+            }.onFailure { e ->
+                Log.w("ProtoLinkCloud", "My Cloud root ASAP cache soft-fail: ${e.message}")
+            }
+        }
     }
 
     /** Full light+hydrate for callers that need a snapshot (entity open / breadcrumb restore). */
@@ -1179,6 +1198,8 @@ class MainViewModel @Inject constructor(
             // "Cloud loaded" (live 1.0.73 FORCE_NO_PROGRESS: Download all disabled + Cloud loaded).
             applyCloudListingItems(items, statusAfterLoad)
             persistCloudListingDiskAsap(folderId, items)
+            // Virtual hub never writes its own key — warm My Cloud root so cache dir+payload exist.
+            warmCacheMyCloudRootAsap(excludeFolderId = folderId)
             Log.i("ProtoLinkCloud", "listing Ready id=$folderId count=${items.size} gen=$loadGen")
             // Serialize post-paint: tree then soft values hydrate (Win ContinueAfterListingReady).
             refreshFolderTree()
@@ -3486,6 +3507,26 @@ class MainViewModel @Inject constructor(
     private fun handleSyncFailure(e: Exception) {
         // Decide/cloud-wins — SyncConflictException removed (D-LEGACY-CONFLICT). Failures surface as status.
         val detail = e.message ?: e.javaClass.simpleName
+        // Sick Api / refused / timeout: soft banner only — never block UI with Sync error OK modal
+        // (#comm-win-sick-connection / Session-1 hardModal FAIL on 1.0.92).
+        val connectivity = ApiConnectivity.isExpectedConnectivityFailure(e)
+        if (!PreferOnlineUiCache.shouldShowHardSyncErrorModal(connectivity)) {
+            Log.w("ProtoLinkSync", "sync soft-fail connectivity: $detail")
+            _state.update { cur ->
+                val proposed = ShareSheetStrings.offlineBanner(uiLang())
+                val status = ForceStatusGuard.statusOrNull(
+                    forceRunning = cur.forceRunning,
+                    forcePreferred = SyncFlight.forcePreferred.get(),
+                    proposed = proposed
+                ) ?: cur.status
+                cur.copy(
+                    status = status,
+                    syncing = false,
+                    syncError = null
+                )
+            }
+            return
+        }
         _state.update { cur ->
             val status = ForceStatusGuard.statusOrNull(
                 forceRunning = cur.forceRunning,
@@ -4136,11 +4177,15 @@ class MainViewModel @Inject constructor(
             } ?: emptyList()
             if (gen != contactsLoadGeneration.get()) return@launch
 
+            // Prefer-online ASAP: self row uses signed-in login immediately (not UUID), so planted
+            // stale disk names are replaced before background GetUserById finishes (Win parity).
+            val meLogin = auth.current()?.login?.takeIf { it.isNotBlank() }
             val items = mutableListOf<ContactItem>()
             for (e in contacts) {
                 val uid = MessengerContactsLoad.tryParseContactUserId(e.values, e.code) ?: continue
-                // Provisional name — resolve logins after the list is visible
-                items.add(ContactItem(uid, uid))
+                val provisional =
+                    if (uid.equals(userId, ignoreCase = true) && meLogin != null) meLogin else uid
+                items.add(ContactItem(uid, provisional))
             }
 
             val ready = items.distinctBy { c -> c.userId.lowercase() }
@@ -4304,15 +4349,21 @@ class MainViewModel @Inject constructor(
             ensureSelfContactRow(userId, bagId, gen)
             if (gen != contactsLoadGeneration.get()) return
 
+            val meLogin = auth.current()?.login?.takeIf { it.isNotBlank() }
             val current = _state.value.contacts
             val enriched = current.map { c ->
-                if (c.userId.equals(userId, true) && !c.displayName.equals(c.userId, true)) c
-                else {
-                    val display = runCatching {
-                        val u = api.getUserById(c.userId)
-                        u.name?.takeIf { it.isNotBlank() } ?: u.login
-                    }.getOrNull()?.takeIf { it.isNotBlank() } ?: c.displayName
-                    c.copy(displayName = display)
+                when {
+                    // Self: prefer signed-in login over UUID / stale planted name.
+                    c.userId.equals(userId, true) && meLogin != null ->
+                        c.copy(displayName = meLogin)
+                    c.userId.equals(userId, true) && !c.displayName.equals(c.userId, true) -> c
+                    else -> {
+                        val display = runCatching {
+                            val u = api.getUserById(c.userId)
+                            u.name?.takeIf { it.isNotBlank() } ?: u.login
+                        }.getOrNull()?.takeIf { it.isNotBlank() } ?: c.displayName
+                        c.copy(displayName = display)
+                    }
                 }
             }.sortedBy { it.displayName.lowercase() }
             if (gen != contactsLoadGeneration.get()) return
@@ -4375,8 +4426,8 @@ class MainViewModel @Inject constructor(
         if (gen != contactsLoadGeneration.get()) return
         val hasSelf = _state.value.contacts.any { it.userId.equals(userId, true) }
         if (hasSelf) return
-        val name = selfHit?.code?.takeIf { it.isNotBlank() }
-            ?: auth.current()?.login?.takeIf { it.isNotBlank() }
+        val name = auth.current()?.login?.takeIf { it.isNotBlank() }
+            ?: selfHit?.code?.takeIf { it.isNotBlank() }
             ?: "Me"
         if (selfHit == null) {
             runCatching {

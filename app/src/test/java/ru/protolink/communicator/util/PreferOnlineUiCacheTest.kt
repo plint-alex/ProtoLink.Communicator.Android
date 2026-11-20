@@ -78,4 +78,10 @@ class PreferOnlineUiCacheTest {
         assertThat(PreferOnlineUiCache.shouldReplaceContactsCache(1, 2)).isFalse()
         assertThat(PreferOnlineUiCache.shouldReplaceContactsCache(3, 1)).isTrue()
     }
+
+    @Test
+    fun hardSyncErrorModal_onlyWhenNotExpectedConnectivity() {
+        assertThat(PreferOnlineUiCache.shouldShowHardSyncErrorModal(true)).isFalse()
+        assertThat(PreferOnlineUiCache.shouldShowHardSyncErrorModal(false)).isTrue()
+    }
 }

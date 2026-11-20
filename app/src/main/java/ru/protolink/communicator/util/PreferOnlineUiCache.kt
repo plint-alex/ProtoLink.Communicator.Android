@@ -84,4 +84,10 @@ object PreferOnlineUiCache {
      */
     fun shouldReplaceContactsCache(incomingCount: Int, existingCachedCount: Int): Boolean =
         incomingCount >= existingCachedCount
+
+    /**
+     * Hard Sync error OK modal only for unexpected failures — expected connectivity stays soft banner.
+     */
+    fun shouldShowHardSyncErrorModal(isExpectedConnectivityFailure: Boolean): Boolean =
+        !isExpectedConnectivityFailure
 }

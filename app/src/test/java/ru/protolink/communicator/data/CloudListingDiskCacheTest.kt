@@ -57,4 +57,13 @@ class CloudListingDiskCacheTest {
         assertThat(loaded.any { it.id == b && it.mimeType == "text/plain" }).isTrue()
         assertThat(cache.tryLoad(UUID.randomUUID().toString())).isEmpty()
     }
+
+    @Test
+    fun listing_saveAsap_empty_stillCreatesFile() {
+        val folder = UUID.randomUUID().toString()
+        cache.saveAsap(folder, emptyList())
+        val path = File(dir, "listing-${folder.replace("-", "").lowercase()}.json")
+        assertThat(path.isFile).isTrue()
+        assertThat(cache.tryLoad(folder)).isEmpty()
+    }
 }
