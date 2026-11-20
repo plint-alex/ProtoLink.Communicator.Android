@@ -564,6 +564,73 @@ class SyncEngineTest {
     }
 
     @Test
+    fun agentsRoleQueuePaths_protectsMailboxQueues_inboxOutbox() {
+        assertThat(
+            AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(
+                "Protolink.ru/Agents/inbox"
+            )
+        ).isTrue()
+        assertThat(
+            AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(
+                "Protolink.ru/Agents/inbox/todo/ask-hello/index.html"
+            )
+        ).isTrue()
+        assertThat(
+            AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(
+                "Protolink.ru/Agents/inbox/done/P1-old-ask/index.html"
+            )
+        ).isTrue()
+        assertThat(
+            AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(
+                "Protolink.ru/Agents/outbox/todo/Q1-ask"
+            )
+        ).isTrue()
+        assertThat(
+            AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(
+                "Protolink.ru/Agents/outbox/done/Q1-closed"
+            )
+        ).isTrue()
+        assertThat(
+            AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(
+                "Protolink.ru/Agents/docs/ops/index.html"
+            )
+        ).isFalse()
+        assertThat(
+            AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(
+                "Protolink.ru/Agents/output/index.html"
+            )
+        ).isFalse()
+        assertThat(
+            AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(
+                "Protolink.ru/Agents/inbox/progress"
+            )
+        ).isFalse()
+        assertThat(
+            AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor("films/inbox/todo")
+        ).isFalse()
+        assertThat(
+            AgentsRoleQueuePaths.shouldSkipFolderMaterialize(
+                "Protolink.ru/Agents/inbox/todo/ghost-ask"
+            )
+        ).isTrue()
+        assertThat(
+            AgentsRoleQueuePaths.shouldSkipFolderMaterialize(
+                "Protolink.ru/Agents/outbox/done/ghost-ask"
+            )
+        ).isTrue()
+        assertThat(
+            AgentsRoleQueuePaths.shouldSkipFolderMaterialize(
+                "Protolink.ru/Agents/inbox/todo"
+            )
+        ).isFalse()
+        assertThat(
+            AgentsRoleQueuePaths.shouldSkipFolderMaterialize(
+                "Protolink.ru/Agents/outbox/done"
+            )
+        ).isFalse()
+    }
+
+    @Test
     fun forcePull_doesNotPruneAgentsRoleOpenQueueTaskPage() = runTest {
         val (store, fs, remote) = harness()
         remote.seedFolder("films-f", "cloud-root", "films")
@@ -577,6 +644,29 @@ class SyncEngineTest {
 
         assertThat(fs.exists(root, planted)).isTrue()
         assertThat(String(fs.readFile(root, planted))).isEqualTo("planted-agents-queue")
+        assertThat(fs.exists(root, "ghost-root.txt")).isFalse()
+        assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
+    }
+
+    @Test
+    fun forcePull_doesNotPruneAgentsMailboxQueueAskPage() = runTest {
+        val (store, fs, remote) = harness()
+        remote.seedFolder("films-f", "cloud-root", "films")
+        remote.seedFile("films-i", "films-f", "index.html", "movie".toByteArray())
+        val inboxAsk =
+            "Protolink.ru/Agents/inbox/todo/ask-planted-mailbox/index.html"
+        val outboxDone =
+            "Protolink.ru/Agents/outbox/done/Q1-closed/index.html"
+        fs.writeFile(root, inboxAsk, "planted-mailbox-ask".toByteArray())
+        fs.writeFile(root, outboxDone, "planted-outbox-done".toByteArray())
+        fs.writeFile(root, "ghost-root.txt", "junk".toByteArray())
+
+        SyncEngine(store, fs, remote).forcePullMapping(mapping)
+
+        assertThat(fs.exists(root, inboxAsk)).isTrue()
+        assertThat(String(fs.readFile(root, inboxAsk))).isEqualTo("planted-mailbox-ask")
+        assertThat(fs.exists(root, outboxDone)).isTrue()
+        assertThat(String(fs.readFile(root, outboxDone))).isEqualTo("planted-outbox-done")
         assertThat(fs.exists(root, "ghost-root.txt")).isFalse()
         assertThat(String(fs.readFile(root, "films/index.html"))).isEqualTo("movie")
     }
