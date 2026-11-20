@@ -4134,8 +4134,14 @@ class MainViewModel @Inject constructor(
             }
         }
         try {
+            // Prefer disk bag only when last-good list is partner-bearing — sticky thin priorBag
+            // must not skip StartupFast escalate (UC_BAG_PICK_STARTUPFAST / Tina off newest page).
+            val diskContactCount = messengerDiskCache.tryLoadContacts(userId).size
+                .coerceAtLeast(_state.value.contacts.size)
             val bagFromCache =
-                if (PreferOnlineUiCache.ShouldPreferCachedUserContactsBag) {
+                if (PreferOnlineUiCache.ShouldPreferCachedUserContactsBag &&
+                    PreferOnlineUiCache.shouldTrustCachedUserContactsBagId(diskContactCount)
+                ) {
                     messengerDiskCache.tryLoadUserContactsBagId(userId)
                 } else {
                     null
@@ -4153,7 +4159,8 @@ class MainViewModel @Inject constructor(
                     val proposed = if (cur.contacts.isEmpty()) {
                         MessengerContactsLoad.LoadFailedSoft
                     } else {
-                        ShareSheetStrings.offlineBanner(uiLang())
+                        // Budget abandon ≠ connectivity — keep paint; Continue reconciles richest.
+                        cur.status
                     }
                     val status = ForceStatusGuard.statusOrNull(
                         forceRunning = cur.forceRunning,
@@ -4166,6 +4173,8 @@ class MainViewModel @Inject constructor(
                         isContactsLoading = false
                     )
                 }
+                // Win budget-elapsed parity: still richest-bag reconcile in background (Tina).
+                launch { continueContactsAfterPaint(userId, "", gen) }
                 return@launch
             }
             userContactsBagId = bagId
@@ -4327,20 +4336,31 @@ class MainViewModel @Inject constructor(
         gen: Int
     ) {
         try {
-            ensureSelfContactRow(userId, bagId, gen)
+            // Richest-bag first (before login enrich) so Tina lands before Refresh bumps generation.
+            val rich = UserContactsBagClient.ensureBagId(api, userId)
             if (gen != contactsLoadGeneration.get()) return
+            if (!rich.isNullOrBlank() && (
+                    userContactsBagId.isNullOrBlank() ||
+                        !rich.equals(userContactsBagId, ignoreCase = true)
+                    )
+            ) {
+                userContactsBagId = rich
+                replaceContactRowsFromBag(rich, userId, gen)
+                return
+            }
 
+            val activeBag = when {
+                !rich.isNullOrBlank() -> rich
+                bagId.isNotBlank() -> bagId
+                else -> userContactsBagId.orEmpty()
+            }
+            if (activeBag.isNotBlank()) {
+                ensureSelfContactRow(userId, activeBag, gen)
+                if (gen != contactsLoadGeneration.get()) return
+            }
             enrichContactDisplayNames(userId, gen)
             if (gen != contactsLoadGeneration.get()) return
             persistContactsDiskAsap(userId)
-
-            // Background richest-bag pick — if different from startup-fast, swap kids once.
-            val rich = UserContactsBagClient.ensureBagId(api, userId)
-            if (gen != contactsLoadGeneration.get()) return
-            if (!rich.isNullOrBlank() && !rich.equals(userContactsBagId, ignoreCase = true)) {
-                userContactsBagId = rich
-                replaceContactRowsFromBag(rich, userId, gen)
-            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

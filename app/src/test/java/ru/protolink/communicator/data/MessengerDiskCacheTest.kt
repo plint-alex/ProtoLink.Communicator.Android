@@ -51,19 +51,49 @@ class MessengerDiskCacheTest {
     }
 
     @Test
-    fun contacts_saveAsap_preservesBagId_whenOmitted() {
+    fun contacts_saveAsap_preservesBagId_whenPartnerBearingAndOmitted() {
         val owner = UUID.randomUUID().toString()
         val bag = UUID.randomUUID().toString()
         val a = UUID.randomUUID().toString()
-        cache.saveContactsAsap(owner, listOf(MessengerDiskCache.CachedContact(a, "A")), bag)
+        val b = UUID.randomUUID().toString()
         cache.saveContactsAsap(
             owner,
             listOf(
                 MessengerDiskCache.CachedContact(a, "A"),
-                MessengerDiskCache.CachedContact(UUID.randomUUID().toString(), "B")
+                MessengerDiskCache.CachedContact(b, "B")
+            ),
+            bag
+        )
+        cache.saveContactsAsap(
+            owner,
+            listOf(
+                MessengerDiskCache.CachedContact(a, "A"),
+                MessengerDiskCache.CachedContact(b, "B")
             )
         )
         assertThat(cache.tryLoadUserContactsBagId(owner)).isEqualTo(bag)
+    }
+
+    @Test
+    fun contacts_saveAsap_clearsThinBagAuthority() {
+        val owner = UUID.randomUUID().toString()
+        val bag = UUID.randomUUID().toString()
+        val a = UUID.randomUUID().toString()
+        val b = UUID.randomUUID().toString()
+        cache.saveContactsAsap(
+            owner,
+            listOf(
+                MessengerDiskCache.CachedContact(a, "A"),
+                MessengerDiskCache.CachedContact(b, "B")
+            ),
+            bag
+        )
+        assertThat(cache.tryLoadUserContactsBagId(owner)).isEqualTo(bag)
+
+        // Self-only rewrite must drop sticky thin priorBag (UC_BAG_PICK_STARTUPFAST).
+        cache.saveContactsAsap(owner, listOf(MessengerDiskCache.CachedContact(a, "A")), bag)
+        assertThat(cache.tryLoadUserContactsBagId(owner)).isNull()
+        assertThat(cache.tryLoadContacts(owner)).hasSize(1)
     }
 
     @Test

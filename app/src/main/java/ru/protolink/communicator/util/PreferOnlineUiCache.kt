@@ -35,6 +35,13 @@ object PreferOnlineUiCache {
     fun shouldPersistUserContactsBagId(contactCount: Int): Boolean =
         contactCount >= UserContactsBagHelpers.PartnerRowThreshold
 
+    /**
+     * Trust disk bag id on cold start only when last-good contacts are partner-bearing.
+     * Sticky thin priorBag (self-only) must not skip StartupFast escalate (Tina off newest page).
+     */
+    fun shouldTrustCachedUserContactsBagId(cachedContactCount: Int): Boolean =
+        shouldPersistUserContactsBagId(cachedContactCount)
+
     /** Paint disk/memory cache before waiting on network when a prior payload exists. */
     fun shouldPaintCacheBeforeOnline(hasCachedPayload: Boolean): Boolean = hasCachedPayload
 

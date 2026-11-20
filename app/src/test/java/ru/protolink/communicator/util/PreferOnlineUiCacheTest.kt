@@ -22,6 +22,10 @@ class PreferOnlineUiCacheTest {
         assertThat(PreferOnlineUiCache.shouldPersistUserContactsBagId(0)).isFalse()
         assertThat(PreferOnlineUiCache.shouldPersistUserContactsBagId(1)).isFalse()
         assertThat(PreferOnlineUiCache.shouldPersistUserContactsBagId(2)).isTrue()
+        // Sticky thin priorBag must not skip StartupFast escalate.
+        assertThat(PreferOnlineUiCache.shouldTrustCachedUserContactsBagId(0)).isFalse()
+        assertThat(PreferOnlineUiCache.shouldTrustCachedUserContactsBagId(1)).isFalse()
+        assertThat(PreferOnlineUiCache.shouldTrustCachedUserContactsBagId(2)).isTrue()
     }
 
     @Test

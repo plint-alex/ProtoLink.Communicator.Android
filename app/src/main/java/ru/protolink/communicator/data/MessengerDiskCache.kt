@@ -69,17 +69,25 @@ class MessengerDiskCache(
         synchronized(io) {
             try {
                 root.mkdirs()
+                val contactDtos = contacts
+                    .filter { it.id.isNotBlank() }
+                    .map { ContactDto(id = it.id, name = it.name) }
+                // Self-only / empty must not keep a sticky thin priorBag as cold-start authority.
+                val partnerBearing =
+                    PreferOnlineUiCache.shouldPersistUserContactsBagId(contactDtos.size)
                 val priorBag = runCatching {
                     readContactsFile(ownerUserId)?.userContactsBagId?.takeIf { it.isNotBlank() }
                 }.getOrNull()
-                val bagId = userContactsBagId?.takeIf { it.isNotBlank() } ?: priorBag.orEmpty()
+                val bagId = when {
+                    !partnerBearing -> ""
+                    !userContactsBagId.isNullOrBlank() -> userContactsBagId
+                    else -> priorBag.orEmpty()
+                }
                 val dto = ContactsFile(
                     ownerUserId = ownerUserId,
                     savedUtcMillis = System.currentTimeMillis(),
                     userContactsBagId = bagId,
-                    contacts = contacts
-                        .filter { it.id.isNotBlank() }
-                        .map { ContactDto(id = it.id, name = it.name) }
+                    contacts = contactDtos
                 )
                 contactsPath(ownerUserId).writeText(gson.toJson(dto))
             } catch (_: Exception) {
