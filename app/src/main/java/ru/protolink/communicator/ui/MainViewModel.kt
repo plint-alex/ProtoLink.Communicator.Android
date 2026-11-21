@@ -4199,6 +4199,8 @@ class MainViewModel @Inject constructor(
                         isContactsLoading = false
                     )
                 }
+                // Thin plant must not stick while Continue awaits EnsureBagId (storm).
+                stripThinUntrustedContactsOnInteractiveAbandon(userId)
                 // Win budget-elapsed parity: still richest-bag reconcile in background (Tina).
                 launch { continueContactsAfterPaint(userId, "", gen) }
                 return@launch
@@ -4218,6 +4220,7 @@ class MainViewModel @Inject constructor(
                 _state.update { cur ->
                     cur.copy(isContactsLoading = false)
                 }
+                stripThinUntrustedContactsOnInteractiveAbandon(userId)
                 launch { continueContactsAfterPaint(userId, bagId, gen) }
                 return@launch
             }
@@ -4299,8 +4302,14 @@ class MainViewModel @Inject constructor(
 
     private fun persistContactsDiskAsap(ownerUserId: String) {
         val contacts = _state.value.contacts
-        if (contacts.isEmpty()) return
         val existing = messengerDiskCache.tryLoadContacts(ownerUserId)
+        if (contacts.isEmpty()) {
+            // Authoritative empty / enrich-drop: wipe thin planted disk (Tina rich disk kept).
+            if (PreferOnlineUiCache.shouldClearContactsCacheWhenIncomingEmpty(existing.size)) {
+                messengerDiskCache.saveContactsAsap(ownerUserId, emptyList(), null)
+            }
+            return
+        }
         val bagToPersist =
             if (PreferOnlineUiCache.shouldPersistUserContactsBagId(contacts.size)) {
                 userContactsBagId
@@ -4337,6 +4346,30 @@ class MainViewModel @Inject constructor(
         )
     }
 
+    /**
+     * Interactive timeout/abandon: replace thin planted STALE with signed-in self login ASAP
+     * (UI + disk) so prefer-online is not sticky while Continue awaits bag kids / EnsureBagId.
+     */
+    private fun stripThinUntrustedContactsOnInteractiveAbandon(userId: String) {
+        val painted = _state.value.contacts
+        if (!PreferOnlineUiCache.shouldStripThinPaintOnInteractiveAbandon(painted.size)) return
+        val meLogin = auth.current()?.login?.takeIf { it.isNotBlank() }
+        val selfOnly =
+            if (meLogin != null) listOf(ContactItem(userId, meLogin)) else emptyList()
+        _state.update { cur ->
+            cur.copy(contacts = selfOnly, isContactsLoading = false)
+        }
+        messengerDiskCache.saveContactsAsap(
+            userId,
+            selfOnly.map { MessengerDiskCache.CachedContact(it.userId, it.displayName) },
+            userContactsBagId = null
+        )
+        Log.i(
+            "ProtoLinkContacts",
+            "strip thin plant on interactive abandon → self=${selfOnly.size}"
+        )
+    }
+
     /** Apply online bag kids with prefer-online reconcile (subset-aware replace + name upsert). */
     private fun applyOnlineContactsToState(ready: List<ContactItem>) {
         val painted = _state.value.contacts
@@ -4345,6 +4378,7 @@ class MainViewModel @Inject constructor(
             online = ready,
             idOf = { it.userId }
         )
+        Log.i("ProtoLinkContacts", "online replace contacts count=${reconciled.size}")
         _state.update { cur ->
             val proposed = "Contacts: ${reconciled.size}"
             val status = ForceStatusGuard.statusOrNull(
@@ -4375,7 +4409,30 @@ class MainViewModel @Inject constructor(
         gen: Int
     ) {
         try {
-            // Richest-bag first (before login enrich) so Tina lands before Refresh bumps generation.
+            // Win ContinueContacts order: known-bag kids / ensureSelf+enrich BEFORE EnsureBagId.
+            // Prior richest-first starved online replace under Sync/Notes GetEntities storm
+            // (disk paint only; planted STALE sticky; no online-replace log).
+            if (bagId.isNotBlank()) {
+                replaceContactRowsFromBag(bagId, userId, gen)
+                if (gen != contactsLoadGeneration.get()) return
+            } else {
+                val activeBag = userContactsBagId.orEmpty()
+                if (activeBag.isNotBlank()) {
+                    val partnerBearingBefore =
+                        PreferOnlineUiCache.shouldKeepPaintedOnAuthoritativeEmptyOnline(
+                            _state.value.contacts.size
+                        )
+                    ensureSelfContactRow(userId, activeBag, gen)
+                    if (gen != contactsLoadGeneration.get()) return
+                    pruneUntrustedContactsAfterEnsureSelf(userId, partnerBearingBefore, gen)
+                    if (gen != contactsLoadGeneration.get()) return
+                }
+                enrichContactDisplayNames(userId, gen)
+                if (gen != contactsLoadGeneration.get()) return
+                persistContactsDiskAsap(userId)
+            }
+
+            // Background richest-bag escalate (Tina off StartupFast newest page).
             val rich = UserContactsBagClient.ensureBagId(
                 api,
                 userId,
@@ -4389,27 +4446,7 @@ class MainViewModel @Inject constructor(
             ) {
                 userContactsBagId = rich
                 replaceContactRowsFromBag(rich, userId, gen)
-                return
             }
-
-            val activeBag = when {
-                !rich.isNullOrBlank() -> rich
-                bagId.isNotBlank() -> bagId
-                else -> userContactsBagId.orEmpty()
-            }
-            if (activeBag.isNotBlank()) {
-                val partnerBearingBefore =
-                    PreferOnlineUiCache.shouldKeepPaintedOnAuthoritativeEmptyOnline(
-                        _state.value.contacts.size
-                    )
-                ensureSelfContactRow(userId, activeBag, gen)
-                if (gen != contactsLoadGeneration.get()) return
-                pruneUntrustedContactsAfterEnsureSelf(userId, partnerBearingBefore, gen)
-                if (gen != contactsLoadGeneration.get()) return
-            }
-            enrichContactDisplayNames(userId, gen)
-            if (gen != contactsLoadGeneration.get()) return
-            persistContactsDiskAsap(userId)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

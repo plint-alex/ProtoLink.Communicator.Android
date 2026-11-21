@@ -156,6 +156,21 @@ object PreferOnlineUiCache {
         paintedContactCount >= UserContactsBagHelpers.PartnerRowThreshold
 
     /**
+     * Interactive budget / GetEntities timeout: thin planted junk must not stay sticky while
+     * background continue awaits EnsureBagId under Sync/Notes storm (PREFER_ONLINE_STALE_PLANT).
+     * Partner-bearing Tina paint is kept.
+     */
+    fun shouldStripThinPaintOnInteractiveAbandon(paintedContactCount: Int): Boolean =
+        paintedContactCount > 0 && !shouldKeepPaintedOnAuthoritativeEmptyOnline(paintedContactCount)
+
+    /**
+     * After authoritative empty / enrich-drop cleared UI: wipe thin sticky disk rows.
+     * Do not wipe partner-bearing Tina disk on empty incoming.
+     */
+    fun shouldClearContactsCacheWhenIncomingEmpty(existingCachedCount: Int): Boolean =
+        existingCachedCount > 0 && !shouldPersistUserContactsBagId(existingCachedCount)
+
+    /**
      * After ensureSelf on prefer-online continue: keep self + authoritative online ids.
      * When online was never authoritative (timeout) and pre-ensureSelf paint was not
      * partner-bearing, keep only self — strips planted [STALE] that ensureSelf prepends onto

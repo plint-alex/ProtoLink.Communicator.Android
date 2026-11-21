@@ -168,6 +168,42 @@ class PreferOnlineUiCacheTest {
     }
 
     @Test
+    fun stripThinPaint_onInteractiveAbandon_keepsTina() {
+        assertThat(PreferOnlineUiCache.shouldStripThinPaintOnInteractiveAbandon(0)).isFalse()
+        assertThat(PreferOnlineUiCache.shouldStripThinPaintOnInteractiveAbandon(1)).isTrue()
+        assertThat(PreferOnlineUiCache.shouldStripThinPaintOnInteractiveAbandon(2)).isFalse()
+    }
+
+    @Test
+    fun clearContactsCache_whenIncomingEmpty_onlyThinDisk() {
+        assertThat(PreferOnlineUiCache.shouldClearContactsCacheWhenIncomingEmpty(0)).isFalse()
+        assertThat(PreferOnlineUiCache.shouldClearContactsCacheWhenIncomingEmpty(1)).isTrue()
+        assertThat(PreferOnlineUiCache.shouldClearContactsCacheWhenIncomingEmpty(2)).isFalse()
+    }
+
+    @Test
+    fun replaceAfterStalePlant_timeoutAbandon_thenOnlineSelf() {
+        // Plant path: Interactive timeout strips thin → self login; later online reconciles.
+        data class Row(val id: String, val name: String)
+        val self = "a52b6095-7952-4535-90a1-ce8bdaf7f9c7"
+        val plant = listOf(Row("00000000-0000-0000-0000-000000000099", "STALE_CACHE_TEST_NAME@test.local"))
+        assertThat(PreferOnlineUiCache.shouldStripThinPaintOnInteractiveAbandon(plant.size)).isTrue()
+        val afterAbandon = listOf(Row(self, "alex.plint@gmail.com"))
+        val online = listOf(Row(self, "alex.plint@gmail.com"))
+        val out = PreferOnlineUiCache.reconcileContactsAfterOnline(afterAbandon, online) { it.id }
+        assertThat(out).hasSize(1)
+        assertThat(out[0].name).isEqualTo("alex.plint@gmail.com")
+        assertThat(
+            PreferOnlineUiCache.shouldReplaceContactsCache(
+                incomingCount = 1,
+                existingCachedCount = 1,
+                incomingIsSubsetOfExisting = false
+            )
+        ).isTrue()
+        assertThat(PreferOnlineUiCache.shouldClearContactsCacheWhenIncomingEmpty(1)).isTrue()
+    }
+
+    @Test
     fun retainTrusted_afterEnsureSelf_stripsPlantedStale() {
         data class Row(val id: String, val name: String)
         val self = "a52b6095-7952-4535-90a1-ce8bdaf7f9c7"
