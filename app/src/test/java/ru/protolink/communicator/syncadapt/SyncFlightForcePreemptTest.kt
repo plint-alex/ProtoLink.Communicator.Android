@@ -3,6 +3,7 @@ package ru.protolink.communicator.syncadapt
 import com.google.common.truth.Truth.assertThat
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -165,5 +166,32 @@ class SyncFlightForcePreemptTest {
         }
         deferred.join()
         assertThat(result).isNull()
+    }
+
+    @Test
+    fun cancelBudgetedExclusiveOnly_cancelsBudgetedPush_notUnbudgeted() = runTest {
+        // Win CancelBudgetedExclusiveOnly — full Sync coalesce aborts AutoPush only.
+        SyncFlight.markBudgetedExclusive(true)
+        val push = async {
+            SyncFlight.runDeferringToForce(pollMs = 10L, abandonAfterMs = 500L) {
+                delay(10_000)
+                "push-done"
+            }
+        }
+        delay(40)
+        SyncFlight.cancelBudgetedExclusiveOnly()
+        assertThat(push.await()).isNull()
+        SyncFlight.markBudgetedExclusive(false)
+
+        SyncFlight.markBudgetedExclusive(false)
+        val full = async {
+            SyncFlight.runDeferringToForce(pollMs = 10L, abandonAfterMs = 500L) {
+                delay(80)
+                "full-done"
+            }
+        }
+        delay(20)
+        SyncFlight.cancelBudgetedExclusiveOnly() // no-op when not budgeted
+        assertThat(full.await()).isEqualTo("full-done")
     }
 }

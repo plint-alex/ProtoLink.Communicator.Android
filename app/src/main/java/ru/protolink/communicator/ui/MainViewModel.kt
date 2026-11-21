@@ -481,6 +481,8 @@ class MainViewModel @Inject constructor(
                 delay(intervalMs)
                 if (!auth.isAuthenticated) continue
                 if (mappingStore.load().isEmpty()) continue
+                // Win RequestLocalPushAsync: skip when deferredFull — do not re-arm Uploading.
+                if (SyncFlight.deferredFull.get()) continue
                 if (_state.value.syncing || SyncFlight.mutex.isLocked) continue
                 requestLocalPush()
             }
@@ -3457,7 +3459,9 @@ class MainViewModel @Inject constructor(
                 return@launch
             }
             if (!SyncFlight.mutex.tryLock()) {
+                // Win CancelBudgetedExclusiveOnly — abort hung AutoPush so deferred full can run.
                 SyncFlight.deferredFull.set(true)
+                SyncFlight.cancelBudgetedExclusiveOnly()
                 setStatusUnlessForce("Full sync queued…")
                 return@launch
             }
@@ -3652,11 +3656,14 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch {
             if (!auth.isAuthenticated) return@launch
             if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) return@launch
+            // Win RequestLocalPushAsync skips when deferredFull is set.
+            if (SyncFlight.deferredFull.get()) return@launch
             val mappings = mappingStore.load()
             if (mappings.isEmpty()) return@launch
             if (_state.value.syncing || !SyncFlight.mutex.tryLock()) return@launch
             _state.update { it.copy(status = "Uploading local changes…", syncing = true) }
             var budgetExpired = false
+            SyncFlight.markBudgetedExclusive(true)
             try {
                 val applied = withContext(Dispatchers.IO) {
                     // Win CloudMappedSyncCoordinator.AutoPushBudget — cancel hung SAF-hash push
@@ -3679,38 +3686,31 @@ class MainViewModel @Inject constructor(
                     notifyOtherDevices()
                     currentFolderId?.let { loadCloudFolder(it) }
                 }
-                // Drain deferred full sync requested while we held the lock.
-                while (
-                    SyncFlight.deferredFull.getAndSet(false) && !SyncFlight.forcePreferred.get()
-                ) {
-                    val currentMappings = mappingStore.load()
-                    val drained = withContext(Dispatchers.IO) {
-                        val engineMappings = currentMappings.map {
-                            SyncMapping(
-                                id = it.cloudFolderId.replace("-", ""),
-                                cloudFolderId = it.cloudFolderId,
-                                localRootPath = it.localPath,
-                                cloudFolderName = it.cloudFolderName
+                // Win: do not drain deferred full under Uploading — unlock so RequestFullSync
+                // reclaim runs with Syncing… / Sync complete chrome (CancelBudgetedExclusiveOnly).
+                when {
+                    forceOwnsStatus() ->
+                        _state.update { it.copy(syncing = false, mappings = mappingStore.load()) }
+                    SyncFlight.deferredFull.get() ->
+                        _state.update {
+                            it.copy(
+                                status = "Full sync queued…",
+                                syncing = false,
+                                mappings = mappingStore.load()
                             )
                         }
-                        SyncFlight.runDeferringToForce {
-                            SyncEngine(metadataStore, localFs, remoteCloud).reconcileAll(engineMappings)
+                    else ->
+                        _state.update {
+                            it.copy(
+                                status = if (applied > 0) {
+                                    "Uploaded local changes ($applied)"
+                                } else {
+                                    "No local changes"
+                                },
+                                syncing = false,
+                                mappings = mappingStore.load()
+                            )
                         }
-                    }
-                    if (drained == null) break
-                    currentFolderId?.let { loadCloudFolder(it) }
-                }
-                // Preempted Force owns the banner — unlock without "No local changes" clobber (1.0.66).
-                if (forceOwnsStatus()) {
-                    _state.update { it.copy(syncing = false, mappings = mappingStore.load()) }
-                } else {
-                    _state.update {
-                        it.copy(
-                            status = if (applied > 0) "Uploaded local changes ($applied)" else "No local changes",
-                            syncing = false,
-                            mappings = mappingStore.load()
-                        )
-                    }
                 }
             } catch (e: TimeoutCancellationException) {
                 budgetExpired = true
@@ -3738,12 +3738,11 @@ class MainViewModel @Inject constructor(
                 Log.e("ProtoLinkSync", "local push failed", e)
                 handleSyncFailure(e)
             } finally {
+                SyncFlight.markBudgetedExclusive(false)
                 if (SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
             }
-            // Budget cancel: reclaim Sync chrome (Win AutoPush yields lane for full reconcile).
-            // Always request full Sync after expire — deferredFull may be false when interval
-            // push alone held the lane (sticky Uploading with no Sync complete).
-            if (budgetExpired && !SyncFlight.forcePreferred.get()) {
+            // Budget expire or CancelBudgetedExclusiveOnly: Win yields lane for full reconcile.
+            if ((budgetExpired || SyncFlight.deferredFull.get()) && !SyncFlight.forcePreferred.get()) {
                 SyncFlight.deferredFull.set(true)
                 requestFullSync()
             }

@@ -13,7 +13,9 @@ object SafTreeLister {
         val documentId: String,
         val name: String,
         val isDirectory: Boolean,
-        val uri: Uri
+        val uri: Uri,
+        /** DocumentsContract COLUMN_SIZE when provider reports it; null for directories / missing. */
+        val sizeBytes: Long? = null
     )
 
     fun treeDocumentId(treeUri: Uri): String =
@@ -32,7 +34,8 @@ object SafTreeLister {
                 arrayOf(
                     DocumentsContract.Document.COLUMN_DOCUMENT_ID,
                     DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                    DocumentsContract.Document.COLUMN_MIME_TYPE
+                    DocumentsContract.Document.COLUMN_MIME_TYPE,
+                    DocumentsContract.Document.COLUMN_SIZE
                 ),
                 null,
                 null,
@@ -41,12 +44,18 @@ object SafTreeLister {
                 val idIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
                 val nameIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
                 val mimeIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val sizeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
                 while (cursor.moveToNext()) {
                     val id = cursor.getString(idIdx) ?: continue
                     val name = cursor.getString(nameIdx)?.takeIf { it.isNotBlank() } ?: continue
                     val mime = cursor.getString(mimeIdx).orEmpty()
                     val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
-                    out.add(Entry(id, name, isDir, documentUri(treeUri, id)))
+                    val size = if (!isDir && sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
+                        cursor.getLong(sizeIdx).takeIf { it >= 0L }
+                    } else {
+                        null
+                    }
+                    out.add(Entry(id, name, isDir, documentUri(treeUri, id), size))
                 }
             }
         } catch (e: Exception) {

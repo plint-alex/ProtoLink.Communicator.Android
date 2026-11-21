@@ -38,6 +38,11 @@ object SyncFlight {
     val laneEpoch = AtomicInteger(0)
 
     private val exclusiveJob = AtomicReference<Job?>(null)
+    /**
+     * Win CloudMappedSyncCoordinator._budgetedExclusive — AutoPush/interval push only.
+     * Full reconcile is unlimited; [cancelBudgetedExclusiveOnly] must not abort it.
+     */
+    private val budgetedExclusive = AtomicBoolean(false)
 
     /** Grace after cancel before owner unlocks even if work ignores cancellation. */
     const val ABANDON_AFTER_MS = 2_000L
@@ -48,6 +53,19 @@ object SyncFlight {
 
     fun clearExclusiveJob(job: Job) {
         exclusiveJob.compareAndSet(job, null)
+    }
+
+    fun markBudgetedExclusive(budgeted: Boolean) {
+        budgetedExclusive.set(budgeted)
+    }
+
+    /**
+     * Win CancelBudgetedExclusiveOnly — cancel hung AutoPush so deferred full Sync can reclaim.
+     * Does **not** set [forcePreferred] (manual Sync / SignalR coalesce, not Force).
+     */
+    fun cancelBudgetedExclusiveOnly() {
+        if (!budgetedExclusive.get()) return
+        exclusiveJob.get()?.cancel(CancellationException("SyncFlight: CancelBudgetedExclusiveOnly"))
     }
 
     /** Mark Force priority, bump lane epoch, cancel current exclusive **work** (not mutex owner). */
@@ -99,7 +117,15 @@ object SyncFlight {
             return try {
                 worker.await()
             } catch (e: CancellationException) {
-                if (forcePreferred.get() || laneEpoch.get() != startEpoch) null else throw e
+                // Force preempt OR CancelBudgetedExclusiveOnly → yield lane (null).
+                if (forcePreferred.get() ||
+                    laneEpoch.get() != startEpoch ||
+                    e.message?.contains("CancelBudgetedExclusiveOnly") == true
+                ) {
+                    null
+                } else {
+                    throw e
+                }
             }
         } finally {
             clearExclusiveJob(worker)
@@ -143,6 +169,7 @@ object SyncFlight {
         exclusiveJob.set(null)
         forcePreferred.set(false)
         deferredFull.set(false)
+        budgetedExclusive.set(false)
         laneEpoch.set(0)
         // Mutex must be unlocked by the test that locked it.
     }

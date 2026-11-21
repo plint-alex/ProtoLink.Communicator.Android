@@ -8,6 +8,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import ru.protolink.communicator.data.CloudCodes
 import ru.protolink.communicator.data.NotesTreeBuilder
 import ru.protolink.communicator.data.SafChildResolve
+import ru.protolink.communicator.data.SafDocumentSize
 import ru.protolink.communicator.data.SafPrimaryPath
 import ru.protolink.communicator.data.SafTreeLister
 import java.io.File
@@ -209,25 +210,34 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
     private fun treeUri(rootPath: String): Uri = Uri.parse(rootPath)
 
     /**
-     * Real byte length for a SAF document. Do **not** use [InputStream.available] — on many OEMs
-     * (Huawei leaf folders) it returns 0 for existing HTML files, which made sync treat notes as empty.
+     * Real byte length for a SAF document — Win FileInfo.Length cost model.
+     * Do **not** use [InputStream.available] (OEM 0) or full-stream [readBytes] (1.0.104 Force starve).
      */
-    private fun uriByteLength(uri: Uri): Long {
-        runCatching {
-            context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { pfd ->
-                val len = pfd.length
-                if (len >= 0L) return len
+    private fun uriByteLength(
+        uri: Uri,
+        tree: Uri? = null,
+        relativePath: String? = null,
+        listedSize: Long? = null
+    ): Long {
+        val primary = if (tree != null && relativePath != null) {
+            SafPrimaryPath.tryResolveExisting(tree, relativePath)
+        } else {
+            null
+        }
+        return SafDocumentSize.lengthBytes(context, uri, primary, listedSize)
+    }
+
+    private fun uriContentHash(uri: Uri, tree: Uri? = null, relativePath: String? = null): String {
+        if (tree != null && relativePath != null) {
+            val file = SafPrimaryPath.tryResolveExisting(tree, relativePath)
+            if (file != null && file.isFile) {
+                return runCatching { ContentHashUtil.sha256Hex(file.readBytes()) }.getOrDefault("")
             }
         }
         return runCatching {
-            context.contentResolver.openInputStream(uri)?.use { it.readBytes().size.toLong() } ?: 0L
-        }.getOrDefault(0L)
-    }
-
-    private fun uriContentHash(uri: Uri): String =
-        runCatching {
             context.contentResolver.openInputStream(uri)?.use { ContentHashUtil.sha256Hex(it.readBytes()) } ?: ""
         }.getOrDefault("")
+    }
 
     private fun root(rootPath: String): DocumentFile =
         DocumentFile.fromTreeUri(context, treeUri(rootPath))
@@ -293,8 +303,8 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                 SafTreeLister.findIndexHtmlByGuess(context, tree, folderDocId)?.let { indexUri ->
                     val name = "index.html"
                     val childRel = if (rel.isEmpty()) name.lowercase() else "$rel/${name.lowercase()}"
-                    val len = uriByteLength(indexUri)
-                    val hash = if (computeContentHashes) uriContentHash(indexUri) else ""
+                    val len = uriByteLength(indexUri, tree, childRel)
+                    val hash = if (computeContentHashes) uriContentHash(indexUri, tree, childRel) else ""
                     files.add(FsEntry(childRel, false, len, hash))
                     rollSizeIntoAncestors(childRel, len)
                     seenNames.add(name)
@@ -306,8 +316,13 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                     rememberFolder(childRel)
                     walk(child.documentId, childRel)
                 } else {
-                    val len = uriByteLength(child.uri)
-                    val hash = if (computeContentHashes) uriContentHash(child.uri) else ""
+                    // Size-only: COLUMN_SIZE / File.length — never open stream per file (Win FileInfo).
+                    val len = uriByteLength(child.uri, tree, childRel, child.sizeBytes)
+                    val hash = if (computeContentHashes) {
+                        uriContentHash(child.uri, tree, childRel)
+                    } else {
+                        ""
+                    }
                     files.add(FsEntry(childRel, false, len, hash))
                     rollSizeIntoAncestors(childRel, len)
                 }
@@ -656,15 +671,14 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
     override fun fileLengthBytes(rootPath: String, relativePath: String): Long? =
         runCatching {
             val n = relativePath.replace('\\', '/').trim('/')
-            val found = find(rootPath, n)
-            if (found != null) {
-                if (found.isDirectory) return@runCatching null
-                return@runCatching uriByteLength(found.uri)
-            }
             val tree = treeUri(rootPath)
-            val file = SafPrimaryPath.tryResolveExisting(tree, n) ?: return@runCatching null
-            if (!file.isFile) return@runCatching null
-            file.length()
+            // Prefer primary File.length (Win FileInfo) before any SAF open.
+            SafPrimaryPath.tryResolveExisting(tree, n)?.takeIf { it.isFile }?.length()?.let {
+                return@runCatching it
+            }
+            val found = find(rootPath, n) ?: return@runCatching null
+            if (found.isDirectory) return@runCatching null
+            uriByteLength(found.uri, tree, n)
         }.getOrNull()
 
     private fun mimeForName(name: String): String = when {
