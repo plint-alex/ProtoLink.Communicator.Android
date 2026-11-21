@@ -55,6 +55,9 @@ interface SyncMetaDao {
     @Query("DELETE FROM sync_meta WHERE remoteId = :remoteId")
     suspend fun deleteByRemoteId(remoteId: String)
 
+    @Query("DELETE FROM sync_meta WHERE lower(replace(remoteId, '-', '')) IN (:normalizedIds)")
+    suspend fun deleteByNormalizedRemoteIds(normalizedIds: List<String>)
+
     @Query("DELETE FROM sync_meta WHERE mappingId = :mappingId")
     suspend fun clearMapping(mappingId: String)
 
@@ -115,6 +118,27 @@ class RoomMetadataStore @Inject constructor(
 
     override fun deleteByRemoteId(remoteId: String) {
         kotlinx.coroutines.runBlocking { dao.deleteByRemoteId(remoteId) }
+    }
+
+    override fun removeByRemoteIds(remoteIds: Collection<String>): Int {
+        val normalized = remoteIds
+            .asSequence()
+            .map { it.replace("-", "").lowercase() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .toList()
+        if (normalized.isEmpty()) return 0
+        return kotlinx.coroutines.runBlocking {
+            var removed = 0
+            for (chunk in normalized.chunked(200)) {
+                val before = dao.getAll().count { row ->
+                    row.remoteId.replace("-", "").lowercase() in chunk
+                }
+                dao.deleteByNormalizedRemoteIds(chunk)
+                removed += before
+            }
+            removed
+        }
     }
 
     override fun getLastSyncUtc(mappingId: String): Instant? =

@@ -418,6 +418,13 @@ class MainViewModel @Inject constructor(
     /** Messenger contacts load generation — supersede slower older fetches (#messenger-startup-priority). */
     private val contactsLoadGeneration = java.util.concurrent.atomic.AtomicInteger(0)
 
+    /**
+     * Session tombstones after Cloud delete — Soft Ready / empty-API paint must not resurrect them.
+     * Win CloudViewModel._deletedRemoteIds (normalized dash-insensitive).
+     */
+    private val deletedRemoteIds =
+        java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
     init {
         refreshAuth()
         _state.update {
@@ -481,6 +488,8 @@ class MainViewModel @Inject constructor(
                 delay(intervalMs)
                 if (!auth.isAuthenticated) continue
                 if (mappingStore.load().isEmpty()) continue
+                // Win _cloudMutationSuspend — skip AutoPush during Cloud delete/mirror cleanup.
+                if (SyncFlight.isCloudMutationSuspended()) continue
                 // Win RequestLocalPushAsync: skip when deferredFull — do not re-arm Uploading.
                 if (SyncFlight.deferredFull.get()) continue
                 if (_state.value.syncing || SyncFlight.mutex.isLocked) continue
@@ -856,21 +865,27 @@ class MainViewModel @Inject constructor(
         val mappingId = mapping.cloudFolderId.replace("-", "")
         val soft = CloudInteractiveListing.buildSoftReadyRows(
             folderRemoteId = folderId,
-            children = runCatching { metadataStore.getAll(mappingId) }.getOrDefault(emptyList()),
+            children = runCatching { metadataStore.getAll(mappingId) }.getOrDefault(emptyList())
+                .filter { !isDeletedRemoteId(it.remoteId) },
             maxRows = CloudInteractiveListing.MAX_ROWS
         )
-        return soft.map { row ->
-            CloudItem(
-                id = row.id,
-                name = row.name,
-                isFolder = row.isFolder,
-                typeLabel = if (row.isFolder) "Folder" else "File",
-                sizeDisplay = "—",
-                dateDisplay = ChatTime.formatListMeta(row.updateTimeMillis),
-                updateTimeMillis = row.updateTimeMillis
-            )
-        }
+        return soft
+            .filter { !isDeletedRemoteId(it.id) }
+            .map { row ->
+                CloudItem(
+                    id = row.id,
+                    name = row.name,
+                    isFolder = row.isFolder,
+                    typeLabel = if (row.isFolder) "Folder" else "File",
+                    sizeDisplay = "—",
+                    dateDisplay = ChatTime.formatListMeta(row.updateTimeMillis),
+                    updateTimeMillis = row.updateTimeMillis
+                )
+            }
     }
+
+    private fun isDeletedRemoteId(id: String): Boolean =
+        deletedRemoteIds.contains(CloudFolderDelete.normalizeRemoteId(id))
 
     /** Values-light pages only (structure-complete). Soft Ready when API empty — Win Ready paint. */
     private suspend fun loadCloudFolderChildrenLight(folderId: String): List<CloudItem> {
@@ -893,7 +908,10 @@ class MainViewModel @Inject constructor(
             if (batch.size < pageSize) break
             skip += pageSize
         }
-        val apiItems = sortCloudListing(light.mapNotNull { cloudChildItem(it, metaLeaf) })
+        val apiItems = sortCloudListing(
+            light.mapNotNull { cloudChildItem(it, metaLeaf) }
+                .filter { !isDeletedRemoteId(it.id) }
+        )
         // Soft Ready when GetEntities returned empty (Win TryApplySyncMetaSoftReady).
         return CloudInteractiveListing.preferApiOrSoftReady(apiItems, softReadyCloudItems(folderId))
     }
@@ -3655,6 +3673,7 @@ class MainViewModel @Inject constructor(
     private fun requestLocalPush() {
         viewModelScope.launch {
             if (!auth.isAuthenticated) return@launch
+            if (SyncFlight.isCloudMutationSuspended()) return@launch
             if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) return@launch
             // Win RequestLocalPushAsync skips when deferredFull is set.
             if (SyncFlight.deferredFull.get()) return@launch
@@ -4093,29 +4112,26 @@ class MainViewModel @Inject constructor(
             } else null
         }
 
+        // Win SuspendMappedRootWatchers — AutoPush must not recreate soft-hidden tree from local.
+        SyncFlight.suspendCloudMutation()
         try {
+            val deletedIds = linkedSetOf<String>()
             if (isFolder) {
                 CloudFolderDelete.deleteFolderRecursive(
                     folderId = id,
-                    listChildren = { folderId ->
-                        api.getEntities(
-                            GetEntitiesRequest(
-                                parentIds = listOf(folderId),
-                                includeValues = false,
-                                take = 500
-                            )
-                        ).map { CloudFolderDelete.ChildRef(it.id, it.code) }
-                    },
+                    listChildren = { folderId -> listCloudChildrenForDelete(folderId) },
                     deleteEntity = { entityId ->
                         api.deleteEntity(DeleteEntityRequest(entityId))
-                    }
+                    },
+                    deletedIds = deletedIds
                 )
             } else {
                 api.deleteEntity(DeleteEntityRequest(id))
+                deletedIds.add(id)
             }
 
-            // NFR-SYNC-1: mirror IO soft-fails; Cloud tree already deleted.
-            CloudFolderDelete.softDeleteLocalMirror(localFs, mirror, isFolder)
+            // Soft Ready paints sync-meta when GetEntities empty — purge all cascade ids (Win).
+            runCatching { metadataStore.removeByRemoteIds(deletedIds) }
             if (wasMappedRoot) {
                 unmapFolderQuiet(id)
             } else if (mirror != null && mirror.relativePath.isNotBlank()) {
@@ -4124,9 +4140,26 @@ class MainViewModel @Inject constructor(
                 }?.cloudFolderId?.replace("-", "")
                 if (mappingId != null) {
                     runCatching { metadataStore.delete(mappingId, mirror.relativePath) }
+                    // Drop descendant meta under the deleted folder path (prefix).
+                    runCatching {
+                        val prefix = mirror.relativePath.trim('/').lowercase()
+                        if (prefix.isNotEmpty()) {
+                            metadataStore.getAll(mappingId)
+                                .filter {
+                                    val rel = it.relativePath.replace('\\', '/').trim('/').lowercase()
+                                    rel == prefix || rel.startsWith("$prefix/")
+                                }
+                                .forEach { metadataStore.delete(mappingId, it.relativePath) }
+                        }
+                    }
                 }
             }
-            runCatching { metadataStore.deleteByRemoteId(id) }
+            for (gone in deletedIds) {
+                deletedRemoteIds.add(CloudFolderDelete.normalizeRemoteId(gone))
+            }
+
+            // NFR-SYNC-1: mirror IO soft-fails; Cloud tree already deleted.
+            CloudFolderDelete.softDeleteLocalMirror(localFs, mirror, isFolder)
 
             val openFile = _state.value.cloudOpenFile
             if (openFile?.id.equals(id, ignoreCase = true)) {
@@ -4148,7 +4181,35 @@ class MainViewModel @Inject constructor(
             } else {
                 showError("Delete failed", httpDetail(e), e)
             }
+        } finally {
+            SyncFlight.resumeCloudMutation()
         }
+    }
+
+    /**
+     * Full GetEntities pages for E10 cascade (Api does not cascade).
+     * Single take=500 left large folders with undeleted children → Soft Ready/Sync resurrect.
+     */
+    private suspend fun listCloudChildrenForDelete(folderId: String): List<CloudFolderDelete.ChildRef> {
+        val take = 200
+        val all = ArrayList<CloudFolderDelete.ChildRef>()
+        var skip = 0
+        while (true) {
+            val page = api.getEntities(
+                GetEntitiesRequest(
+                    parentIds = listOf(folderId),
+                    includeValues = false,
+                    skip = skip,
+                    take = take
+                )
+            )
+            for (e in page) {
+                all.add(CloudFolderDelete.ChildRef(e.id, e.code))
+            }
+            if (page.size < take) break
+            skip += take
+        }
+        return all
     }
 
     /** Unmap without status toast (mapped-root delete honesty). */

@@ -146,21 +146,35 @@ object CloudFolderDelete {
     /**
      * Depth-first: delete CloudFile children, recurse CloudFolder children, then delete [folderId].
      * Matches Windows DeleteFolderRecursiveAsync (Api has no cascade).
+     * [deletedIds] collects every successfully deleted remote id (for sync-meta purge / Soft Ready tombstones).
      */
     suspend fun deleteFolderRecursive(
         folderId: String,
         listChildren: suspend (String) -> List<ChildRef>,
-        deleteEntity: suspend (String) -> Unit
+        deleteEntity: suspend (String) -> Unit,
+        deletedIds: MutableCollection<String>? = null
     ) {
         val children = listChildren(folderId)
         for (c in children) {
-            when (c.code) {
-                CloudCodes.CLOUD_FILE -> deleteEntity(c.id)
-                CloudCodes.CLOUD_FOLDER -> deleteFolderRecursive(c.id, listChildren, deleteEntity)
+            if (c.id.equals(folderId, ignoreCase = true)) continue
+            val code = c.code.orEmpty()
+            when {
+                code.equals(CloudCodes.CLOUD_FILE, ignoreCase = true) -> {
+                    deleteEntity(c.id)
+                    deletedIds?.add(c.id)
+                }
+                code.equals(CloudCodes.CLOUD_FOLDER, ignoreCase = true) -> {
+                    deleteFolderRecursive(c.id, listChildren, deleteEntity, deletedIds)
+                }
             }
         }
         deleteEntity(folderId)
+        deletedIds?.add(folderId)
     }
+
+    /** Normalize Cloud entity ids for tombstone / meta purge (dash-insensitive). */
+    fun normalizeRemoteId(id: String): String =
+        id.replace("-", "").lowercase()
 
     private fun isRu(lang: String?): Boolean =
         lang?.startsWith("ru", ignoreCase = true) == true

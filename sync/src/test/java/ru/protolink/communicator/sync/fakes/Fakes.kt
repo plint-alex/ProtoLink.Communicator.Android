@@ -35,7 +35,28 @@ class InMemoryMetadataStore : MetadataStore {
     }
 
     override fun deleteByRemoteId(remoteId: String) {
-        items.entries.removeIf { it.value.remoteId == remoteId }
+        val want = remoteId.replace("-", "").lowercase()
+        items.entries.removeIf {
+            it.value.remoteId.replace("-", "").lowercase() == want
+        }
+    }
+
+    override fun removeByRemoteIds(remoteIds: Collection<String>): Int {
+        val want = remoteIds
+            .map { it.replace("-", "").lowercase() }
+            .filter { it.isNotEmpty() }
+            .toHashSet()
+        if (want.isEmpty()) return 0
+        var n = 0
+        val it = items.entries.iterator()
+        while (it.hasNext()) {
+            val e = it.next()
+            if (e.value.remoteId.replace("-", "").lowercase() in want) {
+                it.remove()
+                n++
+            }
+        }
+        return n
     }
 
     override fun getLastSyncUtc(mappingId: String): Instant? = lastSync[mappingId]

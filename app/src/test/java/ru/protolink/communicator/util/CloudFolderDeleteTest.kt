@@ -149,10 +149,13 @@ class CloudFolderDeleteTest {
     @Test
     fun deleteFolderRecursive_depthFirst_filesThenFoldersThenSelf() = runBlocking {
         val order = mutableListOf<String>()
+        val deleted = linkedSetOf<String>()
         val tree = mapOf(
             "root" to listOf(
                 CloudFolderDelete.ChildRef("file1", CloudCodes.CLOUD_FILE),
-                CloudFolderDelete.ChildRef("sub", CloudCodes.CLOUD_FOLDER)
+                CloudFolderDelete.ChildRef("sub", CloudCodes.CLOUD_FOLDER),
+                CloudFolderDelete.ChildRef("junk", "SomeOtherCode"),
+                CloudFolderDelete.ChildRef("root", CloudCodes.CLOUD_FOLDER) // self-id skip
             ),
             "sub" to listOf(
                 CloudFolderDelete.ChildRef("file2", CloudCodes.CLOUD_FILE)
@@ -161,9 +164,18 @@ class CloudFolderDeleteTest {
         CloudFolderDelete.deleteFolderRecursive(
             folderId = "root",
             listChildren = { id -> tree[id].orEmpty() },
-            deleteEntity = { id -> order.add(id) }
+            deleteEntity = { id -> order.add(id) },
+            deletedIds = deleted
         )
         assertThat(order).containsExactly("file1", "file2", "sub", "root").inOrder()
+        assertThat(deleted).containsExactly("file1", "file2", "sub", "root").inOrder()
+        assertThat(order).doesNotContain("junk")
+    }
+
+    @Test
+    fun normalizeRemoteId_dashInsensitive() {
+        assertThat(CloudFolderDelete.normalizeRemoteId("AAAAAAAA-aaaa-4aaa-8aaa-AAAAAAAAAAAA"))
+            .isEqualTo("aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa")
     }
 
     private class FakeLocalFs(

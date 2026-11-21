@@ -32,6 +32,11 @@ object SyncFlight {
     /** Force (or conflict resolve) wants the exclusive lane — full/push must defer. */
     val forcePreferred = AtomicBoolean(false)
     /**
+     * Win CloudMappedSyncCoordinator._cloudMutationSuspend — pause interval AutoPush while
+     * Cloud delete + mirror cleanup runs so PushLocalChanges cannot recreate soft-hidden rows.
+     */
+    private val cloudMutationSuspend = AtomicInteger(0)
+    /**
      * Bumped on Force preempt. Full/push work captures the epoch at start and aborts when it
      * changes so an abandoned (post-grace) writer cannot keep mutating under Force.
      */
@@ -78,6 +83,16 @@ object SyncFlight {
     fun clearForcePreferred() {
         forcePreferred.set(false)
     }
+
+    fun suspendCloudMutation() {
+        cloudMutationSuspend.incrementAndGet()
+    }
+
+    fun resumeCloudMutation() {
+        if (cloudMutationSuspend.decrementAndGet() < 0) cloudMutationSuspend.set(0)
+    }
+
+    fun isCloudMutationSuspended(): Boolean = cloudMutationSuspend.get() > 0
 
     /**
      * Run full/push work until complete, or yield to Force.

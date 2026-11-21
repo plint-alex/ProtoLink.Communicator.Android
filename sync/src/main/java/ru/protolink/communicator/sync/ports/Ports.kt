@@ -12,6 +12,20 @@ interface MetadataStore {
     fun upsert(item: SyncItemMeta)
     fun delete(mappingId: String, relativePath: String)
     fun deleteByRemoteId(remoteId: String)
+    /**
+     * Drop sync-meta rows whose remoteId is in [remoteIds] (case-/dash-insensitive).
+     * Win JsonSyncMetadataStore.RemoveByRemoteIds — Soft Ready must not resurrect
+     * soft-hidden Cloud entities after E10 folder delete.
+     */
+    fun removeByRemoteIds(remoteIds: Collection<String>): Int {
+        var n = 0
+        for (id in remoteIds) {
+            if (id.isBlank()) continue
+            deleteByRemoteId(id)
+            n++
+        }
+        return n
+    }
     fun getLastSyncUtc(mappingId: String): Instant?
     fun setLastSyncUtc(mappingId: String, time: Instant)
     fun clearMapping(mappingId: String)
