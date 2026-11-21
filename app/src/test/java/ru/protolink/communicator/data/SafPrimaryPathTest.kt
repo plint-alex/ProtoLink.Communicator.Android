@@ -58,4 +58,22 @@ class SafPrimaryPathTest {
         val tree = Uri.parse("content://com.android.externalstorage.documents/tree/ABCD-EFGH%3ANotes")
         SafPrimaryPath.flushListing(RuntimeEnvironment.getApplication(), tree)
     }
+
+    @Test
+    fun flushListing_nestedWaitZero_returnsImmediately() {
+        // Per-dir 1.5s await starved Force on MyNotesFolder — nested must not block.
+        val tree = Uri.parse(
+            "content://com.android.externalstorage.documents/tree/" +
+                "primary%3ADocuments%2FMyNotesFolder%2Fmynotesfolder"
+        )
+        val started = System.nanoTime()
+        SafPrimaryPath.flushListing(
+            RuntimeEnvironment.getApplication(),
+            tree,
+            relativePath = "at-sync-threeway-upload-test",
+            waitMs = SafPrimaryPath.FLUSH_WAIT_NESTED_MS
+        )
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000L
+        assertThat(elapsedMs).isLessThan(500L)
+    }
 }

@@ -3718,7 +3718,19 @@ class MainViewModel @Inject constructor(
                     "ProtoLinkSync",
                     "local push AutoPushBudget (${AUTO_PUSH_BUDGET_MS}ms) expired — releasing lane"
                 )
-                _state.update { it.copy(syncing = false, mappings = mappingStore.load()) }
+                // Must clear sticky "Uploading local changes…" (1.0.103 residual: syncing=false
+                // left the banner forever so Sync chrome never showed Sync complete).
+                if (!forceOwnsStatus()) {
+                    _state.update {
+                        it.copy(
+                            status = "Upload budget expired — syncing…",
+                            syncing = false,
+                            mappings = mappingStore.load()
+                        )
+                    }
+                } else {
+                    _state.update { it.copy(syncing = false, mappings = mappingStore.load()) }
+                }
             } catch (e: CancellationException) {
                 _state.update { it.copy(syncing = false) }
                 throw e
@@ -3728,8 +3740,11 @@ class MainViewModel @Inject constructor(
             } finally {
                 if (SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
             }
-            // Budget cancel leaves deferredFull for Sync chrome (Sync complete) to run.
-            if (budgetExpired && SyncFlight.deferredFull.get() && !SyncFlight.forcePreferred.get()) {
+            // Budget cancel: reclaim Sync chrome (Win AutoPush yields lane for full reconcile).
+            // Always request full Sync after expire — deferredFull may be false when interval
+            // push alone held the lane (sticky Uploading with no Sync complete).
+            if (budgetExpired && !SyncFlight.forcePreferred.get()) {
+                SyncFlight.deferredFull.set(true)
                 requestFullSync()
             }
         }

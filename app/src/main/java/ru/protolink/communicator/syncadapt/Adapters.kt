@@ -261,9 +261,25 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
 
     override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> {
         val tree = treeUri(rootPath)
-        // Primary trees: flush MediaProvider so DocumentsContract sees adb mkdir (1.0.99 miss).
-        SafPrimaryPath.flushListing(context, tree)
-        val out = mutableListOf<FsEntry>()
+        // Root flush once (Win File.Exists sees shell creates immediately; SAF needs one nudge).
+        SafPrimaryPath.flushListing(
+            context, tree, relativePath = "", waitMs = SafPrimaryPath.FLUSH_WAIT_ROOT_MS
+        )
+        // Win SnapshotFs: single-pass enumerate + ancestor folder size rollup.
+        // Legacy sumFilesSaf per directory was O(dirs×files) and starved Force before first Api
+        // (1.0.103 FORCE_UPLOAD_STUCK_NO_PROGRESS / sticky Uploading on MyNotesFolder).
+        val folderSizes = linkedMapOf<String, Long>()
+        val files = mutableListOf<FsEntry>()
+        fun rememberFolder(rel: String) {
+            if (rel.isNotEmpty()) folderSizes.putIfAbsent(rel, 0L)
+        }
+        fun rollSizeIntoAncestors(fileRel: String, size: Long) {
+            var parent = PathUtil.parentOf(fileRel)
+            while (parent.isNotEmpty()) {
+                folderSizes[parent] = (folderSizes[parent] ?: 0L) + size
+                parent = PathUtil.parentOf(parent)
+            }
+        }
         fun walk(folderDocId: String, rel: String) {
             val entries = SafTreeLister.listChildren(context, tree, folderDocId)
             val seenNames = entries.map { it.name.lowercase() }.toMutableSet()
@@ -277,27 +293,37 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                 SafTreeLister.findIndexHtmlByGuess(context, tree, folderDocId)?.let { indexUri ->
                     val name = "index.html"
                     val childRel = if (rel.isEmpty()) name.lowercase() else "$rel/${name.lowercase()}"
+                    val len = uriByteLength(indexUri)
                     val hash = if (computeContentHashes) uriContentHash(indexUri) else ""
-                    out.add(FsEntry(childRel, false, uriByteLength(indexUri), hash))
+                    files.add(FsEntry(childRel, false, len, hash))
+                    rollSizeIntoAncestors(childRel, len)
                     seenNames.add(name)
                 }
             }
             for (child in entries) {
                 val childRel = if (rel.isEmpty()) child.name.lowercase() else "$rel/${child.name.lowercase()}"
                 if (child.isDirectory) {
-                    val size = sumFilesSaf(tree, child.documentId)
-                    out.add(FsEntry(childRel, true, size))
+                    rememberFolder(childRel)
                     walk(child.documentId, childRel)
                 } else {
+                    val len = uriByteLength(child.uri)
                     val hash = if (computeContentHashes) uriContentHash(child.uri) else ""
-                    out.add(FsEntry(childRel, false, uriByteLength(child.uri), hash))
+                    files.add(FsEntry(childRel, false, len, hash))
+                    rollSizeIntoAncestors(childRel, len)
                 }
             }
             // Shell/MediaProvider creates under primary: can lag DocumentsContract — merge File kids
             // so ApplyLocal sees adb mkdir fixtures (Win File.Exists parity).
-            mergePrimaryFileChildren(tree, rel, seenNames, out, computeContentHashes)
+            mergePrimaryFileChildren(
+                tree, rel, seenNames, files, folderSizes, computeContentHashes, ::rollSizeIntoAncestors
+            )
         }
         walk(SafTreeLister.treeDocumentId(tree), "")
+        val out = ArrayList<FsEntry>(files.size + folderSizes.size)
+        out.addAll(files)
+        for ((rel, size) in folderSizes) {
+            out.add(FsEntry(rel, true, size))
+        }
         return out
     }
 
@@ -305,19 +331,24 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
      * Append primary-tree children missing from DocumentsContract listing.
      * Uses [SafPrimaryPath.listChildNames] (File.list / Os.listdir) so scoped-storage null
      * listFiles still surfaces adb mkdir fixtures. Recurses into File-only folders.
+     * Folder sizes come from [rollSize] — no recursive sumFilesIo (Win single-pass parity).
      */
     private fun mergePrimaryFileChildren(
         tree: Uri,
         rel: String,
         seenNames: MutableSet<String>,
-        out: MutableList<FsEntry>,
-        computeContentHashes: Boolean
+        files: MutableList<FsEntry>,
+        folderSizes: MutableMap<String, Long>,
+        computeContentHashes: Boolean,
+        rollSize: (String, Long) -> Unit
     ) {
         val dir = SafPrimaryPath.tryResolveExisting(tree, rel) ?: return
         if (!dir.isDirectory) return
-        // Per-dir flush: root-only flush left nested adb mkdir invisible to DocumentsContract
-        // until File merge — still flush so MediaScanner catches up for later SAF writes.
-        SafPrimaryPath.flushListing(context, tree, rel)
+        // Fire-and-forget nested flush — Os.listdir already lists shell creates; awaiting
+        // MediaScanner per directory was 1.5s×folders (Force stuck residual after 1.0.103).
+        SafPrimaryPath.flushListing(
+            context, tree, rel, waitMs = SafPrimaryPath.FLUSH_WAIT_NESTED_MS
+        )
         val names = SafPrimaryPath.listChildNames(dir)
         if (names.isEmpty()) return
         for (rawName in names) {
@@ -332,12 +363,15 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                 SafPrimaryPath.listChildNames(f).isNotEmpty() && !f.isFile
             }.getOrDefault(false)
             if (isDir && !f.isFile) {
-                out.add(FsEntry(childRel, true, if (f.isDirectory) sumFilesIo(f) else 0L))
-                mergePrimaryFileChildren(tree, childRel, mutableSetOf(), out, computeContentHashes)
+                folderSizes.putIfAbsent(childRel, 0L)
+                mergePrimaryFileChildren(
+                    tree, childRel, mutableSetOf(), files, folderSizes,
+                    computeContentHashes, rollSize
+                )
             } else if (f.isFile) {
                 if (computeContentHashes) {
                     val bytes = runCatching { f.readBytes() }.getOrNull() ?: continue
-                    out.add(
+                    files.add(
                         FsEntry(
                             childRel,
                             false,
@@ -345,52 +379,34 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                             ContentHashUtil.sha256Hex(bytes)
                         )
                     )
+                    rollSize(childRel, bytes.size.toLong())
                 } else {
-                    out.add(FsEntry(childRel, false, f.length(), ""))
+                    val len = f.length()
+                    files.add(FsEntry(childRel, false, len, ""))
+                    rollSize(childRel, len)
                 }
             } else {
                 // Name from Os.listdir but File can't read — still record as folder stub so
                 // ApplyLocal Added can create the Api entity; nested merge may fill later.
-                out.add(FsEntry(childRel, true, 0L))
-                mergePrimaryFileChildren(tree, childRel, mutableSetOf(), out, computeContentHashes)
+                folderSizes.putIfAbsent(childRel, 0L)
+                mergePrimaryFileChildren(
+                    tree, childRel, mutableSetOf(), files, folderSizes,
+                    computeContentHashes, rollSize
+                )
             }
         }
-    }
-
-    private fun sumFilesIo(dir: File): Long {
-        var sum = 0L
-        val kids = dir.listFiles() ?: return 0L
-        for (f in kids) {
-            sum += if (f.isDirectory) sumFilesIo(f) else f.length()
-        }
-        return sum
-    }
-
-    private fun sumFilesSaf(tree: Uri, folderDocId: String): Long {
-        var sum = 0L
-        val entries = SafTreeLister.listChildren(context, tree, folderDocId)
-        val hasIndex = entries.any {
-            !it.isDirectory && (it.name.equals("index.html", true) || it.name.equals("index.htm", true))
-        }
-        if (!hasIndex) {
-            SafTreeLister.findIndexHtmlByGuess(context, tree, folderDocId)?.let { uri ->
-                sum += uriByteLength(uri)
-            }
-        }
-        for (child in entries) {
-            sum += if (child.isDirectory) {
-                sumFilesSaf(tree, child.documentId)
-            } else {
-                uriByteLength(child.uri)
-            }
-        }
-        return sum
     }
 
     override fun listImmediate(rootPath: String, relativePath: String): List<FsEntry> {
         val tree = treeUri(rootPath)
         val parentNorm = relativePath.replace('\\', '/').trim('/')
-        SafPrimaryPath.flushListing(context, tree, parentNorm)
+        // Single-dir list: short root-style wait only at mapped root; nested = fire-and-forget.
+        val wait = if (parentNorm.isEmpty()) {
+            SafPrimaryPath.FLUSH_WAIT_ROOT_MS
+        } else {
+            SafPrimaryPath.FLUSH_WAIT_NESTED_MS
+        }
+        SafPrimaryPath.flushListing(context, tree, parentNorm, waitMs = wait)
         val parentId = if (parentNorm.isEmpty()) {
             SafTreeLister.treeDocumentId(tree)
         } else {

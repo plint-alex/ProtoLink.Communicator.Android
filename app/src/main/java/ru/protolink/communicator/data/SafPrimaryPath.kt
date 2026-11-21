@@ -26,7 +26,10 @@ object SafPrimaryPath {
     private const val TAG = "ProtoLinkSaf"
     private const val EXTERNAL_AUTHORITY = "com.android.externalstorage.documents"
     private const val PRIMARY_PREFIX = "primary:"
-    private const val FLUSH_WAIT_MS = 1_500L
+    /** Default wait after MediaScanner for root flush (adb mkdir → DocumentsContract). */
+    const val FLUSH_WAIT_ROOT_MS = 1_500L
+    /** Nested merge: Os.listdir already sees shell creates — do not block 1.5s×dirs (Force starve). */
+    const val FLUSH_WAIT_NESTED_MS = 0L
 
     /** Absolute File for [treeUri] + optional relative path, or null when not a primary tree. */
     fun tryResolve(treeUri: Uri, relativePath: String = ""): File? {
@@ -78,8 +81,18 @@ object SafPrimaryPath {
     /**
      * Nudge MediaProvider + DocumentsContract so ExternalStorageProvider re-lists shell creates.
      * Best-effort; failures must not abort Sync.
+     *
+     * @param waitMs max wait for MediaScanner callback. Root snapshot may use
+     * [FLUSH_WAIT_ROOT_MS]; per-directory File merge must use [FLUSH_WAIT_NESTED_MS] (0) —
+     * Win SnapshotFs has no per-dir sleep; 1.5s×folders starved Force before first Api
+     * (1.0.103 FORCE_UPLOAD_STUCK_NO_PROGRESS residual).
      */
-    fun flushListing(context: Context, treeUri: Uri, relativePath: String = "") {
+    fun flushListing(
+        context: Context,
+        treeUri: Uri,
+        relativePath: String = "",
+        waitMs: Long = FLUSH_WAIT_ROOT_MS
+    ) {
         val dir = tryResolve(treeUri, relativePath) ?: return
         runCatching {
             val rootId = DocumentsContract.getTreeDocumentId(treeUri)
@@ -91,6 +104,17 @@ object SafPrimaryPath {
             Log.d(TAG, "notifyChange soft-fail: ${e.message}")
         }
         if (!dir.exists()) return
+        if (waitMs <= 0L) {
+            runCatching {
+                MediaScannerConnection.scanFile(
+                    context,
+                    arrayOf(dir.absolutePath),
+                    null,
+                    null
+                )
+            }
+            return
+        }
         val latch = CountDownLatch(1)
         runCatching {
             MediaScannerConnection.scanFile(
@@ -101,6 +125,6 @@ object SafPrimaryPath {
         }.onFailure {
             latch.countDown()
         }
-        runCatching { latch.await(FLUSH_WAIT_MS, TimeUnit.MILLISECONDS) }
+        runCatching { latch.await(waitMs, TimeUnit.MILLISECONDS) }
     }
 }
