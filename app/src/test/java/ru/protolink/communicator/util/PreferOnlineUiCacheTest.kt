@@ -150,11 +150,64 @@ class PreferOnlineUiCacheTest {
     }
 
     @Test
-    fun reconcile_emptyOnline_keepsPaint() {
+    fun reconcile_emptyOnline_stripsThinPlant_keepsRichTina() {
         data class Row(val id: String, val name: String)
-        val painted = listOf(Row("stale", "STALE_CACHE_TEST_NAME@test.local"))
-        val out = PreferOnlineUiCache.reconcileContactsAfterOnline(painted, emptyList()) { it.id }
-        assertThat(out).isEqualTo(painted)
+        val plant = listOf(Row("stale", "STALE_CACHE_TEST_NAME@test.local"))
+        assertThat(
+            PreferOnlineUiCache.reconcileContactsAfterOnline(plant, emptyList()) { it.id }
+        ).isEmpty()
+        assertThat(PreferOnlineUiCache.shouldKeepPaintedOnAuthoritativeEmptyOnline(1)).isFalse()
+        assertThat(PreferOnlineUiCache.shouldKeepPaintedOnAuthoritativeEmptyOnline(2)).isTrue()
+        val rich = listOf(
+            Row("self", "alex.plint@gmail.com"),
+            Row("tina", "tina@example.com")
+        )
+        assertThat(
+            PreferOnlineUiCache.reconcileContactsAfterOnline(rich, emptyList()) { it.id }
+        ).isEqualTo(rich)
+    }
+
+    @Test
+    fun retainTrusted_afterEnsureSelf_stripsPlantedStale() {
+        data class Row(val id: String, val name: String)
+        val self = "a52b6095-7952-4535-90a1-ce8bdaf7f9c7"
+        val mixed = listOf(
+            Row(self, "alex.plint@gmail.com"),
+            Row("00000000-0000-0000-0000-000000000099", "STALE_CACHE_TEST_NAME@test.local")
+        )
+        // Timeout + thin pre-ensureSelf paint (plant): self only even though list size is 2.
+        val afterTimeout = PreferOnlineUiCache.retainTrustedContactsAfterEnsureSelf(
+            contacts = mixed,
+            selfId = self,
+            authoritativeOnlineIds = null,
+            partnerBearingPaintBeforeEnsureSelf = false,
+            idOf = { it.id }
+        )
+        assertThat(afterTimeout).hasSize(1)
+        assertThat(afterTimeout[0].id).isEqualTo(self)
+        // Authoritative online self: drop foreign planted id.
+        val afterOnline = PreferOnlineUiCache.retainTrustedContactsAfterEnsureSelf(
+            contacts = mixed,
+            selfId = self,
+            authoritativeOnlineIds = listOf(self),
+            partnerBearingPaintBeforeEnsureSelf = false,
+            idOf = { it.id }
+        )
+        assertThat(afterOnline.map { it.id }).containsExactly(self)
+        // Rich Tina without online yet: keep partners.
+        val rich = listOf(
+            Row(self, "alex.plint@gmail.com"),
+            Row("tina", "tina@example.com")
+        )
+        assertThat(
+            PreferOnlineUiCache.retainTrustedContactsAfterEnsureSelf(
+                contacts = rich,
+                selfId = self,
+                authoritativeOnlineIds = null,
+                partnerBearingPaintBeforeEnsureSelf = true,
+                idOf = { it.id }
+            )
+        ).isEqualTo(rich)
     }
 
     @Test

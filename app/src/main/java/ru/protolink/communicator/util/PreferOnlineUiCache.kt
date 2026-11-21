@@ -121,15 +121,19 @@ object PreferOnlineUiCache {
 
     /**
      * Prefer-online reconcile after a completed bag fetch (not interactive timeout).
-     * Empty online keeps paint (Tina / last-good); non-empty uses subset-aware replace;
-     * online names win on id match. Callers must not pass timeout-as-empty here.
+     * Authoritative empty online: keep partner-bearing paint (Tina); strip thin planted junk
+     * (PREFER_ONLINE_STALE_PLANT). Non-empty uses subset-aware replace; online names win on
+     * id match. Callers must not pass timeout-as-empty here.
      */
     fun <T> reconcileContactsAfterOnline(
         painted: List<T>,
         online: List<T>,
         idOf: (T) -> String
     ): List<T> {
-        if (online.isEmpty()) return painted
+        if (online.isEmpty()) {
+            return if (shouldKeepPaintedOnAuthoritativeEmptyOnline(painted.size)) painted
+            else emptyList()
+        }
         val onlineIds = online.map(idOf)
         val paintedIds = painted.map(idOf)
         val subset = isOnlineSubsetOfPainted(onlineIds, paintedIds)
@@ -141,6 +145,45 @@ object PreferOnlineUiCache {
         for (p in painted) merged[idOf(p).lowercase()] = p
         for (o in online) merged[idOf(o).lowercase()] = o
         return merged.values.toList()
+    }
+
+    /**
+     * Authoritative empty bag (completed fetch, not timeout): rich partner-bearing paint may
+     * outrank a transient empty StartupFast page (Tina). Thin paint (planted stale / self-only
+     * junk) must not stick — clear so ensureSelf can paint live login.
+     */
+    fun shouldKeepPaintedOnAuthoritativeEmptyOnline(paintedContactCount: Int): Boolean =
+        paintedContactCount >= UserContactsBagHelpers.PartnerRowThreshold
+
+    /**
+     * After ensureSelf on prefer-online continue: keep self + authoritative online ids.
+     * When online was never authoritative (timeout) and pre-ensureSelf paint was not
+     * partner-bearing, keep only self — strips planted [STALE] that ensureSelf prepends onto
+     * (size becomes 2 but the extra row is junk). Rich Tina paint without online yet is kept.
+     *
+     * @param authoritativeOnlineIds null = no successful bag fetch yet (timeout / abandon);
+     *        non-null (including empty) = completed GetEntities for the bag.
+     * @param partnerBearingPaintBeforeEnsureSelf whether contacts were partner-bearing before
+     *        ensureSelf ran (not after — ensureSelf+[STALE] must not look like Tina).
+     */
+    fun <T> retainTrustedContactsAfterEnsureSelf(
+        contacts: List<T>,
+        selfId: String,
+        authoritativeOnlineIds: Collection<String>?,
+        partnerBearingPaintBeforeEnsureSelf: Boolean,
+        idOf: (T) -> String
+    ): List<T> {
+        val selfKey = selfId.lowercase()
+        if (authoritativeOnlineIds != null) {
+            val allowed = HashSet<String>(authoritativeOnlineIds.size + 1)
+            for (id in authoritativeOnlineIds) allowed.add(id.lowercase())
+            allowed.add(selfKey)
+            return distinctById(contacts.filter { allowed.contains(idOf(it).lowercase()) }, idOf)
+        }
+        if (!partnerBearingPaintBeforeEnsureSelf) {
+            return distinctById(contacts.filter { idOf(it).equals(selfId, ignoreCase = true) }, idOf)
+        }
+        return distinctById(contacts, idOf)
     }
 
     private fun <T> distinctById(items: List<T>, idOf: (T) -> String): List<T> {

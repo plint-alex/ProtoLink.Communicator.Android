@@ -359,6 +359,11 @@ class MainViewModel @Inject constructor(
     }
     /** Current UserContacts bag id (prefer-online ASAP persist). */
     @Volatile private var userContactsBagId: String? = null
+    /**
+     * Last completed bag GetEntities contact ids (prefer-online).
+     * null = no authoritative fetch yet (Interactive timeout); non-null including empty = done.
+     */
+    @Volatile private var lastAuthoritativeOnlineContactIds: List<String>? = null
     private val uploadGates = ConcurrentHashMap<String, Mutex>()
     /** RemoteId (lowercase) → has external share (Notes tree lazy glyph). */
     private val notesExternalShareByRemoteId = ConcurrentHashMap<String, Boolean>()
@@ -4108,6 +4113,8 @@ class MainViewModel @Inject constructor(
     fun loadContacts() = viewModelScope.launch {
         val userId = auth.current()?.userId ?: return@launch
         val gen = contactsLoadGeneration.incrementAndGet()
+        // New load: no authoritative bag kids until this attempt completes GetEntities.
+        lastAuthoritativeOnlineContactIds = null
         _state.update { it.copy(isContactsLoading = true) }
         // Sick/cold: paint last-good disk contacts before online prefer (never blank wipe).
         if (_state.value.contacts.isEmpty()) {
@@ -4190,6 +4197,7 @@ class MainViewModel @Inject constructor(
             }
             if (gen != contactsLoadGeneration.get()) return@launch
             if (contactsOrTimeout == null) {
+                // Timeout: leave lastAuthoritativeOnlineContactIds untouched (still null / prior).
                 _state.update { cur ->
                     cur.copy(isContactsLoading = false)
                 }
@@ -4214,6 +4222,7 @@ class MainViewModel @Inject constructor(
             }
 
             val ready = items.distinctBy { c -> c.userId.lowercase() }
+            lastAuthoritativeOnlineContactIds = ready.map { it.userId }
             applyOnlineContactsToState(ready)
             persistContactsDiskAsap(userId)
             // Stay on chat list until the user opens a conversation (phones show list first).
@@ -4370,7 +4379,13 @@ class MainViewModel @Inject constructor(
                 else -> userContactsBagId.orEmpty()
             }
             if (activeBag.isNotBlank()) {
+                val partnerBearingBefore =
+                    PreferOnlineUiCache.shouldKeepPaintedOnAuthoritativeEmptyOnline(
+                        _state.value.contacts.size
+                    )
                 ensureSelfContactRow(userId, activeBag, gen)
+                if (gen != contactsLoadGeneration.get()) return
+                pruneUntrustedContactsAfterEnsureSelf(userId, partnerBearingBefore, gen)
                 if (gen != contactsLoadGeneration.get()) return
             }
             enrichContactDisplayNames(userId, gen)
@@ -4420,15 +4435,53 @@ class MainViewModel @Inject constructor(
             items.add(ContactItem(uid, provisional))
         }
         val ready = items.distinctBy { c -> c.userId.lowercase() }
+        lastAuthoritativeOnlineContactIds = ready.map { it.userId }
         // Shrink-guard inside reconcile keeps Tina when thin ⊆ rich.
         applyOnlineContactsToState(ready)
+        val partnerBearingBefore =
+            PreferOnlineUiCache.shouldKeepPaintedOnAuthoritativeEmptyOnline(
+                _state.value.contacts.size
+            )
         ensureSelfContactRow(userId, bagId, gen)
+        if (gen != contactsLoadGeneration.get()) return
+        pruneUntrustedContactsAfterEnsureSelf(userId, partnerBearingBefore, gen)
         if (gen != contactsLoadGeneration.get()) return
         enrichContactDisplayNames(userId, gen)
         if (gen != contactsLoadGeneration.get()) return
         persistContactsDiskAsap(userId)
         refreshUnreadBadges()
         if (_state.value.shareSheet.showAddPeople) rebuildShareContactPicker()
+    }
+
+    /** Drop planted/foreign rows after ensureSelf (PREFER_ONLINE_STALE_PLANT). */
+    private fun pruneUntrustedContactsAfterEnsureSelf(
+        userId: String,
+        partnerBearingPaintBeforeEnsureSelf: Boolean,
+        gen: Int
+    ) {
+        if (gen != contactsLoadGeneration.get()) return
+        val pruned = PreferOnlineUiCache.retainTrustedContactsAfterEnsureSelf(
+            contacts = _state.value.contacts,
+            selfId = userId,
+            authoritativeOnlineIds = lastAuthoritativeOnlineContactIds,
+            partnerBearingPaintBeforeEnsureSelf = partnerBearingPaintBeforeEnsureSelf,
+            idOf = { it.userId }
+        )
+        if (pruned.size == _state.value.contacts.size &&
+            pruned.map { it.userId.lowercase() } ==
+            _state.value.contacts.map { it.userId.lowercase() }
+        ) {
+            return
+        }
+        _state.update { cur ->
+            val proposed = "Contacts: ${pruned.size}"
+            val status = ForceStatusGuard.statusOrNull(
+                forceRunning = cur.forceRunning,
+                forcePreferred = SyncFlight.forcePreferred.get(),
+                proposed = proposed
+            ) ?: cur.status
+            cur.copy(contacts = pruned, status = status)
+        }
     }
 
     private suspend fun enrichContactDisplayNames(userId: String, gen: Int) {
