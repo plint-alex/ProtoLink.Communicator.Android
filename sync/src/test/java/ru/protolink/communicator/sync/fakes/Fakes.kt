@@ -57,7 +57,7 @@ class InMemoryFileSystem : LocalFileSystem {
 
     private fun k(root: String, rel: String) = "${root.trimEnd('/', '\\')}|${PathUtil.normalize(rel)}"
 
-    override fun snapshot(rootPath: String): List<FsEntry> {
+    override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> {
         val prefix = "${rootPath.trimEnd('/', '\\')}|"
         val fileRels = files.keys.filter { it.startsWith(prefix) }.map { it.removePrefix(prefix) }
         val dirRels = dirs.filter { it.startsWith(prefix) }.map { it.removePrefix(prefix) }.filter { it.isNotEmpty() }
@@ -65,7 +65,8 @@ class InMemoryFileSystem : LocalFileSystem {
         val result = mutableListOf<FsEntry>()
         for (rel in fileRels) {
             val bytes = files.getValue(prefix + rel)
-            result.add(FsEntry(rel, false, bytes.size.toLong(), ContentHashUtil.sha256Hex(bytes)))
+            val hash = if (computeContentHashes) ContentHashUtil.sha256Hex(bytes) else ""
+            result.add(FsEntry(rel, false, bytes.size.toLong(), hash))
         }
         for (rel in dirRels) {
             val size = fileRels.filter { it == rel || it.startsWith("$rel/") }

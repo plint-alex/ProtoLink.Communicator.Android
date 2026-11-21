@@ -1562,9 +1562,9 @@ class SyncEngineTest {
         val (store, innerFs, remote) = harness()
         var snapshots = 0
         val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
-            override fun snapshot(rootPath: String): List<FsEntry> {
+            override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> {
                 snapshots++
-                return innerFs.snapshot(rootPath)
+                return innerFs.snapshot(rootPath, computeContentHashes)
             }
         }
         remote.seedFolder("films", "cloud-root", "Films")
@@ -2122,9 +2122,9 @@ class SyncEngineTest {
         var snapshots = 0
         var lengthProbes = 0
         val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
-            override fun snapshot(rootPath: String): List<FsEntry> {
+            override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> {
                 snapshots++
-                return innerFs.snapshot(rootPath)
+                return innerFs.snapshot(rootPath, computeContentHashes)
             }
 
             override fun fileLengthBytes(rootPath: String, relativePath: String): Long? {
@@ -2156,15 +2156,126 @@ class SyncEngineTest {
         assertThat(snapshots).isAtMost(4)
     }
 
+    /**
+     * Win ApplyLocal reconcile: SnapshotFs(computeContentHashes: false).
+     * Live ≥1.0.101 residual: SAF always hashed whole MyNotesFolder before Api → sticky Uploading.
+     */
+    @Test
+    fun applyLocal_reconcile_snapshotSkipsContentHashes() = runTest {
+        val (store, innerFs, remote) = harness()
+        var hashedSnaps = 0
+        var sizeOnlySnaps = 0
+        val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
+            override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> {
+                if (computeContentHashes) hashedSnaps++ else sizeOnlySnaps++
+                return innerFs.snapshot(rootPath, computeContentHashes)
+            }
+        }
+        remote.seedFolder("keep-f", "cloud-root", "keep")
+        innerFs.createDirectory(root, "keep")
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "keep-f",
+                parentRemoteId = "cloud-root",
+                relativePath = "keep",
+                isFolder = true,
+                sizeBytes = 0
+            )
+        )
+        // Local-new folder must still upload (path presence — no hash needed).
+        innerFs.createDirectory(root, "at-sync-threeway-upload-test")
+
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        assertThat(remote.childrenOf("cloud-root").any {
+            it.name.equals("at-sync-threeway-upload-test", ignoreCase = true)
+        }).isTrue()
+        assertThat(sizeOnlySnaps).isAtLeast(1)
+        // Reconcile ApplyLocal must not request hashed snapshot.
+        assertThat(hashedSnaps).isEqualTo(0)
+    }
+
+    /**
+     * Win ApplyRemote.Updated: FileInfo.Length one path — not full snapshot per item.
+     * Live residual: per-Updated SafLocalFileSystem.snapshot re-starved large trees.
+     */
+    @Test
+    fun applyRemote_updated_usesFileLengthNotFullSnapshot() = runTest {
+        val (store, innerFs, remote) = harness()
+        var snapshots = 0
+        var lengthProbes = 0
+        val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
+            override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> {
+                snapshots++
+                return innerFs.snapshot(rootPath, computeContentHashes)
+            }
+
+            override fun fileLengthBytes(rootPath: String, relativePath: String): Long? {
+                lengthProbes++
+                return innerFs.fileLengthBytes(rootPath, relativePath)
+            }
+        }
+        val oldTime = java.time.Instant.parse("2026-01-01T00:00:00Z")
+        val newTime = java.time.Instant.parse("2026-06-01T00:00:00Z")
+        remote.seedFile("f1", "cloud-root", "note.txt", "server-new".toByteArray())
+        remote.get("f1")!!.updateTime = newTime
+        // Same size as local so Compare size path may miss; Updated safety net still runs.
+        innerFs.writeFile(root, "note.txt", "local-old!".toByteArray())
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "f1",
+                parentRemoteId = "cloud-root",
+                relativePath = "note.txt",
+                isFolder = false,
+                sizeBytes = 10,
+                contentHash = ContentHashUtil.sha256Hex("local-old!".toByteArray()),
+                remoteUpdateTime = oldTime
+            )
+        )
+
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        // Updated safety net must probe length, not N full snaps per item.
+        assertThat(lengthProbes).isAtLeast(1)
+        assertThat(snapshots).isAtMost(4)
+    }
+
+    /**
+     * Force upload: size-only snapshot then hash at readFile — first Api must not wait on
+     * whole-tree SAF SHA-256 (FORCE_UPLOAD_STUCK_NO_PROGRESS on e93e0fa5).
+     */
+    @Test
+    fun forcePush_snapshotSkipsContentHashes() = runTest {
+        val (store, innerFs, remote) = harness()
+        var hashedSnaps = 0
+        val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
+            override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> {
+                if (computeContentHashes) hashedSnaps++
+                return innerFs.snapshot(rootPath, computeContentHashes)
+            }
+        }
+        innerFs.writeFile(root, "upload-me.txt", "payload".toByteArray())
+
+        val count = SyncEngine(store, fs, remote).forcePushMapping(mapping)
+
+        assertThat(count).isEqualTo(1)
+        assertThat(hashedSnaps).isEqualTo(0)
+        assertThat(remote.childrenOf("cloud-root").any {
+            it.name.equals("upload-me.txt", ignoreCase = true)
+        }).isTrue()
+    }
+
     /** Bootstrap must not call full-tree snapshot once per remote item (O(n²) on polluted roots). */
     @Test
     fun bootstrap_doesNotSnapshotWholeTreePerRemoteItem() = runTest {
         val (store, innerFs, remote) = harness()
         var snapshots = 0
         val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
-            override fun snapshot(rootPath: String): List<FsEntry> {
+            override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> {
                 snapshots++
-                return innerFs.snapshot(rootPath)
+                return innerFs.snapshot(rootPath, computeContentHashes)
             }
         }
         remote.seedFolder("films-f", "cloud-root", "films")

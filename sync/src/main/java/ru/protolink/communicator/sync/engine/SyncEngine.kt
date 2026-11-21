@@ -441,7 +441,9 @@ class SyncEngine(
     }
 
     private fun recomputeFolderSizes(mapping: SyncMapping) {
-        val snap = fs.snapshot(mapping.localRootPath).associateBy { PathUtil.normalize(it.relativePath) }
+        // Size rollup only — Win SnapshotFs(computeContentHashes: false) for folder sizes.
+        val snap = fs.snapshot(mapping.localRootPath, computeContentHashes = false)
+            .associateBy { PathUtil.normalize(it.relativePath) }
         for (item in store.getAll(mapping.id).filter { it.isFolder }) {
             val fsSize = snap[PathUtil.normalize(item.relativePath)]?.sizeBytes ?: item.sizeBytes
             if (fsSize != item.sizeBytes) store.upsert(item.copy(sizeBytes = fsSize))
@@ -454,7 +456,8 @@ class SyncEngine(
         skipSizeUpdates: Boolean,
         remoteInMapping: List<RemoteChangeClassifier.RemoteLocated> = emptyList()
     ): Int {
-        val snap = fs.snapshot(mapping.localRootPath)
+        // Win ApplyLocal: reconcile → size/structure only; push → hash for same-size Updated.
+        val snap = fs.snapshot(mapping.localRootPath, computeContentHashes = !skipSizeUpdates)
         val meta = store.getAll(mapping.id)
         val changes = localClassifier.classify(snap, meta)
         var applied = 0
@@ -891,9 +894,9 @@ class SyncEngine(
                     if (c.meta.mappingId != mapping.id) continue
                     if (c.meta.isFolder) continue
                     if (dirty.contains(PathUtil.normalize(c.meta.relativePath))) continue
-                    val snap = fs.snapshot(mapping.localRootPath)
-                        .firstOrNull { PathUtil.normalize(it.relativePath) == PathUtil.normalize(c.meta.relativePath) }
-                    if (snap != null && snap.sizeBytes != c.meta.sizeBytes) continue
+                    // Win: FileInfo.Length one path — not full-tree snapshot per Updated item.
+                    val localLen = fs.fileLengthBytes(mapping.localRootPath, c.meta.relativePath)
+                    if (localLen != null && localLen != c.meta.sizeBytes) continue
                     val bytes = remote.downloadFile(c.remote.id) ?: continue
                     if (bytes.isEmpty()) continue
                     fs.writeFile(mapping.localRootPath, c.meta.relativePath, bytes)
@@ -1614,7 +1617,10 @@ class SyncEngine(
 
     /** Overwrite server with all local files; meta follows local. Returns files uploaded. */
     suspend fun forcePushMapping(mapping: SyncMapping): Int {
-        val snap = fs.snapshot(mapping.localRootPath)
+        // Size/structure first; hash each file at upload (readFile). Win SnapshotFs hashes via
+        // fast File IO — SAF openInputStream×whole MyNotesFolder before first Api was the
+        // FORCE_UPLOAD_STUCK_NO_PROGRESS residual (same decision table, SAF cost model only).
+        val snap = fs.snapshot(mapping.localRootPath, computeContentHashes = false)
             .sortedWith(compareBy({ it.relativePath.count { c -> c == '/' } }, { if (it.isFolder) 0 else 1 }))
         if (snap.isEmpty()) {
             throw SyncException(
@@ -1624,6 +1630,7 @@ class SyncEngine(
         var files = 0
         val siblingCache = mutableMapOf<String, List<RemoteEntry>>()
         for (entry in snap) {
+            coroutineContext.ensureActive()
             val path = PathUtil.normalize(entry.relativePath)
             val parentPath = PathUtil.parentOf(path)
             val parentId = resolveParentId(mapping, parentPath) ?: mapping.cloudFolderId

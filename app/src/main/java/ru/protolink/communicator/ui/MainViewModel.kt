@@ -106,12 +106,14 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MultipartBody
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -3654,19 +3656,24 @@ class MainViewModel @Inject constructor(
             if (mappings.isEmpty()) return@launch
             if (_state.value.syncing || !SyncFlight.mutex.tryLock()) return@launch
             _state.update { it.copy(status = "Uploading local changes…", syncing = true) }
+            var budgetExpired = false
             try {
                 val applied = withContext(Dispatchers.IO) {
-                    val engineMappings = mappings.map {
-                        SyncMapping(
-                            id = it.cloudFolderId.replace("-", ""),
-                            cloudFolderId = it.cloudFolderId,
-                            localRootPath = it.localPath,
-                            cloudFolderName = it.cloudFolderName
-                        )
+                    // Win CloudMappedSyncCoordinator.AutoPushBudget — cancel hung SAF-hash push
+                    // so deferred full Sync can reclaim the lane (sticky Uploading residual).
+                    withTimeout(AUTO_PUSH_BUDGET_MS) {
+                        val engineMappings = mappings.map {
+                            SyncMapping(
+                                id = it.cloudFolderId.replace("-", ""),
+                                cloudFolderId = it.cloudFolderId,
+                                localRootPath = it.localPath,
+                                cloudFolderName = it.cloudFolderName
+                            )
+                        }
+                        SyncFlight.runDeferringToForce {
+                            SyncEngine(metadataStore, localFs, remoteCloud).pushLocalChanges(engineMappings)
+                        } ?: 0
                     }
-                    SyncFlight.runDeferringToForce {
-                        SyncEngine(metadataStore, localFs, remoteCloud).pushLocalChanges(engineMappings)
-                    } ?: 0
                 }
                 if (applied > 0) {
                     notifyOtherDevices()
@@ -3705,6 +3712,13 @@ class MainViewModel @Inject constructor(
                         )
                     }
                 }
+            } catch (e: TimeoutCancellationException) {
+                budgetExpired = true
+                Log.w(
+                    "ProtoLinkSync",
+                    "local push AutoPushBudget (${AUTO_PUSH_BUDGET_MS}ms) expired — releasing lane"
+                )
+                _state.update { it.copy(syncing = false, mappings = mappingStore.load()) }
             } catch (e: CancellationException) {
                 _state.update { it.copy(syncing = false) }
                 throw e
@@ -3714,7 +3728,16 @@ class MainViewModel @Inject constructor(
             } finally {
                 if (SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
             }
+            // Budget cancel leaves deferredFull for Sync chrome (Sync complete) to run.
+            if (budgetExpired && SyncFlight.deferredFull.get() && !SyncFlight.forcePreferred.get()) {
+                requestFullSync()
+            }
         }
+    }
+
+    private companion object {
+        /** Win CloudMappedSyncCoordinator.AutoPushBudget. */
+        const val AUTO_PUSH_BUDGET_MS = 60_000L
     }
 
     private suspend fun notifyOtherDevices() {

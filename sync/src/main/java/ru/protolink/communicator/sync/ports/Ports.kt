@@ -18,7 +18,13 @@ interface MetadataStore {
 }
 
 interface LocalFileSystem {
-    fun snapshot(rootPath: String): List<FsEntry>
+    /**
+     * Tree snapshot under [rootPath].
+     * Win SnapshotFs([computeContentHashes]): reconcile ApplyLocal uses false (size/structure
+     * only — content already verified in ApplyCompare); interval push uses true so same-size
+     * edits still classify as Updated. Default true preserves Force/push callers.
+     */
+    fun snapshot(rootPath: String, computeContentHashes: Boolean = true): List<FsEntry>
     /**
      * Immediate children only (no recursion, no content hash). Empty [relativePath] = root.
      * Force uses this for early per-parent ghost prune without a full hashed snapshot.

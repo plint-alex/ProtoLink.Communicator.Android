@@ -259,7 +259,7 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
             ?.takeIf { it.exists() }
     }
 
-    override fun snapshot(rootPath: String): List<FsEntry> {
+    override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> {
         val tree = treeUri(rootPath)
         // Primary trees: flush MediaProvider so DocumentsContract sees adb mkdir (1.0.99 miss).
         SafPrimaryPath.flushListing(context, tree)
@@ -277,7 +277,8 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                 SafTreeLister.findIndexHtmlByGuess(context, tree, folderDocId)?.let { indexUri ->
                     val name = "index.html"
                     val childRel = if (rel.isEmpty()) name.lowercase() else "$rel/${name.lowercase()}"
-                    out.add(FsEntry(childRel, false, uriByteLength(indexUri), uriContentHash(indexUri)))
+                    val hash = if (computeContentHashes) uriContentHash(indexUri) else ""
+                    out.add(FsEntry(childRel, false, uriByteLength(indexUri), hash))
                     seenNames.add(name)
                 }
             }
@@ -288,12 +289,13 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                     out.add(FsEntry(childRel, true, size))
                     walk(child.documentId, childRel)
                 } else {
-                    out.add(FsEntry(childRel, false, uriByteLength(child.uri), uriContentHash(child.uri)))
+                    val hash = if (computeContentHashes) uriContentHash(child.uri) else ""
+                    out.add(FsEntry(childRel, false, uriByteLength(child.uri), hash))
                 }
             }
             // Shell/MediaProvider creates under primary: can lag DocumentsContract — merge File kids
             // so ApplyLocal sees adb mkdir fixtures (Win File.Exists parity).
-            mergePrimaryFileChildren(tree, rel, seenNames, out)
+            mergePrimaryFileChildren(tree, rel, seenNames, out, computeContentHashes)
         }
         walk(SafTreeLister.treeDocumentId(tree), "")
         return out
@@ -308,10 +310,14 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
         tree: Uri,
         rel: String,
         seenNames: MutableSet<String>,
-        out: MutableList<FsEntry>
+        out: MutableList<FsEntry>,
+        computeContentHashes: Boolean
     ) {
         val dir = SafPrimaryPath.tryResolveExisting(tree, rel) ?: return
         if (!dir.isDirectory) return
+        // Per-dir flush: root-only flush left nested adb mkdir invisible to DocumentsContract
+        // until File merge — still flush so MediaScanner catches up for later SAF writes.
+        SafPrimaryPath.flushListing(context, tree, rel)
         val names = SafPrimaryPath.listChildNames(dir)
         if (names.isEmpty()) return
         for (rawName in names) {
@@ -327,22 +333,26 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
             }.getOrDefault(false)
             if (isDir && !f.isFile) {
                 out.add(FsEntry(childRel, true, if (f.isDirectory) sumFilesIo(f) else 0L))
-                mergePrimaryFileChildren(tree, childRel, mutableSetOf(), out)
+                mergePrimaryFileChildren(tree, childRel, mutableSetOf(), out, computeContentHashes)
             } else if (f.isFile) {
-                val bytes = runCatching { f.readBytes() }.getOrNull() ?: continue
-                out.add(
-                    FsEntry(
-                        childRel,
-                        false,
-                        bytes.size.toLong(),
-                        ContentHashUtil.sha256Hex(bytes)
+                if (computeContentHashes) {
+                    val bytes = runCatching { f.readBytes() }.getOrNull() ?: continue
+                    out.add(
+                        FsEntry(
+                            childRel,
+                            false,
+                            bytes.size.toLong(),
+                            ContentHashUtil.sha256Hex(bytes)
+                        )
                     )
-                )
+                } else {
+                    out.add(FsEntry(childRel, false, f.length(), ""))
+                }
             } else {
                 // Name from Os.listdir but File can't read — still record as folder stub so
                 // ApplyLocal Added can create the Api entity; nested merge may fill later.
                 out.add(FsEntry(childRel, true, 0L))
-                mergePrimaryFileChildren(tree, childRel, mutableSetOf(), out)
+                mergePrimaryFileChildren(tree, childRel, mutableSetOf(), out, computeContentHashes)
             }
         }
     }
