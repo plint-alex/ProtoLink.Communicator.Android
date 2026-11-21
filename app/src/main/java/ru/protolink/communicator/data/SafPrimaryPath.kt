@@ -1,8 +1,15 @@
 package ru.protolink.communicator.data
 
+import android.content.Context
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.provider.DocumentsContract
+import android.util.Log
 import java.io.File
+import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.stream.Collectors
 
 /**
  * Resolve primary-external SAF tree URIs to java.io.File paths.
@@ -10,10 +17,16 @@ import java.io.File
  * DocumentsContract children queries can lag behind shell/MediaProvider creates under the same
  * tree (tester adb mkdir fixtures). Sync snapshot/read must still see those paths so ApplyLocal
  * can upload (Win File.Exists parity on the mapped root).
+ *
+ * Under targetSdk 34 without MANAGE_EXTERNAL_STORAGE, [File.listFiles] on Documents/ often returns
+ * null even when the path exists — prefer [listChildNames] (Os.listdir) + [flushListing] before SAF
+ * re-query. This is a SAF FS peculiarity only — not a second SyncEngine path.
  */
 object SafPrimaryPath {
+    private const val TAG = "ProtoLinkSaf"
     private const val EXTERNAL_AUTHORITY = "com.android.externalstorage.documents"
     private const val PRIMARY_PREFIX = "primary:"
+    private const val FLUSH_WAIT_MS = 1_500L
 
     /** Absolute File for [treeUri] + optional relative path, or null when not a primary tree. */
     fun tryResolve(treeUri: Uri, relativePath: String = ""): File? {
@@ -34,4 +47,60 @@ object SafPrimaryPath {
 
     fun tryResolveExisting(treeUri: Uri, relativePath: String = ""): File? =
         tryResolve(treeUri, relativePath)?.takeIf { it.exists() }
+
+    /**
+     * Child names under a primary directory. Uses [File.list] first; on scoped-storage null,
+     * [Files.list] then reflective `android.system.Os.listdir` so adb mkdir fixtures still
+     * enter the SAF File merge (Win File.Exists discovery parity).
+     */
+    fun listChildNames(dir: File): List<String> {
+        dir.list()?.let { return it.toList() }
+        val nio = runCatching {
+            Files.list(dir.toPath()).use { stream ->
+                stream.map { it.fileName.toString() }.collect(Collectors.toList())
+            }
+        }.getOrElse { e ->
+            Log.d(TAG, "Files.list miss ${dir.absolutePath}: ${e.message}")
+            null
+        }
+        if (nio != null) return nio
+        return runCatching {
+            val os = Class.forName("android.system.Os")
+            val method = os.getMethod("listdir", String::class.java)
+            @Suppress("UNCHECKED_CAST")
+            (method.invoke(null, dir.absolutePath) as? Array<String>)?.toList().orEmpty()
+        }.getOrElse { e ->
+            Log.d(TAG, "Os.listdir miss ${dir.absolutePath}: ${e.message}")
+            emptyList()
+        }
+    }
+
+    /**
+     * Nudge MediaProvider + DocumentsContract so ExternalStorageProvider re-lists shell creates.
+     * Best-effort; failures must not abort Sync.
+     */
+    fun flushListing(context: Context, treeUri: Uri, relativePath: String = "") {
+        val dir = tryResolve(treeUri, relativePath) ?: return
+        runCatching {
+            val rootId = DocumentsContract.getTreeDocumentId(treeUri)
+            val rel = relativePath.replace('\\', '/').trim('/')
+            val parentId = if (rel.isEmpty()) rootId else "$rootId/$rel"
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentId)
+            context.contentResolver.notifyChange(childrenUri, null)
+        }.onFailure { e ->
+            Log.d(TAG, "notifyChange soft-fail: ${e.message}")
+        }
+        if (!dir.exists()) return
+        val latch = CountDownLatch(1)
+        runCatching {
+            MediaScannerConnection.scanFile(
+                context,
+                arrayOf(dir.absolutePath),
+                null
+            ) { _, _ -> latch.countDown() }
+        }.onFailure {
+            latch.countDown()
+        }
+        runCatching { latch.await(FLUSH_WAIT_MS, TimeUnit.MILLISECONDS) }
+    }
 }

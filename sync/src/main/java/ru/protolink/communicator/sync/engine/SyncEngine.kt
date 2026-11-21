@@ -31,6 +31,12 @@ class SyncEngine(
 ) {
     companion object {
         /**
+         * Per-item getFile budget (Win RemoteDownloadBudget 45s). One hung download must not
+         * keep ApplyCompare / ApplyRemote open past the daily-use LastSync window.
+         */
+        var remoteDownloadBudgetMs: Long = 45_000L
+
+        /**
          * Parallel GetEntities for folder walk. Align with Windows
          * GetEntitiesThrottlingHandler.SyncLaneConcurrency (24). Must pair with OkHttp
          * maxRequestsPerHost ≥ this (default 5 capped live Force to ~140–180 GE/min).
@@ -192,8 +198,8 @@ class SyncEngine(
         allRemote: List<RemoteChangeClassifier.RemoteLocated>,
         dirty: MutableSet<String>
     ): Pair<Int, Int> {
-        val snap = fs.snapshot(mapping.localRootPath)
-            .associateBy { PathUtil.normalize(it.relativePath) }
+        // Win ApplyCompare: do not SnapshotFs here — per-meta Exists + Length only.
+        // Full-tree snapshot on ~10k MyNotesFolder starved ApplyRemote (Api-only download miss).
         val remoteById = allRemote.associateBy { it.entry.id }
         var writes = 0
         var reads = 0
@@ -208,11 +214,7 @@ class SyncEngine(
             if (PathUtil.normalize(located.relativePath) != PathUtil.normalize(meta.relativePath)) continue
 
             val path = PathUtil.normalize(meta.relativePath)
-            val localEntry = snap[path]
-            val localSize = when {
-                localEntry == null || !fs.exists(mapping.localRootPath, path) -> null
-                else -> localEntry.sizeBytes
-            }
+            val localSize = fs.fileLengthBytes(mapping.localRootPath, path)
 
             // Missing local while meta exists = user deleted (or rename). Let structural
             // local phase handle Removed/Renamed — do not re-download here.

@@ -2112,6 +2112,50 @@ class SyncEngineTest {
         assertThat(store.getAll("m1").any { !it.isFolder && it.remoteId == "films-i" }).isTrue()
     }
 
+    /**
+     * Win ApplyCompare: per-meta Exists+Length only — no full-tree snapshot during compare.
+     * Live 1.0.99 residual: Compare snapshot starved ApplyRemote (DOWNLOAD_API_ONLY_NOT_ON_SAF).
+     */
+    @Test
+    fun applyCompare_doesNotFullSnapshot_usesFileLength() = runTest {
+        val (store, innerFs, remote) = harness()
+        var snapshots = 0
+        var lengthProbes = 0
+        val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
+            override fun snapshot(rootPath: String): List<FsEntry> {
+                snapshots++
+                return innerFs.snapshot(rootPath)
+            }
+
+            override fun fileLengthBytes(rootPath: String, relativePath: String): Long? {
+                lengthProbes++
+                return innerFs.fileLengthBytes(rootPath, relativePath)
+            }
+        }
+        remote.seedFile("f1", "cloud-root", "keep.txt", "same".toByteArray())
+        innerFs.writeFile(root, "keep.txt", "same".toByteArray())
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "f1",
+                parentRemoteId = "cloud-root",
+                relativePath = "keep.txt",
+                isFolder = false,
+                sizeBytes = 4,
+                contentHash = ContentHashUtil.sha256Hex("same".toByteArray()),
+                remoteUpdateTime = java.time.Instant.parse("2026-01-01T00:00:00Z")
+            )
+        )
+        remote.seedFolder("dl-f", "cloud-root", "at-sync-threeway-download-test")
+
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        assertThat(fs.exists(root, "at-sync-threeway-download-test")).isTrue()
+        assertThat(lengthProbes).isAtLeast(1)
+        // Local phase still snapshots once; Compare must not add another full walk for meta files.
+        assertThat(snapshots).isAtMost(4)
+    }
+
     /** Bootstrap must not call full-tree snapshot once per remote item (O(n²) on polluted roots). */
     @Test
     fun bootstrap_doesNotSnapshotWholeTreePerRemoteItem() = runTest {

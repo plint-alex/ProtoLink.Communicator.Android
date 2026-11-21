@@ -16,6 +16,9 @@ package ru.protolink.communicator.syncadapt
  * Live 1.0.99 three-way Sync FAIL: listing wrote "Cloud loaded" while syncing=true (mutex held /
  * Sync button disabled) so tester Sync taps looked idle and never coalesced. Guard [syncing]
  * the same way for Cloud loaded / Contacts writers — Sync banner stays until the pass ends.
+ *
+ * Live 1.0.101 reverify residual: Contacts:/messages/setStatusUnlessForce still omitted syncing=
+ * → idle "Contacts: 2" during Sync. All non-Force status writers must pass syncing=.
  */
 object ForceStatusGuard {
     /** True when Force (or conflict resolve using the Force lane) owns the status line. */

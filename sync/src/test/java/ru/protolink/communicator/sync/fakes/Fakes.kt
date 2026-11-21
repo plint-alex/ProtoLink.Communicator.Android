@@ -156,6 +156,12 @@ class InMemoryFileSystem : LocalFileSystem {
         return files.containsKey(key) || dirs.contains(key)
     }
 
+    override fun fileLengthBytes(rootPath: String, relativePath: String): Long? {
+        val key = k(rootPath, relativePath)
+        if (dirs.contains(key)) return null
+        return files[key]?.size?.toLong()
+    }
+
     fun seedRoot(rootPath: String) {
         // root itself is implicit
     }

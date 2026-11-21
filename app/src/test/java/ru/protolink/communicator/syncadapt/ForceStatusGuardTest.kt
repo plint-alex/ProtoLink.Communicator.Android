@@ -112,4 +112,17 @@ class ForceStatusGuardTest {
             )
         ).isEqualTo("Cloud loaded")
     }
+
+    @Test
+    fun statusOrNull_preservesSyncingOverContacts() {
+        // Live 1.0.101: Contacts:2 overwrote Syncing… when syncing= omitted.
+        assertThat(
+            ForceStatusGuard.statusOrNull(
+                forceRunning = false,
+                forcePreferred = false,
+                proposed = "Contacts: 2",
+                syncing = true
+            )
+        ).isNull()
+    }
 }

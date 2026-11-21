@@ -30,6 +30,17 @@ interface LocalFileSystem {
     fun delete(rootPath: String, relativePath: String, isFolder: Boolean)
     fun move(rootPath: String, fromRelative: String, toRelative: String, isFolder: Boolean)
     fun exists(rootPath: String, relativePath: String): Boolean
+
+    /**
+     * Byte length of a local file, or null if missing / not a file.
+     * Win ApplyCompare uses File.Exists + FileInfo.Length — not a full-tree snapshot.
+     * Default reads bytes (fine for unit fakes); production SAF overrides with cheap length.
+     */
+    fun fileLengthBytes(rootPath: String, relativePath: String): Long? =
+        runCatching {
+            if (!exists(rootPath, relativePath)) return null
+            readFile(rootPath, relativePath).size.toLong()
+        }.getOrNull()
 }
 
 interface RemoteCloud {

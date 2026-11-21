@@ -2,14 +2,20 @@ package ru.protolink.communicator.data
 
 import android.net.Uri
 import com.google.common.truth.Truth.assertThat
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
 class SafPrimaryPathTest {
+
+    @get:Rule
+    val tmp = TemporaryFolder()
 
     @Test
     fun resolve_primaryDocumentsTree_toEmulatedPath() {
@@ -33,5 +39,23 @@ class SafPrimaryPathTest {
     fun resolve_nonPrimary_returnsNull() {
         val tree = Uri.parse("content://com.android.externalstorage.documents/tree/ABCD-EFGH%3ANotes")
         assertThat(SafPrimaryPath.tryResolve(tree)).isNull()
+    }
+
+    @Test
+    fun listChildNames_seesNestedAdbStyleFixture() {
+        // Win File.Exists parity for shell creates: merge must not depend on listFiles alone.
+        val root = tmp.newFolder("mynotesfolder")
+        val fixture = java.io.File(root, "at-sync-threeway-upload-test-20261121").also { it.mkdirs() }
+        java.io.File(fixture, "readme-test.txt").writeText("hello")
+        val names = SafPrimaryPath.listChildNames(root)
+        assertThat(names.map { it.lowercase() }).contains("at-sync-threeway-upload-test-20261121")
+        assertThat(SafPrimaryPath.listChildNames(fixture).map { it.lowercase() })
+            .contains("readme-test.txt")
+    }
+
+    @Test
+    fun flushListing_nonPrimary_isNoOp() {
+        val tree = Uri.parse("content://com.android.externalstorage.documents/tree/ABCD-EFGH%3ANotes")
+        SafPrimaryPath.flushListing(RuntimeEnvironment.getApplication(), tree)
     }
 }

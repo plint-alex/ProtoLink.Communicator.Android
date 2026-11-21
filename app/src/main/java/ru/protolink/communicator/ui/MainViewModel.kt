@@ -1263,7 +1263,8 @@ class MainViewModel @Inject constructor(
                         val status = ForceStatusGuard.statusOrNull(
                             forceRunning = cur.forceRunning,
                             forcePreferred = SyncFlight.forcePreferred.get(),
-                            proposed = proposed
+                            proposed = proposed,
+                            syncing = cur.syncing
                         ) ?: cur.status
                         cur.copy(status = status)
                     }
@@ -1281,7 +1282,8 @@ class MainViewModel @Inject constructor(
                         val status = ForceStatusGuard.statusOrNull(
                             forceRunning = cur.forceRunning,
                             forcePreferred = SyncFlight.forcePreferred.get(),
-                            proposed = proposed
+                            proposed = proposed,
+                            syncing = cur.syncing
                         ) ?: cur.status
                         cur.copy(status = status)
                     }
@@ -1294,7 +1296,8 @@ class MainViewModel @Inject constructor(
                 val status = ForceStatusGuard.statusOrNull(
                     forceRunning = cur.forceRunning,
                     forcePreferred = SyncFlight.forcePreferred.get(),
-                    proposed = proposed
+                    proposed = proposed,
+                    syncing = cur.syncing
                 ) ?: cur.status
                 cur.copy(status = status)
             }
@@ -3406,15 +3409,20 @@ class MainViewModel @Inject constructor(
 
     /** Force (or conflict resolve) owns the status banner — do not clobber with coalesce text. */
     private fun forceOwnsStatus(): Boolean =
-        ForceStatusGuard.ownsStatus(_state.value.forceRunning, SyncFlight.forcePreferred.get())
+        ForceStatusGuard.ownsStatus(
+            _state.value.forceRunning,
+            SyncFlight.forcePreferred.get(),
+            syncing = _state.value.syncing
+        )
 
-    /** Apply [status] only when Force does not own the banner (1.0.66 FORCE_NO_PROGRESS). */
+    /** Apply [status] only when Force/Sync does not own the banner (1.0.66 FORCE_NO_PROGRESS). */
     private fun setStatusUnlessForce(status: String) {
         _state.update { cur ->
             val next = ForceStatusGuard.statusOrNull(
                 forceRunning = cur.forceRunning,
                 forcePreferred = SyncFlight.forcePreferred.get(),
-                proposed = status
+                proposed = status,
+                syncing = cur.syncing
             ) ?: return@update cur
             cur.copy(status = next)
         }
@@ -3495,7 +3503,12 @@ class MainViewModel @Inject constructor(
                 }
             } catch (e: CancellationException) {
                 _state.update { cur ->
-                    if (ForceStatusGuard.ownsStatus(cur.forceRunning, SyncFlight.forcePreferred.get())) {
+                    if (ForceStatusGuard.ownsStatus(
+                            cur.forceRunning,
+                            SyncFlight.forcePreferred.get(),
+                            syncing = cur.syncing
+                        )
+                    ) {
                         cur.copy(syncing = false)
                     } else {
                         cur.copy(syncing = false, status = "Sync cancelled")
@@ -3524,7 +3537,8 @@ class MainViewModel @Inject constructor(
                 val status = ForceStatusGuard.statusOrNull(
                     forceRunning = cur.forceRunning,
                     forcePreferred = SyncFlight.forcePreferred.get(),
-                    proposed = proposed
+                    proposed = proposed,
+                    syncing = cur.syncing
                 ) ?: cur.status
                 cur.copy(
                     status = status,
@@ -3538,7 +3552,8 @@ class MainViewModel @Inject constructor(
             val status = ForceStatusGuard.statusOrNull(
                 forceRunning = cur.forceRunning,
                 forcePreferred = SyncFlight.forcePreferred.get(),
-                proposed = "Sync failed: $detail"
+                proposed = "Sync failed: $detail",
+                syncing = cur.syncing
             ) ?: cur.status
             cur.copy(
                 status = status,
@@ -4136,7 +4151,8 @@ class MainViewModel @Inject constructor(
                     val status = ForceStatusGuard.statusOrNull(
                         forceRunning = cur.forceRunning,
                         forcePreferred = SyncFlight.forcePreferred.get(),
-                        proposed = proposed
+                        proposed = proposed,
+                        syncing = cur.syncing
                     ) ?: cur.status
                     cur.copy(isContactsLoading = false, status = status)
                 }
@@ -4174,7 +4190,8 @@ class MainViewModel @Inject constructor(
                     val status = ForceStatusGuard.statusOrNull(
                         forceRunning = cur.forceRunning,
                         forcePreferred = SyncFlight.forcePreferred.get(),
-                        proposed = proposed
+                        proposed = proposed,
+                        syncing = cur.syncing
                     ) ?: cur.status
                     cur.copy(
                         contacts = if (cur.contacts.isEmpty()) emptyList() else cur.contacts,
@@ -4249,7 +4266,8 @@ class MainViewModel @Inject constructor(
                 val status = ForceStatusGuard.statusOrNull(
                     forceRunning = cur.forceRunning,
                     forcePreferred = SyncFlight.forcePreferred.get(),
-                    proposed = proposed
+                    proposed = proposed,
+                    syncing = cur.syncing
                 ) ?: cur.status
                 cur.copy(status = status, isContactsLoading = false)
             }
@@ -4332,7 +4350,8 @@ class MainViewModel @Inject constructor(
             val status = ForceStatusGuard.statusOrNull(
                 forceRunning = cur.forceRunning,
                 forcePreferred = SyncFlight.forcePreferred.get(),
-                proposed = proposed
+                proposed = proposed,
+                syncing = cur.syncing
             ) ?: cur.status
             cur.copy(contacts = reconciled, status = status, isContactsLoading = false)
         }
@@ -4404,7 +4423,8 @@ class MainViewModel @Inject constructor(
                     val status = ForceStatusGuard.statusOrNull(
                         forceRunning = cur.forceRunning,
                         forcePreferred = SyncFlight.forcePreferred.get(),
-                        proposed = proposed
+                        proposed = proposed,
+                        syncing = cur.syncing
                     ) ?: cur.status
                     cur.copy(status = status)
                 }
@@ -4478,7 +4498,8 @@ class MainViewModel @Inject constructor(
             val status = ForceStatusGuard.statusOrNull(
                 forceRunning = cur.forceRunning,
                 forcePreferred = SyncFlight.forcePreferred.get(),
-                proposed = proposed
+                proposed = proposed,
+                syncing = cur.syncing
             ) ?: cur.status
             cur.copy(contacts = pruned, status = status)
         }
@@ -4521,7 +4542,8 @@ class MainViewModel @Inject constructor(
             val status = ForceStatusGuard.statusOrNull(
                 forceRunning = s.forceRunning,
                 forcePreferred = SyncFlight.forcePreferred.get(),
-                proposed = proposed
+                proposed = proposed,
+                syncing = s.syncing
             ) ?: s.status
             s.copy(
                 contacts = enriched.map { e ->
@@ -4762,7 +4784,8 @@ class MainViewModel @Inject constructor(
                             val status = ForceStatusGuard.statusOrNull(
                                 forceRunning = cur.forceRunning,
                                 forcePreferred = SyncFlight.forcePreferred.get(),
-                                proposed = proposed
+                                proposed = proposed,
+                                syncing = cur.syncing
                             ) ?: cur.status
                             cur.copy(messages = merged, status = status)
                         }
@@ -4780,7 +4803,8 @@ class MainViewModel @Inject constructor(
                             val status = ForceStatusGuard.statusOrNull(
                                 forceRunning = cur.forceRunning,
                                 forcePreferred = SyncFlight.forcePreferred.get(),
-                                proposed = proposed
+                                proposed = proposed,
+                                syncing = cur.syncing
                             ) ?: cur.status
                             cur.copy(status = status)
                         }
@@ -4792,7 +4816,8 @@ class MainViewModel @Inject constructor(
                             val status = ForceStatusGuard.statusOrNull(
                                 forceRunning = cur.forceRunning,
                                 forcePreferred = SyncFlight.forcePreferred.get(),
-                                proposed = proposed
+                                proposed = proposed,
+                                syncing = cur.syncing
                             ) ?: cur.status
                             cur.copy(status = status)
                         }
@@ -5552,7 +5577,8 @@ fun setNotesRoot(uri: String) {
             val status = ForceStatusGuard.statusOrNull(
                 forceRunning = cur.forceRunning,
                 forcePreferred = SyncFlight.forcePreferred.get(),
-                proposed = treeStatus
+                proposed = treeStatus,
+                syncing = cur.syncing
             ) ?: cur.status
             cur.copy(
                 notesExpandedIds = expanded,

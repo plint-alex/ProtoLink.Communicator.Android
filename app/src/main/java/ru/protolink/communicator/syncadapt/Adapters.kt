@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
+import kotlinx.coroutines.withTimeoutOrNull
 import ru.protolink.communicator.data.CloudCodes
 import ru.protolink.communicator.data.NotesTreeBuilder
 import ru.protolink.communicator.data.SafChildResolve
@@ -19,6 +20,7 @@ import ru.protolink.communicator.data.api.ProtoLinkApi
 import ru.protolink.communicator.data.api.RemoveParentRequest
 import ru.protolink.communicator.sync.engine.ContentHashUtil
 import ru.protolink.communicator.sync.engine.PathUtil
+import ru.protolink.communicator.sync.engine.SyncEngine
 import ru.protolink.communicator.sync.model.FsEntry
 import ru.protolink.communicator.sync.model.RemoteEntry
 import ru.protolink.communicator.sync.ports.LocalFileSystem
@@ -162,9 +164,12 @@ class ApiRemoteCloud(private val api: ProtoLinkApi) : RemoteCloud {
     }
 
     override suspend fun downloadFile(entityId: String): ByteArray? {
-        val resp = api.getFile(entityId)
-        if (!resp.isSuccessful) return null
-        return resp.body()?.bytes()
+        // Win RemoteDownloadBudget 45s — soft-fail null on timeout (do not abort reconcile).
+        return withTimeoutOrNull(SyncEngine.remoteDownloadBudgetMs) {
+            val resp = api.getFile(entityId)
+            if (!resp.isSuccessful) return@withTimeoutOrNull null
+            resp.body()?.bytes()
+        }
     }
 
     override suspend fun fileSize(entityId: String): Long? {
@@ -256,6 +261,8 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
 
     override fun snapshot(rootPath: String): List<FsEntry> {
         val tree = treeUri(rootPath)
+        // Primary trees: flush MediaProvider so DocumentsContract sees adb mkdir (1.0.99 miss).
+        SafPrimaryPath.flushListing(context, tree)
         val out = mutableListOf<FsEntry>()
         fun walk(folderDocId: String, rel: String) {
             val entries = SafTreeLister.listChildren(context, tree, folderDocId)
@@ -293,8 +300,9 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
     }
 
     /**
-     * Append java.io.File children missing from DocumentsContract listing for primary trees.
-     * Recurses into File-only folders (no SAF doc id) so nested adb fixtures are snapshotted.
+     * Append primary-tree children missing from DocumentsContract listing.
+     * Uses [SafPrimaryPath.listChildNames] (File.list / Os.listdir) so scoped-storage null
+     * listFiles still surfaces adb mkdir fixtures. Recurses into File-only folders.
      */
     private fun mergePrimaryFileChildren(
         tree: Uri,
@@ -304,16 +312,23 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
     ) {
         val dir = SafPrimaryPath.tryResolveExisting(tree, rel) ?: return
         if (!dir.isDirectory) return
-        val kids = dir.listFiles() ?: return
-        for (f in kids) {
-            val nameKey = f.name.lowercase()
+        val names = SafPrimaryPath.listChildNames(dir)
+        if (names.isEmpty()) return
+        for (rawName in names) {
+            if (rawName == "." || rawName == "..") continue
+            val nameKey = rawName.lowercase()
             if (nameKey in seenNames) continue
             seenNames.add(nameKey)
+            val f = File(dir, rawName)
             val childRel = if (rel.isEmpty()) nameKey else "$rel/$nameKey"
-            if (f.isDirectory) {
-                out.add(FsEntry(childRel, true, sumFilesIo(f)))
+            val isDir = f.isDirectory || runCatching {
+                // Os.listdir may return a name while File metadata is briefly stale.
+                SafPrimaryPath.listChildNames(f).isNotEmpty() && !f.isFile
+            }.getOrDefault(false)
+            if (isDir && !f.isFile) {
+                out.add(FsEntry(childRel, true, if (f.isDirectory) sumFilesIo(f) else 0L))
                 mergePrimaryFileChildren(tree, childRel, mutableSetOf(), out)
-            } else {
+            } else if (f.isFile) {
                 val bytes = runCatching { f.readBytes() }.getOrNull() ?: continue
                 out.add(
                     FsEntry(
@@ -323,6 +338,11 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                         ContentHashUtil.sha256Hex(bytes)
                     )
                 )
+            } else {
+                // Name from Os.listdir but File can't read — still record as folder stub so
+                // ApplyLocal Added can create the Api entity; nested merge may fill later.
+                out.add(FsEntry(childRel, true, 0L))
+                mergePrimaryFileChildren(tree, childRel, mutableSetOf(), out)
             }
         }
     }
@@ -360,6 +380,7 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
     override fun listImmediate(rootPath: String, relativePath: String): List<FsEntry> {
         val tree = treeUri(rootPath)
         val parentNorm = relativePath.replace('\\', '/').trim('/')
+        SafPrimaryPath.flushListing(context, tree, parentNorm)
         val parentId = if (parentNorm.isEmpty()) {
             SafTreeLister.treeDocumentId(tree)
         } else {
@@ -378,15 +399,17 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
         val fromFile = mutableListOf<FsEntry>()
         val dir = SafPrimaryPath.tryResolveExisting(tree, parentNorm)
         if (dir != null && dir.isDirectory) {
-            for (f in dir.listFiles().orEmpty()) {
-                val key = f.name.lowercase()
+            for (rawName in SafPrimaryPath.listChildNames(dir)) {
+                if (rawName == "." || rawName == "..") continue
+                val key = rawName.lowercase()
                 if (key in seen) continue
                 seen.add(key)
-                val childRel = if (parentNorm.isEmpty()) f.name else "$parentNorm/${f.name}"
+                val f = File(dir, rawName)
+                val childRel = if (parentNorm.isEmpty()) rawName else "$parentNorm/$rawName"
                 fromFile.add(
                     FsEntry(
                         relativePath = childRel.replace('\\', '/'),
-                        isFolder = f.isDirectory,
+                        isFolder = f.isDirectory || !f.isFile,
                         sizeBytes = 0L,
                         contentHash = ""
                     )
@@ -603,6 +626,20 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
             val uri = SafTreeLister.documentUri(tree, NotesTreeBuilder.folderDocumentId(tree, n))
             context.contentResolver.openInputStream(uri)?.use { true } ?: false
         }.getOrDefault(false)
+
+    override fun fileLengthBytes(rootPath: String, relativePath: String): Long? =
+        runCatching {
+            val n = relativePath.replace('\\', '/').trim('/')
+            val found = find(rootPath, n)
+            if (found != null) {
+                if (found.isDirectory) return@runCatching null
+                return@runCatching uriByteLength(found.uri)
+            }
+            val tree = treeUri(rootPath)
+            val file = SafPrimaryPath.tryResolveExisting(tree, n) ?: return@runCatching null
+            if (!file.isFile) return@runCatching null
+            file.length()
+        }.getOrNull()
 
     private fun mimeForName(name: String): String = when {
         name.endsWith(".html", true) || name.endsWith(".htm", true) -> "text/html"
