@@ -7,7 +7,9 @@ import androidx.documentfile.provider.DocumentFile
 import ru.protolink.communicator.data.CloudCodes
 import ru.protolink.communicator.data.NotesTreeBuilder
 import ru.protolink.communicator.data.SafChildResolve
+import ru.protolink.communicator.data.SafPrimaryPath
 import ru.protolink.communicator.data.SafTreeLister
+import java.io.File
 import ru.protolink.communicator.data.api.AddEntityRequest
 import ru.protolink.communicator.data.api.AddParentRequest
 import ru.protolink.communicator.data.api.AddValueRequest
@@ -257,6 +259,7 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
         val out = mutableListOf<FsEntry>()
         fun walk(folderDocId: String, rel: String) {
             val entries = SafTreeLister.listChildren(context, tree, folderDocId)
+            val seenNames = entries.map { it.name.lowercase() }.toMutableSet()
             // OEM leaf bug: children query may omit files — probe index.html explicitly.
             val hasIndexListed = entries.any {
                 !it.isDirectory && (
@@ -268,6 +271,7 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                     val name = "index.html"
                     val childRel = if (rel.isEmpty()) name.lowercase() else "$rel/${name.lowercase()}"
                     out.add(FsEntry(childRel, false, uriByteLength(indexUri), uriContentHash(indexUri)))
+                    seenNames.add(name)
                 }
             }
             for (child in entries) {
@@ -280,9 +284,56 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                     out.add(FsEntry(childRel, false, uriByteLength(child.uri), uriContentHash(child.uri)))
                 }
             }
+            // Shell/MediaProvider creates under primary: can lag DocumentsContract — merge File kids
+            // so ApplyLocal sees adb mkdir fixtures (Win File.Exists parity).
+            mergePrimaryFileChildren(tree, rel, seenNames, out)
         }
         walk(SafTreeLister.treeDocumentId(tree), "")
         return out
+    }
+
+    /**
+     * Append java.io.File children missing from DocumentsContract listing for primary trees.
+     * Recurses into File-only folders (no SAF doc id) so nested adb fixtures are snapshotted.
+     */
+    private fun mergePrimaryFileChildren(
+        tree: Uri,
+        rel: String,
+        seenNames: MutableSet<String>,
+        out: MutableList<FsEntry>
+    ) {
+        val dir = SafPrimaryPath.tryResolveExisting(tree, rel) ?: return
+        if (!dir.isDirectory) return
+        val kids = dir.listFiles() ?: return
+        for (f in kids) {
+            val nameKey = f.name.lowercase()
+            if (nameKey in seenNames) continue
+            seenNames.add(nameKey)
+            val childRel = if (rel.isEmpty()) nameKey else "$rel/$nameKey"
+            if (f.isDirectory) {
+                out.add(FsEntry(childRel, true, sumFilesIo(f)))
+                mergePrimaryFileChildren(tree, childRel, mutableSetOf(), out)
+            } else {
+                val bytes = runCatching { f.readBytes() }.getOrNull() ?: continue
+                out.add(
+                    FsEntry(
+                        childRel,
+                        false,
+                        bytes.size.toLong(),
+                        ContentHashUtil.sha256Hex(bytes)
+                    )
+                )
+            }
+        }
+    }
+
+    private fun sumFilesIo(dir: File): Long {
+        var sum = 0L
+        val kids = dir.listFiles() ?: return 0L
+        for (f in kids) {
+            sum += if (f.isDirectory) sumFilesIo(f) else f.length()
+        }
+        return sum
     }
 
     private fun sumFilesSaf(tree: Uri, folderDocId: String): Long {
@@ -314,7 +365,7 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
         } else {
             NotesTreeBuilder.folderDocumentId(tree, parentNorm)
         }
-        return SafTreeLister.listChildren(context, tree, parentId).map { child ->
+        val fromContract = SafTreeLister.listChildren(context, tree, parentId).map { child ->
             val childRel = if (parentNorm.isEmpty()) child.name else "$parentNorm/${child.name}"
             FsEntry(
                 relativePath = childRel.replace('\\', '/'),
@@ -323,6 +374,26 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                 contentHash = ""
             )
         }
+        val seen = fromContract.map { PathUtil.nameOf(it.relativePath).lowercase() }.toMutableSet()
+        val fromFile = mutableListOf<FsEntry>()
+        val dir = SafPrimaryPath.tryResolveExisting(tree, parentNorm)
+        if (dir != null && dir.isDirectory) {
+            for (f in dir.listFiles().orEmpty()) {
+                val key = f.name.lowercase()
+                if (key in seen) continue
+                seen.add(key)
+                val childRel = if (parentNorm.isEmpty()) f.name else "$parentNorm/${f.name}"
+                fromFile.add(
+                    FsEntry(
+                        relativePath = childRel.replace('\\', '/'),
+                        isFolder = f.isDirectory,
+                        sizeBytes = 0L,
+                        contentHash = ""
+                    )
+                )
+            }
+        }
+        return fromContract + fromFile
     }
 
     override fun createDirectory(rootPath: String, relativePath: String) {
@@ -421,8 +492,14 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                 }.getOrNull()
             }
             ?: find(rootPath, n)?.uri
+        if (uri != null) {
+            return context.contentResolver.openInputStream(uri)!!.use { it.readBytes() }
+        }
+        // DocumentsContract miss (shell create lag): primary File fallback.
+        val file = SafPrimaryPath.tryResolveExisting(tree, n)
             ?: error("Missing $relativePath")
-        return context.contentResolver.openInputStream(uri)!!.use { it.readBytes() }
+        if (!file.isFile) error("Missing $relativePath")
+        return file.readBytes()
     }
 
     override fun delete(rootPath: String, relativePath: String, isFolder: Boolean) {
@@ -431,17 +508,21 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
         if (n.isEmpty()) error("Cannot delete tree root")
 
         val found = find(rootPath, n)
-        val docId = found?.let { runCatching { DocumentsContract.getDocumentId(it.uri) }.getOrNull() }
-            ?: NotesTreeBuilder.folderDocumentId(tree, n)
-
-        if (isFolder) {
-            deleteDocumentRecursive(tree, docId)
-        } else {
-            val uri = found?.uri ?: SafTreeLister.documentUri(tree, docId)
-            if (!DocumentsContract.deleteDocument(context.contentResolver, uri)) {
-                found?.delete()
+        if (found != null) {
+            val docId = runCatching { DocumentsContract.getDocumentId(found.uri) }.getOrNull()
+                ?: NotesTreeBuilder.folderDocumentId(tree, n)
+            if (isFolder) {
+                deleteDocumentRecursive(tree, docId)
+            } else {
+                if (!DocumentsContract.deleteDocument(context.contentResolver, found.uri)) {
+                    found.delete()
+                }
             }
+            return
         }
+        // File-only child (SAF listing lag): delete via java.io.File.
+        val file = SafPrimaryPath.tryResolveExisting(tree, n) ?: return
+        if (isFolder) file.deleteRecursively() else file.delete()
     }
 
     /**
@@ -518,6 +599,7 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
             if (find(rootPath, relativePath) != null) return@runCatching true
             val tree = treeUri(rootPath)
             val n = relativePath.replace('\\', '/').trim('/')
+            if (SafPrimaryPath.tryResolveExisting(tree, n) != null) return@runCatching true
             val uri = SafTreeLister.documentUri(tree, NotesTreeBuilder.folderDocumentId(tree, n))
             context.contentResolver.openInputStream(uri)?.use { true } ?: false
         }.getOrDefault(false)

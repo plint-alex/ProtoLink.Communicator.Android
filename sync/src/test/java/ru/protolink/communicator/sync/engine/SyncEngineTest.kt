@@ -109,6 +109,56 @@ class SyncEngineTest {
         assertThat(remote.childrenOf("cloud-root").any { it.name.equals("hello.txt", true) }).isTrue()
     }
 
+    /**
+     * Three-way upload: nested local-new folder+file must create parents first (Win OrderBy depth),
+     * then child under that parent — not deepest-first leftover from removed PruneCloudAbsent.
+     */
+    @Test
+    fun localAdd_nestedFolder_uploadsUnderParent() = runTest {
+        val (store, fs, remote) = harness()
+        remote.seedFile("keep", "cloud-root", "keep.txt", "k".toByteArray())
+        fs.writeFile(root, "keep.txt", "k".toByteArray())
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        fs.createDirectory(root, "at-sync-threeway-upload-test")
+        fs.writeFile(root, "at-sync-threeway-upload-test/readme-test.txt", "threeway-upload".toByteArray())
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        val folderMeta = store.getAll("m1").firstOrNull {
+            PathUtil.normalize(it.relativePath) == "at-sync-threeway-upload-test" && it.isFolder
+        }
+        assertThat(folderMeta).isNotNull()
+        val fileMeta = store.getAll("m1").firstOrNull {
+            PathUtil.normalize(it.relativePath) == "at-sync-threeway-upload-test/readme-test.txt"
+        }
+        assertThat(fileMeta).isNotNull()
+        assertThat(fileMeta!!.parentRemoteId).isEqualTo(folderMeta!!.remoteId)
+        assertThat(
+            remote.childrenOf("cloud-root").any { it.name.equals("at-sync-threeway-upload-test", true) }
+        ).isTrue()
+        assertThat(
+            remote.childrenOf(folderMeta.remoteId).any { it.name.equals("readme-test.txt", true) }
+        ).isTrue()
+    }
+
+    /** Three-way download: Api-only child materializes on local (ApplyRemote Added). */
+    @Test
+    fun remoteAdd_folder_downloadsOnWarmReconcile() = runTest {
+        val (store, fs, remote) = harness()
+        remote.seedFile("keep", "cloud-root", "keep.txt", "k".toByteArray())
+        fs.writeFile(root, "keep.txt", "k".toByteArray())
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        remote.seedFolder("dl-f", "cloud-root", "at-sync-threeway-download-test")
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+        assertThat(fs.exists(root, "at-sync-threeway-download-test")).isTrue()
+        assertThat(
+            store.getAll("m1").any {
+                PathUtil.normalize(it.relativePath) == "at-sync-threeway-download-test" && it.isFolder
+            }
+        ).isTrue()
+    }
+
     @Test
     fun localRemove_deletesRemote() = runTest {
         val (store, fs, remote) = harness()

@@ -425,7 +425,9 @@ fun CommunicatorAppScreen(vm: MainViewModel = hiltViewModel()) {
                 TopAppBar(
                     title = { Text("ProtoLink") },
                     actions = {
-                        IconButton(onClick = { vm.syncNow() }, enabled = !state.syncing) {
+                        // Always enabled: while syncing, syncNow coalesces (deferredFull) —
+                        // disabled button made three-way Sync taps no-ops under Cloud loaded.
+                        IconButton(onClick = { vm.syncNow() }) {
                             Icon(Icons.Default.Sync, "Sync")
                         }
                         IconButton(onClick = { vm.toggleSettings(true) }) { Icon(Icons.Default.Settings, "Settings") }

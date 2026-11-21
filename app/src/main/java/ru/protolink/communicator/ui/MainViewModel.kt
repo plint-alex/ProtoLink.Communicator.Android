@@ -1107,7 +1107,9 @@ class MainViewModel @Inject constructor(
             val status = ForceStatusGuard.statusOrNull(
                 forceRunning = cur.forceRunning,
                 forcePreferred = SyncFlight.forcePreferred.get(),
-                proposed = proposed
+                proposed = proposed,
+                // Live 1.0.99: do not clobber Syncing… with Cloud loaded (three-way Sync idle-ish).
+                syncing = cur.syncing
             ) ?: cur.status
             cur.copy(cloudItems = items, status = status)
         }

@@ -105,7 +105,6 @@ class SyncEngine(
     ): Result {
         var localCount = 0
         var remoteCount = 0
-        val dirtyByMapping = mutableMapOf<String, MutableSet<String>>()
 
         for (mapping in mappings) {
             coroutineContext.ensureActive()
@@ -125,7 +124,8 @@ class SyncEngine(
 
         val byId = mappings.associateBy { it.id }
 
-        // Always hash-compare every mapped file so all devices converge to the same bytes.
+        // Win ReconcileAll: per-mapping Compare→Remote→Local→LastSync (do not wait for sibling
+        // maps' Apply* before stamping). Cloud materialize before local upload (cloud-wins).
         val enrichedRemote = remoteLocated
         for (mapping in mappings) {
             coroutineContext.ensureActive()
@@ -133,23 +133,13 @@ class SyncEngine(
             val (writes, reads) = applyComparePhase(mapping, enrichedRemote, dirty)
             localCount += writes
             remoteCount += reads
-            dirtyByMapping[mapping.id] = dirty
-        }
-        // Cloud materialize before local upload so polluted Notes trees (local junk) cannot
-        // starve / timeout the pass before missing remote children are filled (cloud-wins).
-        for (mapping in mappings) {
-            coroutineContext.ensureActive()
             remoteCount += applyRemotePhase(
                 mapping,
                 byId,
                 enrichedRemote.filter { it.mappingId == mapping.id },
                 enrichedRemote,
-                dirtyByMapping[mapping.id] ?: emptySet()
+                dirty
             )
-        }
-        for (mapping in mappings) {
-            coroutineContext.ensureActive()
-            val dirty = dirtyByMapping[mapping.id] ?: mutableSetOf()
             val remoteForMapping = enrichedRemote.filter { it.mappingId == mapping.id }
             localCount += applyLocalPhase(mapping, dirty, skipSizeUpdates = true, remoteForMapping)
             store.setLastSyncUtc(mapping.id, Instant.now())
@@ -470,14 +460,10 @@ class SyncEngine(
         // Parent→children cache for match-before-create (push / walk miss).
         val siblingCache = mutableMapOf<String, List<RemoteEntry>>()
 
-        // Full reconcile (remote tree known): prune deepest-first. Local-only push: create parents first.
-        val adds = changes.filterIsInstance<LocalChange.Added>().let { list ->
-            if (remoteInMapping.isNotEmpty()) {
-                list.sortedByDescending { it.entry.relativePath.count { c -> c == '/' } }
-            } else {
-                list.sortedBy { it.entry.relativePath.count { c -> c == '/' } }
-            }
-        }
+        // Win ApplyLocal Added: parents before children (shallowest-first) so resolveParentId
+        // finds freshly upserted folder meta. Deepest-first was leftover from removed PruneCloudAbsent.
+        val adds = changes.filterIsInstance<LocalChange.Added>()
+            .sortedBy { it.entry.relativePath.count { c -> c == '/' } }
         val renames = changes.filterIsInstance<LocalChange.Renamed>()
         val updates = changes.filterIsInstance<LocalChange.Updated>()
         val removes = changes.filterIsInstance<LocalChange.Removed>()

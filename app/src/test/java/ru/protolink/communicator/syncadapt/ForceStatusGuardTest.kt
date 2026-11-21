@@ -90,4 +90,26 @@ class ForceStatusGuardTest {
             )
         ).isNull()
     }
+
+    @Test
+    fun statusOrNull_preservesSyncingOverCloudLoaded() {
+        // Live 1.0.99 three-way: listing Cloud loaded while syncing made Sync look idle.
+        assertThat(ForceStatusGuard.ownsStatus(false, false, syncing = true)).isTrue()
+        assertThat(
+            ForceStatusGuard.statusOrNull(
+                forceRunning = false,
+                forcePreferred = false,
+                proposed = "Cloud loaded",
+                syncing = true
+            )
+        ).isNull()
+        assertThat(
+            ForceStatusGuard.statusOrNull(
+                forceRunning = false,
+                forcePreferred = false,
+                proposed = "Cloud loaded",
+                syncing = false
+            )
+        ).isEqualTo("Cloud loaded")
+    }
 }
