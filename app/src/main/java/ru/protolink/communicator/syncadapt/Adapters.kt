@@ -10,6 +10,7 @@ import ru.protolink.communicator.data.NotesTreeBuilder
 import ru.protolink.communicator.data.SafChildResolve
 import ru.protolink.communicator.data.SafDocumentSize
 import ru.protolink.communicator.data.SafPrimaryPath
+import ru.protolink.communicator.data.SafPrimarySnapshot
 import ru.protolink.communicator.data.SafTreeLister
 import java.io.File
 import ru.protolink.communicator.data.api.AddEntityRequest
@@ -275,9 +276,14 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
         SafPrimaryPath.flushListing(
             context, tree, relativePath = "", waitMs = SafPrimaryPath.FLUSH_WAIT_ROOT_MS
         )
-        // Win SnapshotFs: single-pass enumerate + ancestor folder size rollup.
-        // Legacy sumFilesSaf per directory was O(dirs×files) and starved Force before first Api
-        // (1.0.103 FORCE_UPLOAD_STUCK_NO_PROGRESS / sticky Uploading on MyNotesFolder).
+        // Win SnapshotFs = Directory.GetFiles AllDirectories + FileInfo.Length.
+        // Primary-external maps (live MyNotesFolder): File/Os walk — DocumentsContract×dirs
+        // starved Syncing/Force before first Api after 1.0.105 (COLUMN_SIZE alone insufficient).
+        val primaryRoot = SafPrimaryPath.tryResolveExisting(tree, "")
+        if (primaryRoot != null && (primaryRoot.isDirectory || SafPrimaryPath.listChildNames(primaryRoot).isNotEmpty())) {
+            return SafPrimarySnapshot.snapshot(primaryRoot, computeContentHashes)
+        }
+        // Non-primary / opaque SAF trees: DocumentsContract single-pass + File merge fallback.
         val folderSizes = linkedMapOf<String, Long>()
         val files = mutableListOf<FsEntry>()
         fun rememberFolder(rel: String) {
@@ -537,6 +543,11 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
     override fun readFile(rootPath: String, relativePath: String): ByteArray {
         val tree = treeUri(rootPath)
         val n = relativePath.replace('\\', '/').trim('/')
+        // Win File.ReadAllBytes: primary File first. SAF listChildren×parent per Force file
+        // re-starved upload after size-only snap (1.0.105 FORCE_UPLOAD_STUCK_NO_PROGRESS).
+        SafPrimaryPath.tryResolveExisting(tree, n)?.takeIf { it.isFile }?.let {
+            return it.readBytes()
+        }
         val parent = PathUtil.parentOf(n)
         val name = PathUtil.nameOf(n)
         val parentId = if (parent.isEmpty()) {
@@ -556,14 +567,8 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                 }.getOrNull()
             }
             ?: find(rootPath, n)?.uri
-        if (uri != null) {
-            return context.contentResolver.openInputStream(uri)!!.use { it.readBytes() }
-        }
-        // DocumentsContract miss (shell create lag): primary File fallback.
-        val file = SafPrimaryPath.tryResolveExisting(tree, n)
             ?: error("Missing $relativePath")
-        if (!file.isFile) error("Missing $relativePath")
-        return file.readBytes()
+        return context.contentResolver.openInputStream(uri)!!.use { it.readBytes() }
     }
 
     override fun delete(rootPath: String, relativePath: String, isFolder: Boolean) {
