@@ -51,4 +51,15 @@ object EntityMeta {
             else -> "file-$compact"
         }
     }
+
+    /**
+     * Win [CloudApiService.ShouldReassertDisplayName]: real user name to write/re-write as
+     * NAME_TYPE — not blank and not the synthetic folder-/file-{id} fallback.
+     */
+    fun shouldReassertDisplayName(entityId: String, displayName: String?, isFolder: Boolean): Boolean {
+        val trimmed = displayName?.trim().orEmpty()
+        if (trimmed.isEmpty()) return false
+        val code = if (isFolder) CloudCodes.CLOUD_FOLDER else CloudCodes.CLOUD_FILE
+        return !trimmed.equals(fallbackName(entityId, code), ignoreCase = true)
+    }
 }

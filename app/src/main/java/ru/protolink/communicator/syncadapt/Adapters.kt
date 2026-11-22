@@ -136,7 +136,16 @@ class ApiRemoteCloud(private val api: ProtoLinkApi) : RemoteCloud {
                 values = listOf(AddValueRequest(value = name, parentIds = listOf(CloudCodes.NAME_TYPE_ID)))
             )
         )
-        return res.id ?: error("AddEntity folder returned empty id")
+        val id = res.id ?: error("AddEntity folder returned empty id")
+        // Win CloudApiService.AddEntityAsync re-asserts NAME_TYPE after CloudFolder create so
+        // GetDisplayName never sticks on folder-{guid} (empty-folder Sync materialize path).
+        reassertFolderDisplayName(id, name)
+        return id
+    }
+
+    private suspend fun reassertFolderDisplayName(entityId: String, name: String) {
+        if (!EntityMeta.shouldReassertDisplayName(entityId, name, isFolder = true)) return
+        api.addValue(entityId, AddValueRequest(value = name, parentIds = listOf(CloudCodes.NAME_TYPE_ID)))
     }
 
     override suspend fun addFile(parentId: String, name: String, bytes: ByteArray, mimeType: String): String {

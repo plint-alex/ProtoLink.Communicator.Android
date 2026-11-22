@@ -3398,13 +3398,18 @@ class MainViewModel @Inject constructor(
 
     private suspend fun createCloudFolderUnder(parentId: String, name: String): String? {
         if (CloudVirtualNodes.isVirtual(parentId)) return null
-        return api.addEntity(
+        val id = api.addEntity(
             AddEntityRequest(
                 code = CloudCodes.CLOUD_FOLDER,
                 parentIds = listOf(parentId),
                 values = listOf(AddValueRequest(value = name, parentIds = listOf(CloudCodes.NAME_TYPE_ID)))
             )
-        ).id
+        ).id ?: return null
+        // Sync Adapters.addFolder + Win AddEntityAsync: re-assert NAME so Cloud UI never sticks on folder-{guid}.
+        if (EntityMeta.shouldReassertDisplayName(id, name, isFolder = true)) {
+            api.addValue(id, AddValueRequest(value = name, parentIds = listOf(CloudCodes.NAME_TYPE_ID)))
+        }
+        return id
     }
     fun unmapFolder(cloudFolderId: String) {
         val list = mappingStore.load().toMutableList()

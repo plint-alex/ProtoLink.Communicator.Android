@@ -58,6 +58,17 @@ class EntityMetaDisplayNameTest {
     }
 
     @Test
+    fun shouldReassertDisplayName_realFolderName_notSynthetic() {
+        val id = "12984c41-556d-46ed-84e3-0a524d58c899"
+        assertThat(EntityMeta.shouldReassertDisplayName(id, "User_Test_1", isFolder = true)).isTrue()
+        assertThat(
+            EntityMeta.shouldReassertDisplayName(id, "folder-${id.replace("-", "")}", isFolder = true)
+        ).isFalse()
+        assertThat(EntityMeta.shouldReassertDisplayName(id, "  ", isFolder = true)).isFalse()
+        assertThat(EntityMeta.shouldReassertDisplayName(id, null, isFolder = true)).isFalse()
+    }
+
+    @Test
     fun syntheticCloudFile_skippedBySyncWalk_foldersKept() {
         val fileId = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
         val file = EntityDto(id = fileId, code = CloudCodes.CLOUD_FILE, values = emptyList())
