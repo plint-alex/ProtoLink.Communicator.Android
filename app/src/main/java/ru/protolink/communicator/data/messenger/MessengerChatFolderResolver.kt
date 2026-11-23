@@ -8,6 +8,8 @@ import ru.protolink.communicator.data.api.AddValueRequest
 import ru.protolink.communicator.data.api.GetEntitiesRequest
 import ru.protolink.communicator.data.api.ProtoLinkApi
 import ru.protolink.communicator.util.ChatFolderNaming
+import ru.protolink.communicator.util.CloudInteractiveListing
+import ru.protolink.communicator.util.CloudRootSelection
 import ru.protolink.communicator.util.EntityMeta
 
 /**
@@ -99,15 +101,64 @@ class MessengerChatFolderResolver(
     }
 
     private suspend fun ensureCloudRoot(ownerUserId: String): String {
-        val underUser = api.getEntities(
-            GetEntitiesRequest(parentIds = listOf(ownerUserId), includeValues = false, take = 50)
+        // Page under-user fully — take=50/200 firstOrNull crowns empty junk CloudRoots while
+        // healthy AT root (Chats parent) sits on later pages (ANDROID_SOFTREADY_EMPTY_LISTING class).
+        val roots = ArrayList<CloudRootSelection.Candidate>()
+        var skip = 0
+        val pageSize = 200
+        while (skip <= 5_000) {
+            val underUser = api.getEntities(
+                GetEntitiesRequest(
+                    parentIds = listOf(ownerUserId),
+                    includeValues = false,
+                    skip = skip,
+                    take = pageSize
+                )
+            )
+            if (underUser.isEmpty()) break
+            for (e in underUser) {
+                if (!e.code.equals(CloudCodes.CLOUD_ROOT, ignoreCase = true)) continue
+                roots.add(CloudRootSelection.Candidate(e.id, e.creationTime))
+            }
+            if (underUser.size < pageSize) break
+            skip += pageSize
+        }
+        val distinct = roots.distinctBy { it.id.lowercase() }
+        if (distinct.isEmpty()) {
+            val created = api.addEntity(
+                AddEntityRequest(code = CloudCodes.CLOUD_ROOT, parentIds = listOf(ownerUserId))
+            )
+            return created.id ?: error("CloudRoot create returned empty id")
+        }
+        val lastOpen = settingsStore.load().lastOpenCloudEntityId
+        val preferred = CloudRootSelection.resolvePreferredCloudRootId(
+            knownCloudRootIds = distinct.map { it.id }.toSet(),
+            lastOpenCloudEntityId = lastOpen,
+            currentMyCloudRootId = null
         )
-        val root = underUser.firstOrNull { it.code.equals(CloudCodes.CLOUD_ROOT, ignoreCase = true) }
-        if (root?.id != null) return root.id
-        val created = api.addEntity(
-            AddEntityRequest(code = CloudCodes.CLOUD_ROOT, parentIds = listOf(ownerUserId))
-        )
-        return created.id ?: error("CloudRoot create returned empty id")
+        val counts = if (distinct.size > 1) {
+            val map = HashMap<String, Int>(distinct.size)
+            for (c in distinct) {
+                val kids = runCatching {
+                    api.getEntities(
+                        GetEntitiesRequest(
+                            parentIds = listOf(c.id),
+                            includeValues = false,
+                            take = CloudInteractiveListing.PAGE_SIZE
+                        )
+                    )
+                }.getOrDefault(emptyList())
+                map[c.id.lowercase()] = CloudInteractiveListing.folderChildCount(kids)
+            }
+            map
+        } else {
+            emptyMap()
+        }
+        return CloudRootSelection.pickCanonicalPreferringRichness(
+            roots = distinct,
+            preferredId = preferred,
+            folderChildCountByRemoteId = counts
+        ) ?: distinct.first().id
     }
 
     private suspend fun ensureNamedFolder(parentId: String, name: String): String {

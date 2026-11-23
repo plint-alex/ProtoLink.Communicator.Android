@@ -34,7 +34,12 @@ data class AppSettings(
      * Cycle-2 M6 — reduce Camera/Gallery/File… images before upload (default ON).
      * Gson missing-key → false; [SettingsStore.load] migrates absent key to true.
      */
-    val reducePhotoSizeBeforeSend: Boolean = true
+    val reducePhotoSizeBeforeSend: Boolean = true,
+    /**
+     * Win LastOpenCloudEntityId parity — preferred My Cloud when duplicate CloudRoots exist
+     * under the user (page-1 empty twin vs healthy AT root on later GetEntities pages).
+     */
+    val lastOpenCloudEntityId: String? = null
 )
 
 data class CloudSyncMappingDto(

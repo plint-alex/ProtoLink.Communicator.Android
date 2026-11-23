@@ -55,6 +55,7 @@ import ru.protolink.communicator.util.CloudInteractiveListing
 import ru.protolink.communicator.util.CloudListingStatus
 import ru.protolink.communicator.util.CloudMainParent
 import ru.protolink.communicator.util.CloudRecentList
+import ru.protolink.communicator.util.CloudRootSelection
 import ru.protolink.communicator.util.CloudSharedScope
 import ru.protolink.communicator.util.CloudVirtualNodes
 import ru.protolink.communicator.util.EntityMeta
@@ -784,6 +785,8 @@ class MainViewModel @Inject constructor(
         auth.changePassword(currentPassword, newPassword)
 
     private var cloudRootId: String? = null
+    /** User-parented CloudRoot ids from last ensure pass (multi-root guard). */
+    private val knownCloudRootIds = linkedSetOf<String>()
     private var currentFolderId: String? = null
 
     private fun uiLang(): String = Locale.getDefault().toLanguageTag()
@@ -1144,12 +1147,9 @@ class MainViewModel @Inject constructor(
 
     suspend fun ensureCloudRoot() {
         val userId = auth.current()?.userId ?: return
-        val list = api.getEntities(GetEntitiesRequest(parentIds = listOf(userId), includeValues = false, take = 200))
-        val root = list.firstOrNull { it.code == CloudCodes.CLOUD_ROOT }
-        val id = root?.id ?: api.addEntity(
-            AddEntityRequest(code = CloudCodes.CLOUD_ROOT, parentIds = listOf(userId))
-        ).id ?: return
+        val id = resolveCanonicalCloudRootId(userId) ?: return
         cloudRootId = id
+        folderTreeCodes[id.lowercase()] = CloudCodes.CLOUD_ROOT
         openCloudHub()
     }
 
@@ -1678,6 +1678,7 @@ class MainViewModel @Inject constructor(
         }
         _state.update { it.copy(breadcrumb = it.breadcrumb + (item.id to item.name)) }
         loadCloudFolder(item.id)
+        persistLastOpenCloudEntity(item.id)
         recordRecentOpen(item.id, item.name, isFolder = true)
     }
 
@@ -1698,6 +1699,7 @@ class MainViewModel @Inject constructor(
             _state.update { it.copy(breadcrumb = composed) }
             val name = trail.last().second
             loadCloudFolder(folderId)
+            persistLastOpenCloudEntity(folderId)
             recordRecentOpen(folderId, name, isFolder = true)
             return
         }
@@ -2883,6 +2885,13 @@ class MainViewModel @Inject constructor(
             _state.update { it.copy(status = MapLocalFolderStrings.localMissing(uiLang())) }
             return
         }
+        val code = folderTreeCodes[folderId.lowercase()]
+        if (CloudRootSelection.shouldRefuseMapping(code, folderId, knownCloudRootIds)) {
+            _state.update {
+                it.copy(status = "Cannot map onto CloudRoot — pick a CloudFolder under My Cloud")
+            }
+            return
+        }
         val list = mappingStore.load().toMutableList()
         // One Cloud id and one local tree URI — drop stale dual maps (same Notes root → wrong id).
         list.removeAll {
@@ -3021,16 +3030,112 @@ class MainViewModel @Inject constructor(
     private suspend fun ensureCloudRootQuiet() {
         if (cloudRootId != null) return
         val userId = auth.current()?.userId ?: return
-        val list = api.getEntities(GetEntitiesRequest(parentIds = listOf(userId), includeValues = false, take = 200))
-        val root = list.firstOrNull { it.code == CloudCodes.CLOUD_ROOT }
-        cloudRootId = root?.id ?: api.addEntity(
-            AddEntityRequest(code = CloudCodes.CLOUD_ROOT, parentIds = listOf(userId))
-        ).id
+        val id = resolveCanonicalCloudRootId(userId) ?: return
+        cloudRootId = id
+        folderTreeCodes[id.lowercase()] = CloudCodes.CLOUD_ROOT
+    }
+
+    /**
+     * Win EnsureRoot / ApplyCanonicalCloudRootFromUserChildren: page under-user fully
+     * (UserContacts flood buries CloudRoot past take=200), then PickCanonical + richness
+     * so empty first-page twins cannot become My Cloud (ANDROID_SOFTREADY_EMPTY_LISTING).
+     */
+    private suspend fun resolveCanonicalCloudRootId(userId: String): String? {
+        val roots = loadUserCloudRootCandidates()
+        knownCloudRootIds.clear()
+        for (r in roots) knownCloudRootIds.add(r.id)
+        if (roots.isEmpty()) {
+            val created = api.addEntity(
+                AddEntityRequest(code = CloudCodes.CLOUD_ROOT, parentIds = listOf(userId))
+            ).id ?: return null
+            knownCloudRootIds.add(created)
+            return created
+        }
+        val mapped = mappingStore.load().map { it.cloudFolderId }.toSet()
+        val lastOpen = settingsStore.load().lastOpenCloudEntityId
+        val preferred = CloudRootSelection.resolvePreferredCloudRootId(
+            knownCloudRootIds = knownCloudRootIds,
+            lastOpenCloudEntityId = lastOpen,
+            currentMyCloudRootId = cloudRootId
+        )
+        val counts = if (roots.size > 1) {
+            probeCloudRootFolderChildCounts(roots.map { it.id })
+        } else {
+            emptyMap()
+        }
+        val picked = CloudRootSelection.pickCanonicalPreferringRichness(
+            roots = roots,
+            mappedCloudFolderIds = mapped,
+            preferredId = preferred,
+            folderChildCountByRemoteId = counts
+        )
+        Log.i(
+            "ProtoLinkCloud",
+            "CloudRoot pick id=$picked roots=${roots.size} preferred=$preferred counts=$counts"
+        )
+        return picked
+    }
+
+    /** Page under-user until exhausted — never firstOrNull on a single Take=200 page. */
+    private suspend fun loadUserCloudRootCandidates(): List<CloudRootSelection.Candidate> {
+        val userId = auth.current()?.userId ?: return emptyList()
+        val out = ArrayList<CloudRootSelection.Candidate>()
+        var skip = 0
+        val pageSize = 200
+        while (skip <= 5_000) {
+            val children = api.getEntities(
+                GetEntitiesRequest(
+                    parentIds = listOf(userId),
+                    includeValues = false,
+                    skip = skip,
+                    take = pageSize
+                )
+            )
+            if (children.isEmpty()) break
+            for (e in children) {
+                if (e.code != CloudCodes.CLOUD_ROOT) continue
+                out.add(CloudRootSelection.Candidate(id = e.id, creationTime = e.creationTime))
+            }
+            if (children.size < pageSize) break
+            skip += pageSize
+        }
+        return out.distinctBy { it.id.lowercase() }
+    }
+
+    private suspend fun probeCloudRootFolderChildCounts(rootIds: List<String>): Map<String, Int> {
+        val out = HashMap<String, Int>(rootIds.size)
+        for (id in rootIds) {
+            if (id.isBlank()) continue
+            val kids = runCatching {
+                api.getEntities(
+                    GetEntitiesRequest(
+                        parentIds = listOf(id),
+                        includeValues = false,
+                        take = CloudInteractiveListing.PAGE_SIZE
+                    )
+                )
+            }.getOrDefault(emptyList())
+            out[id.lowercase()] = CloudInteractiveListing.folderChildCount(kids)
+        }
+        return out
+    }
+
+    private fun persistLastOpenCloudEntity(entityId: String) {
+        if (entityId.isBlank() || CloudVirtualNodes.isVirtual(entityId)) return
+        val cur = settingsStore.load()
+        if (cur.lastOpenCloudEntityId.equals(entityId, ignoreCase = true)) return
+        settingsStore.save(cur.copy(lastOpenCloudEntityId = entityId))
     }
 
     private fun resolveWizardParentFolderId(): String? {
         val current = currentFolderId
         if (current != null && !CloudVirtualNodes.isVirtual(current)) return current
+        // Prefer newest non-mapped CloudRoot for create-then-map (Win PickWizardCreateParentRoot).
+        val roots = knownCloudRootIds.map { CloudRootSelection.Candidate(it) }
+        if (roots.isNotEmpty()) {
+            val mapped = mappingStore.load().map { it.cloudFolderId }.toSet()
+            CloudRootSelection.pickWizardCreateParentRoot(roots, mapped)?.let { return it }
+        }
         return cloudRootId
     }
 
