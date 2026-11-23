@@ -37,9 +37,12 @@ object CloudRootSelection {
     }
 
     /**
-     * Same pool as [pickCanonical], but when preferred is absent (or not in pool) prefer the
-     * root with the most CloudFolder/CloudRoot children so an empty first-page twin cannot
-     * become My Cloud while Api kids live under another CloudRoot.
+     * Same pool as [pickCanonical], but prefer the root with the most CloudFolder/CloudRoot
+     * children so an empty first-page twin / keep-data LastOpen cannot become My Cloud while
+     * Api kids live under another CloudRoot.
+     *
+     * Preferred (LastOpen) is kept only when it has folder kids (>0) or counts are unavailable;
+     * an empty preferred loses to a richer pool member (ANDROID_SOFTREADY_EMPTY_LISTING).
      */
     fun pickCanonicalPreferringRichness(
         roots: List<Candidate>,
@@ -49,8 +52,21 @@ object CloudRootSelection {
     ): String? {
         val pool = preferredPool(roots, mappedCloudFolderIds) ?: return null
         val pref = preferredId?.trim().orEmpty()
-        if (pref.isNotEmpty() && pool.any { it.id.equals(pref, ignoreCase = true) }) {
-            return pool.first { it.id.equals(pref, ignoreCase = true) }.id
+        val prefInPool = pref.isNotEmpty() && pool.any { it.id.equals(pref, ignoreCase = true) }
+        if (prefInPool) {
+            if (folderChildCountByRemoteId.isEmpty()) {
+                return pool.first { it.id.equals(pref, ignoreCase = true) }.id
+            }
+            val prefCount = folderChildCountByRemoteId[pref.lowercase()] ?: 0
+            val maxOther = pool
+                .filterNot { it.id.equals(pref, ignoreCase = true) }
+                .maxOfOrNull { folderChildCountByRemoteId[it.id.lowercase()] ?: 0 }
+                ?: 0
+            // Keep LastOpen when it has content, or when nothing else is richer.
+            if (prefCount > 0 || maxOther <= prefCount) {
+                return pool.first { it.id.equals(pref, ignoreCase = true) }.id
+            }
+            // Empty preferred + richer sibling → fall through to richness sort.
         }
         if (folderChildCountByRemoteId.isEmpty()) {
             return pool.sortedWith(earliestCreationThenId).first().id

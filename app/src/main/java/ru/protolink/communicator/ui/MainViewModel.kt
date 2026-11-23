@@ -3073,6 +3073,13 @@ class MainViewModel @Inject constructor(
             "ProtoLinkCloud",
             "CloudRoot pick id=$picked roots=${roots.size} preferred=$preferred counts=$counts"
         )
+        // When richness overrides empty LastOpen, persist so keep-data does not re-stick.
+        if (!picked.isNullOrBlank() &&
+            preferred != null &&
+            !picked.equals(preferred, ignoreCase = true)
+        ) {
+            persistLastOpenCloudEntity(picked)
+        }
         return picked
     }
 

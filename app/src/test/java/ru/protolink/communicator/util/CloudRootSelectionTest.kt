@@ -60,19 +60,57 @@ class CloudRootSelectionTest {
     }
 
     @Test
-    fun pickCanonicalPreferringRichness_keepsPreferredEvenIfLessRich() {
+    fun pickCanonicalPreferringRichness_emptyPreferredLosesToRicher() {
+        // Live FAIL 1.0.109: LastOpen Drive 3e5a2d6e kids=0 crowns over 8aec679c=8.
         val roots = listOf(
             CloudRootSelection.Candidate(emptyTwin, "2026-11-18T13:58:53"),
-            CloudRootSelection.Candidate(healthy, "2024-06-01T00:00:00")
+            CloudRootSelection.Candidate(healthy, "2024-06-01T00:00:00"),
+            CloudRootSelection.Candidate(drive, "2023-01-01T00:00:00")
         )
-        val counts = mapOf(emptyTwin.lowercase() to 0, healthy.lowercase() to 4)
+        val counts = mapOf(
+            emptyTwin.lowercase() to 0,
+            drive.lowercase() to 0,
+            healthy.lowercase() to 8
+        )
         assertThat(
             CloudRootSelection.pickCanonicalPreferringRichness(
                 roots,
-                preferredId = emptyTwin,
+                preferredId = drive,
                 folderChildCountByRemoteId = counts
             )
-        ).isEqualTo(emptyTwin)
+        ).isEqualTo(healthy)
+    }
+
+    @Test
+    fun pickCanonicalPreferringRichness_keepsPreferredWhenItHasKids() {
+        val roots = listOf(
+            CloudRootSelection.Candidate(drive, "2023-01-01T00:00:00"),
+            CloudRootSelection.Candidate(healthy, "2024-06-01T00:00:00")
+        )
+        val counts = mapOf(drive.lowercase() to 2, healthy.lowercase() to 8)
+        assertThat(
+            CloudRootSelection.pickCanonicalPreferringRichness(
+                roots,
+                preferredId = drive,
+                folderChildCountByRemoteId = counts
+            )
+        ).isEqualTo(drive)
+    }
+
+    @Test
+    fun pickCanonicalPreferringRichness_keepsEmptyPreferredWhenAllEmpty() {
+        val roots = listOf(
+            CloudRootSelection.Candidate(drive, "2023-01-01T00:00:00"),
+            CloudRootSelection.Candidate(healthy, "2024-06-01T00:00:00")
+        )
+        val counts = mapOf(drive.lowercase() to 0, healthy.lowercase() to 0)
+        assertThat(
+            CloudRootSelection.pickCanonicalPreferringRichness(
+                roots,
+                preferredId = drive,
+                folderChildCountByRemoteId = counts
+            )
+        ).isEqualTo(drive)
     }
 
     @Test
