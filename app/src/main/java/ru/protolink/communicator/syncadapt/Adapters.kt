@@ -6,6 +6,7 @@ import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
 import kotlinx.coroutines.withTimeoutOrNull
 import ru.protolink.communicator.data.CloudCodes
+import ru.protolink.communicator.data.CloudEntityClassify
 import ru.protolink.communicator.data.NotesTreeBuilder
 import ru.protolink.communicator.data.SafChildResolve
 import ru.protolink.communicator.data.SafDocumentSize
@@ -61,8 +62,8 @@ class ApiRemoteCloud(private val api: ProtoLinkApi) : RemoteCloud {
                 )
             )
             for (e in page) {
-                val isFolder = e.code == CloudCodes.CLOUD_FOLDER
-                val isFile = e.code == CloudCodes.CLOUD_FILE
+                val isFolder = CloudEntityClassify.isFolder(e.typeEntityId, e.code)
+                val isFile = CloudEntityClassify.isFile(e.typeEntityId, e.code)
                 if (!isFolder && !isFile) continue
                 // Same name resolver as Cloud UI (EntityMeta). Old adapter returned null and
                 // skipped — Sync never walked folders Cloud listed → mapped ghosts (NFR-SYNC-1 /
@@ -106,8 +107,8 @@ class ApiRemoteCloud(private val api: ProtoLinkApi) : RemoteCloud {
                     )
                 )
                 for (e in page) {
-                    val isFolder = e.code == CloudCodes.CLOUD_FOLDER
-                    val isFile = e.code == CloudCodes.CLOUD_FILE
+                    val isFolder = CloudEntityClassify.isFolder(e.typeEntityId, e.code)
+                    val isFile = CloudEntityClassify.isFile(e.typeEntityId, e.code)
                     if (!isFolder && !isFile) continue
                     val name = EntityMeta.displayName(e)
                     if (includeValues && EntityMeta.isSyntheticCloudFileDisplayName(e, name)) continue
@@ -388,41 +389,36 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
             seenNames.add(nameKey)
             val f = File(dir, rawName)
             val childRel = if (rel.isEmpty()) nameKey else "$rel/$nameKey"
-            val isDir = f.isDirectory || runCatching {
-                // Os.listdir may return a name while File metadata is briefly stale.
-                SafPrimaryPath.listChildNames(f).isNotEmpty() && !f.isFile
-            }.getOrDefault(false)
-            if (isDir && !f.isFile) {
-                folderSizes.putIfAbsent(childRel, 0L)
-                mergePrimaryFileChildren(
-                    tree, childRel, mutableSetOf(), files, folderSizes,
-                    computeContentHashes, rollSize
-                )
-            } else if (f.isFile) {
-                if (computeContentHashes) {
-                    val bytes = runCatching { f.readBytes() }.getOrNull() ?: continue
-                    files.add(
-                        FsEntry(
-                            childRel,
-                            false,
-                            bytes.size.toLong(),
-                            ContentHashUtil.sha256Hex(bytes)
-                        )
+            // Win GetDirectories/GetFiles — no ghost folder stubs (blocks LocalChange.Removed).
+            when {
+                f.isDirectory -> {
+                    folderSizes.putIfAbsent(childRel, 0L)
+                    mergePrimaryFileChildren(
+                        tree, childRel, mutableSetOf(), files, folderSizes,
+                        computeContentHashes, rollSize
                     )
-                    rollSize(childRel, bytes.size.toLong())
-                } else {
-                    val len = f.length()
-                    files.add(FsEntry(childRel, false, len, ""))
-                    rollSize(childRel, len)
                 }
-            } else {
-                // Name from Os.listdir but File can't read — still record as folder stub so
-                // ApplyLocal Added can create the Api entity; nested merge may fill later.
-                folderSizes.putIfAbsent(childRel, 0L)
-                mergePrimaryFileChildren(
-                    tree, childRel, mutableSetOf(), files, folderSizes,
-                    computeContentHashes, rollSize
-                )
+                f.isFile || runCatching { f.inputStream().use { true } }.getOrDefault(false) -> {
+                    if (computeContentHashes) {
+                        val bytes = runCatching { f.readBytes() }.getOrNull() ?: continue
+                        files.add(
+                            FsEntry(
+                                childRel,
+                                false,
+                                bytes.size.toLong(),
+                                ContentHashUtil.sha256Hex(bytes)
+                            )
+                        )
+                        rollSize(childRel, bytes.size.toLong())
+                    } else {
+                        val len = f.length()
+                        files.add(FsEntry(childRel, false, len, ""))
+                        rollSize(childRel, len)
+                    }
+                }
+                else -> {
+                    // Omit unlistable names — Win SnapshotFs does not invent stubs.
+                }
             }
         }
     }
@@ -674,12 +670,13 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
 
     override fun exists(rootPath: String, relativePath: String): Boolean =
         runCatching {
-            if (find(rootPath, relativePath) != null) return@runCatching true
             val tree = treeUri(rootPath)
             val n = relativePath.replace('\\', '/').trim('/')
+            // Win File.Exists: primary File first, then DocumentFile. Do not openInputStream a
+            // guessed document id — stale MediaProvider ids after shell rm false-positive and
+            // can hide LocalChange.Removed (LOCAL_DELETE_NOT_REMOTE_DELETE).
             if (SafPrimaryPath.tryResolveExisting(tree, n) != null) return@runCatching true
-            val uri = SafTreeLister.documentUri(tree, NotesTreeBuilder.folderDocumentId(tree, n))
-            context.contentResolver.openInputStream(uri)?.use { true } ?: false
+            find(rootPath, n) != null
         }.getOrDefault(false)
 
     override fun fileLengthBytes(rootPath: String, relativePath: String): Long? =

@@ -1,12 +1,13 @@
 package ru.protolink.communicator.util
 
 import ru.protolink.communicator.data.CloudCodes
+import ru.protolink.communicator.data.CloudEntityClassify
 import ru.protolink.communicator.data.api.EntityDto
 
 /** Display helpers for Cloud entities used by messenger attachment / unfurl cards + Sync walk. */
 object EntityMeta {
     fun displayName(entity: EntityDto): String {
-        val values = entity.values ?: return fallbackName(entity.id, entity.code)
+        val values = entity.values ?: return fallbackName(entity)
         for (v in values) {
             val s = JsonValues.asText(v.value)?.trim()?.takeIf { it.isNotEmpty() } ?: continue
             if (v.parents?.any { it.equals(CloudCodes.NAME_TYPE_ID, true) } == true) return s
@@ -16,7 +17,7 @@ object EntityMeta {
             if (v.parents?.any { it.equals(CloudCodes.MIME_TYPE_ID, true) } == true) continue
             return s
         }
-        return fallbackName(entity.id, entity.code)
+        return fallbackName(entity)
     }
 
     fun mimeType(entity: EntityDto): String? {
@@ -28,6 +29,13 @@ object EntityMeta {
         return null
     }
 
+    fun typeLabel(entity: EntityDto): String = when {
+        CloudEntityClassify.isFolder(entity.typeEntityId, entity.code) -> "Folder"
+        CloudEntityClassify.isFile(entity.typeEntityId, entity.code) -> "File"
+        else -> entity.code?.takeIf { it.isNotBlank() } ?: "Entity"
+    }
+
+    /** @deprecated Prefer [typeLabel] with EntityDto (TypeEntityId-aware). */
     fun typeLabel(code: String?): String = when (code) {
         CloudCodes.CLOUD_FOLDER, CloudCodes.CLOUD_ROOT -> "Folder"
         CloudCodes.CLOUD_FILE -> "File"
@@ -40,15 +48,38 @@ object EntityMeta {
      * [CloudApiService.IsSyntheticCloudFileDisplayName]). Folders keep `folder-{id}` and are walked.
      */
     fun isSyntheticCloudFileDisplayName(entity: EntityDto, displayName: String): Boolean =
-        entity.code == CloudCodes.CLOUD_FILE &&
+        CloudEntityClassify.isFile(entity.typeEntityId, entity.code) &&
             displayName.equals(fallbackName(entity.id, CloudCodes.CLOUD_FILE), ignoreCase = true)
+
+    fun fallbackName(entity: EntityDto): String {
+        val code = entity.code
+        // Code=display name (Api) — do not replace with folder-/file-{id}.
+        if (!code.isNullOrBlank() &&
+            code != CloudCodes.CLOUD_FILE &&
+            code != CloudCodes.CLOUD_FOLDER &&
+            code != CloudCodes.CLOUD_ROOT
+        ) {
+            return code
+        }
+        val compact = entity.id.replace("-", "")
+        return when {
+            CloudEntityClassify.isFolder(entity.typeEntityId, code) &&
+                !CloudEntityClassify.isCloudRootCode(code) -> "folder-$compact"
+            CloudEntityClassify.isFile(entity.typeEntityId, code) -> "file-$compact"
+            CloudEntityClassify.isCloudRootCode(code) -> "folder-$compact"
+            else -> "file-$compact"
+        }
+    }
 
     /** Win-aligned: folders → `folder-{id}`; files → `file-{id}` when no name slot. */
     fun fallbackName(id: String, code: String?): String {
         val compact = id.replace("-", "")
         return when (code) {
             CloudCodes.CLOUD_FOLDER, CloudCodes.CLOUD_ROOT -> "folder-$compact"
-            else -> "file-$compact"
+            CloudCodes.CLOUD_FILE -> "file-$compact"
+            else -> {
+                if (!code.isNullOrBlank()) code else "file-$compact"
+            }
         }
     }
 

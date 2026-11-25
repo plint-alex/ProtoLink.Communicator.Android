@@ -13,6 +13,7 @@ import ru.protolink.communicator.data.AppSettings
 import ru.protolink.communicator.data.AuthRepository
 import ru.protolink.communicator.data.TokenRefresher
 import ru.protolink.communicator.data.CloudCodes
+import ru.protolink.communicator.data.CloudEntityClassify
 import ru.protolink.communicator.data.CloudSyncMappingDto
 import ru.protolink.communicator.data.CloudListingDiskCache
 import ru.protolink.communicator.data.CloudRecentStore
@@ -802,9 +803,9 @@ class MainViewModel @Inject constructor(
         val name = CloudInteractiveListing.resolveRowName(e, syncMetaLeafNameByRemoteId)
         val updateMillis = ChatTime.parseMillis(e.updateTime)
         val date = ChatTime.formatListMeta(updateMillis)
-        return when (e.code) {
-            CloudCodes.CLOUD_FOLDER, CloudCodes.CLOUD_ROOT -> {
-                folderTreeCodes[e.id.lowercase()] = e.code
+        return when {
+            CloudEntityClassify.isFolder(e.typeEntityId, e.code) -> {
+                folderTreeCodes[e.id.lowercase()] = e.code ?: CloudCodes.CLOUD_FOLDER
                 CloudItem(
                     id = e.id,
                     name = name,
@@ -815,7 +816,7 @@ class MainViewModel @Inject constructor(
                     updateTimeMillis = updateMillis
                 )
             }
-            CloudCodes.CLOUD_FILE -> {
+            CloudEntityClassify.isFile(e.typeEntityId, e.code) -> {
                 val mime = EntityMeta.mimeType(e)
                 val typeCue = CloudFileTypeCue.shortLabel(mime, name)
                 CloudItem(
@@ -1407,15 +1408,14 @@ class MainViewModel @Inject constructor(
         }
 
         val byId = found
-            .filter { isNavigableCloudCode(it.code) }
+            .filter { isNavigableCloudEntity(it) }
             .associateBy { it.id.lowercase() }
         val fresh = ArrayList<CloudItem>()
         val pruned = ArrayList<CloudRecentList.Entry>()
         for (entry in stored) {
             val entity = byId[entry.entityId.lowercase()] ?: continue
             val name = entityDisplayName(entity)
-            val isFolder =
-                entity.code == CloudCodes.CLOUD_FOLDER || entity.code == CloudCodes.CLOUD_ROOT
+            val isFolder = CloudEntityClassify.isFolder(entity.typeEntityId, entity.code)
             val mime = if (!isFolder) EntityMeta.mimeType(entity) else null
             fresh.add(
                 CloudItem(
@@ -1442,9 +1442,10 @@ class MainViewModel @Inject constructor(
     }
 
     private fun isNavigableCloudCode(code: String?): Boolean =
-        code == CloudCodes.CLOUD_FILE ||
-            code == CloudCodes.CLOUD_FOLDER ||
-            code == CloudCodes.CLOUD_ROOT
+        CloudEntityClassify.isCloudFolderOrFile(typeEntityId = null, code = code)
+
+    private fun isNavigableCloudEntity(e: EntityDto): Boolean =
+        CloudEntityClassify.isCloudFolderOrFile(e.typeEntityId, e.code)
 
     private fun recordRecentOpen(entityId: String, name: String, isFolder: Boolean) {
         if (!CloudRecentList.shouldRecordOpen(entityId, cloudRootId)) return
@@ -1483,7 +1484,7 @@ class MainViewModel @Inject constructor(
         val items = list
             .sortedWith(
                 compareByDescending<EntityDto> {
-                    it.code == CloudCodes.CLOUD_FOLDER || it.code == CloudCodes.CLOUD_ROOT
+                    CloudEntityClassify.isFolder(it.typeEntityId, it.code)
                 }.thenByDescending { it.updateTime.orEmpty() }
                     .thenBy { entityDisplayName(it).lowercase() }
             )
@@ -1498,8 +1499,7 @@ class MainViewModel @Inject constructor(
                     creatorId != null -> creatorId.replace("-", "").take(8)
                     else -> "—"
                 }
-                val isFolder =
-                    e.code == CloudCodes.CLOUD_FOLDER || e.code == CloudCodes.CLOUD_ROOT
+                val isFolder = CloudEntityClassify.isFolder(e.typeEntityId, e.code)
                 val name = entityDisplayName(e)
                 val mime = if (!isFolder) EntityMeta.mimeType(e) else null
                 val sharedSub = ShareSheetCloudStrings.sharedRowSubtitle(lang, creatorName, canWrite)
@@ -1557,11 +1557,9 @@ class MainViewModel @Inject constructor(
             val name = root.entityName?.takeIf { it.isNotBlank() }
                 ?: meta?.let { entityDisplayName(it) }
                 ?: entityId.take(8)
-            val isFolder = when (meta?.code) {
-                CloudCodes.CLOUD_FILE -> false
-                CloudCodes.CLOUD_FOLDER, CloudCodes.CLOUD_ROOT -> true
-                else -> true
-            }
+            val isFolder = meta == null ||
+                CloudEntityClassify.isFolder(meta.typeEntityId, meta.code) ||
+                !CloudEntityClassify.isFile(meta.typeEntityId, meta.code)
             val peopleNames = root.peoplePreview.orEmpty().mapNotNull { p ->
                 p.displayName?.takeIf { it.isNotBlank() }
             }
@@ -1903,9 +1901,8 @@ class MainViewModel @Inject constructor(
                 }
                 return false
             }
-            if (!isNavigableCloudCode(entity.code)) return false
-            val isFolder =
-                entity.code == CloudCodes.CLOUD_FOLDER || entity.code == CloudCodes.CLOUD_ROOT
+            if (!CloudEntityClassify.isCloudFolderOrFile(entity.typeEntityId, entity.code)) return false
+            val isFolder = CloudEntityClassify.isFolder(entity.typeEntityId, entity.code)
             val chain = ArrayList<Pair<EntityDto, String>>()
             var current = entity
             var currentMainParentId: String? = null
@@ -2064,7 +2061,7 @@ class MainViewModel @Inject constructor(
             )
         )
         val folderKids = ArrayList<CloudFolderTree.Node>()
-        for (e in list.filter { CloudFolderTree.isFolderTreeCode(it.code) }
+        for (e in list.filter { CloudFolderTree.isFolderTreeEntity(it.typeEntityId, it.code) }
             .sortedBy { entityDisplayName(it).lowercase() }) {
             if (folderTreeFolderCount >= CloudFolderTree.DEFAULT_MAX_FOLDERS) break
             folderTreeCodes[e.id.lowercase()] = e.code ?: CloudCodes.CLOUD_FOLDER
@@ -3188,7 +3185,7 @@ class MainViewModel @Inject constructor(
             }.getOrElse { emptyList() }
             if (children.isEmpty()) break
             for (e in children) {
-                if (e.code != CloudCodes.CLOUD_FOLDER && e.code != CloudCodes.CLOUD_ROOT) continue
+                if (!CloudEntityClassify.isFolder(e.typeEntityId, e.code)) continue
                 if (e.id.isBlank()) continue
                 folderIds.add(e.id)
                 creationById.putIfAbsent(e.id.lowercase(), e.creationTime)
@@ -4321,7 +4318,7 @@ class MainViewModel @Inject constructor(
                 )
             )
             for (e in page) {
-                all.add(CloudFolderDelete.ChildRef(e.id, e.code))
+                all.add(CloudFolderDelete.ChildRef(e.id, e.code, e.typeEntityId))
             }
             if (page.size < take) break
             skip += take

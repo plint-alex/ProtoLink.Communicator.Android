@@ -15,6 +15,11 @@ import java.io.File
  *
  * When [SafPrimaryPath] can resolve the tree, snapshot via [File] + [SafPrimaryPath.listChildNames]
  * (Os.listdir under scoped storage) — same decision table, SAF peculiarity only.
+ *
+ * **No ghost folder stubs** (tip 1.0.112): Win GetDirectories/GetFiles never invent entries for
+ * names that are neither a real dir nor a readable file. Promoting those names to folder stubs
+ * blocked [LocalChange.Removed] after shell/SAF delete (tester FAIL_CLASS
+ * `LOCAL_DELETE_NOT_REMOTE_DELETE` on 1.0.111) and made Force Upload see “folders only”.
  */
 object SafPrimarySnapshot {
     fun snapshot(root: File, computeContentHashes: Boolean): List<FsEntry> {
@@ -34,13 +39,32 @@ object SafPrimarySnapshot {
             }
         }
 
-        fun isDirectoryLike(f: File): Boolean {
-            if (f.isDirectory) return true
-            if (f.isFile) return false
-            // Os.listdir may return a name while File metadata is briefly stale.
-            return runCatching {
-                SafPrimaryPath.listChildNames(f).isNotEmpty() && !f.isFile
+        fun addFile(childRel: String, child: File) {
+            if (computeContentHashes) {
+                val hash = ContentHashUtil.trySha256Hex { child.readBytes() }
+                if (hash == null) return
+                val len = child.length()
+                files.add(FsEntry(childRel, false, len, hash))
+                rollSizeIntoAncestors(childRel, len)
+            } else {
+                val len = child.length()
+                files.add(FsEntry(childRel, false, len, ""))
+                rollSizeIntoAncestors(childRel, len)
+            }
+        }
+
+        /**
+         * Win File.Exists / FileInfo: real directory, else readable file.
+         * Scoped-storage OEMs sometimes leave isFile=false while the path is still a readable
+         * blob — probe open rather than inventing a folder stub (delete-converge hazard).
+         */
+        fun classifyChild(child: File): ChildKind {
+            if (child.isDirectory) return ChildKind.Directory
+            if (child.isFile) return ChildKind.File
+            val readableFile = runCatching {
+                child.inputStream().use { true }
             }.getOrDefault(false)
+            return if (readableFile) ChildKind.File else ChildKind.Omit
         }
 
         fun walk(dir: File, rel: String) {
@@ -51,24 +75,15 @@ object SafPrimarySnapshot {
                 val nameKey = rawName.lowercase()
                 val child = File(dir, rawName)
                 val childRel = if (rel.isEmpty()) nameKey else "$rel/$nameKey"
-                if (isDirectoryLike(child) && !child.isFile) {
-                    rememberFolder(childRel)
-                    walk(child, childRel)
-                } else if (child.isFile) {
-                    if (computeContentHashes) {
-                        val hash = ContentHashUtil.trySha256Hex { child.readBytes() }
-                        if (hash == null) continue
-                        val len = child.length()
-                        files.add(FsEntry(childRel, false, len, hash))
-                        rollSizeIntoAncestors(childRel, len)
-                    } else {
-                        val len = child.length()
-                        files.add(FsEntry(childRel, false, len, ""))
-                        rollSizeIntoAncestors(childRel, len)
+                when (classifyChild(child)) {
+                    ChildKind.Directory -> {
+                        rememberFolder(childRel)
+                        walk(child, childRel)
                     }
-                } else {
-                    // Name visible but neither file nor readable dir — folder stub (Win keeps dirs).
-                    rememberFolder(childRel)
+                    ChildKind.File -> addFile(childRel, child)
+                    ChildKind.Omit -> {
+                        // Win SnapshotFs omits unlistable names — do not stub as folders.
+                    }
                 }
             }
         }
@@ -81,4 +96,6 @@ object SafPrimarySnapshot {
         }
         return out
     }
+
+    private enum class ChildKind { Directory, File, Omit }
 }

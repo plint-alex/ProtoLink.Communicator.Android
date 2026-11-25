@@ -48,6 +48,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import ru.protolink.communicator.data.CloudCodes
+import ru.protolink.communicator.data.CloudEntityClassify
 import ru.protolink.communicator.data.api.AddEntityRequest
 import ru.protolink.communicator.data.api.GetEntitiesRequest
 import ru.protolink.communicator.data.api.ProtoLinkApi
@@ -103,11 +104,8 @@ fun CloudPickerDialog(
                 )
             )
             val rows = list.mapNotNull { e ->
-                val code = e.code.orEmpty()
-                val isFolder =
-                    code.equals(CloudCodes.CLOUD_FOLDER, true) ||
-                        code.equals(CloudCodes.CLOUD_ROOT, true)
-                val isFile = code.equals(CloudCodes.CLOUD_FILE, true)
+                val isFolder = CloudEntityClassify.isFolder(e.typeEntityId, e.code)
+                val isFile = CloudEntityClassify.isFile(e.typeEntityId, e.code)
                 if (!isFolder && !isFile) return@mapNotNull null
                 val mime = EntityMeta.mimeType(e)
                 val name = EntityMeta.displayName(e)

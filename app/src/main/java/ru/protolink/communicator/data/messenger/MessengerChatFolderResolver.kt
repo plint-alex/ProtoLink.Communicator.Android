@@ -2,6 +2,7 @@ package ru.protolink.communicator.data.messenger
 
 import retrofit2.HttpException
 import ru.protolink.communicator.data.CloudCodes
+import ru.protolink.communicator.data.CloudEntityClassify
 import ru.protolink.communicator.data.SettingsStore
 import ru.protolink.communicator.data.api.AddEntityRequest
 import ru.protolink.communicator.data.api.AddValueRequest
@@ -71,12 +72,12 @@ class MessengerChatFolderResolver(
             GetEntitiesRequest(parentIds = listOf(chatsId), includeValues = true, take = 500)
         )
         val siblingNames = siblings
-            .filter { it.code.equals(CloudCodes.CLOUD_FOLDER, ignoreCase = true) }
+            .filter { CloudEntityClassify.isFolder(it.typeEntityId, it.code) }
             .map { EntityMeta.displayName(it) }
 
         val folderName = ChatFolderNaming.chooseFolderName(partnerDisplayName, partnerUserId, siblingNames)
         val existing = siblings.firstOrNull { e ->
-            e.code.equals(CloudCodes.CLOUD_FOLDER, ignoreCase = true) &&
+            CloudEntityClassify.isFolder(e.typeEntityId, e.code) &&
                 EntityMeta.displayName(e).equals(folderName, ignoreCase = true)
         }
 
@@ -166,7 +167,7 @@ class MessengerChatFolderResolver(
             GetEntitiesRequest(parentIds = listOf(parentId), includeValues = true, take = 200)
         )
         val hit = children.firstOrNull { e ->
-            e.code.equals(CloudCodes.CLOUD_FOLDER, ignoreCase = true) &&
+            CloudEntityClassify.isFolder(e.typeEntityId, e.code) &&
                 EntityMeta.displayName(e).equals(name, ignoreCase = true)
         }
         if (hit?.id != null) return hit.id

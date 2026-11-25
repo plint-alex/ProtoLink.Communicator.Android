@@ -1,6 +1,7 @@
 package ru.protolink.communicator.util
 
 import ru.protolink.communicator.data.CloudCodes
+import ru.protolink.communicator.data.CloudEntityClassify
 import ru.protolink.communicator.data.CloudSyncMappingDto
 import ru.protolink.communicator.sync.ports.LocalFileSystem
 
@@ -10,7 +11,7 @@ import ru.protolink.communicator.sync.ports.LocalFileSystem
  * CloudViewModel.DeleteAsync / DeleteFolderRecursiveAsync / CloudMappingMirrorPaths.
  */
 object CloudFolderDelete {
-    data class ChildRef(val id: String, val code: String?)
+    data class ChildRef(val id: String, val code: String?, val typeEntityId: String? = null)
 
     data class MirrorTarget(
         val rootUri: String,
@@ -157,13 +158,12 @@ object CloudFolderDelete {
         val children = listChildren(folderId)
         for (c in children) {
             if (c.id.equals(folderId, ignoreCase = true)) continue
-            val code = c.code.orEmpty()
             when {
-                code.equals(CloudCodes.CLOUD_FILE, ignoreCase = true) -> {
+                CloudEntityClassify.isFile(c.typeEntityId, c.code) -> {
                     deleteEntity(c.id)
                     deletedIds?.add(c.id)
                 }
-                code.equals(CloudCodes.CLOUD_FOLDER, ignoreCase = true) -> {
+                CloudEntityClassify.isFolder(c.typeEntityId, c.code) -> {
                     deleteFolderRecursive(c.id, listChildren, deleteEntity, deletedIds)
                 }
             }

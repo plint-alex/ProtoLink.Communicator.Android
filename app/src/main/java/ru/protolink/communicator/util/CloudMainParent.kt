@@ -1,6 +1,7 @@
 package ru.protolink.communicator.util
 
 import ru.protolink.communicator.data.CloudCodes
+import ru.protolink.communicator.data.CloudEntityClassify
 import ru.protolink.communicator.data.api.EntityDto
 
 /**
@@ -30,5 +31,8 @@ object CloudMainParent {
     }
 
     fun isCloudFolderOrRoot(code: String?): Boolean =
-        code == CloudCodes.CLOUD_FOLDER || code == CloudCodes.CLOUD_ROOT
+        CloudEntityClassify.isFolder(typeEntityId = null, code = code)
+
+    fun isCloudFolderOrRoot(typeEntityId: String?, code: String?): Boolean =
+        CloudEntityClassify.isFolder(typeEntityId, code)
 }

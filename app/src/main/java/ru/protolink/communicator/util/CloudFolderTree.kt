@@ -1,6 +1,7 @@
 package ru.protolink.communicator.util
 
 import ru.protolink.communicator.data.CloudCodes
+import ru.protolink.communicator.data.CloudEntityClassify
 
 /**
  * Pure helpers for Communicator Cloud/Photos persistent folder tree (AT-PC1 / AT-PC8 / E9b).
@@ -31,7 +32,10 @@ object CloudFolderTree {
     )
 
     fun isFolderTreeCode(code: String?): Boolean =
-        code == CloudCodes.CLOUD_FOLDER || code == CloudCodes.CLOUD_ROOT
+        CloudEntityClassify.isFolder(typeEntityId = null, code = code)
+
+    fun isFolderTreeEntity(typeEntityId: String?, code: String?): Boolean =
+        CloudEntityClassify.isFolder(typeEntityId, code)
 
     /**
      * Tree root from breadcrumb: prefer CloudRoot id when present; else first non-virtual crumb;

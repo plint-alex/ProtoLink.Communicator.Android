@@ -1715,9 +1715,9 @@ class SyncEngine(
             )
             files++
         }
-        if (files == 0) {
-            throw SyncException("Force upload processed 0 files (folders only or empty tree).")
-        }
+        // Win ForcePushMappingCoreAsync does not throw when the tree is folders-only — it just
+        // finishes. Android-only "0 files" abort hid Sync delete residuals behind Force chrome
+        // (tester 1.0.111: "Force upload processed 0 files (folders only or empty tree).").
         store.setLastSyncUtc(mapping.id, Instant.now())
         return files
     }

@@ -98,6 +98,8 @@ data class SearchEntityItemDto(
 data class EntityDto(
     val id: String,
     val code: String?,
+    /** Cube type id — typeCloudFolder / typeCloudFile (Code is display name). */
+    @SerializedName("typeEntityId") val typeEntityId: String? = null,
     val version: Int = 0,
     val creationTime: String? = null,
     val updateTime: String? = null,

@@ -57,6 +57,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import ru.protolink.communicator.data.CloudCodes
+import ru.protolink.communicator.data.CloudEntityClassify
 import ru.protolink.communicator.data.api.GetEntitiesRequest
 import ru.protolink.communicator.data.api.ProtoLinkApi
 import ru.protolink.communicator.util.EntityLinkUnfurl
@@ -613,9 +614,11 @@ private suspend fun loadUnfurlCard(
         }
         val e = entities[0]
         val title = EntityMeta.displayName(e)
-        val typeName = EntityMeta.typeLabel(e.code)
+        val typeName = EntityMeta.typeLabel(e)
         var thumb: Bitmap? = null
-        if (e.code == CloudCodes.CLOUD_FILE && MessengerAttachmentRender.looksLikeImageMime(EntityMeta.mimeType(e))) {
+        if (CloudEntityClassify.isFile(e.typeEntityId, e.code) &&
+            MessengerAttachmentRender.looksLikeImageMime(EntityMeta.mimeType(e))
+        ) {
             thumb = fetchImageSuspend(api, entityId, 96, 96).bitmap
         }
         MessengerUnfurlCache.put(

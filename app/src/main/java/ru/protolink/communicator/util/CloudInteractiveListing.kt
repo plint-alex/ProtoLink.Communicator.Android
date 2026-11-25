@@ -1,6 +1,7 @@
 package ru.protolink.communicator.util
 
 import ru.protolink.communicator.data.CloudCodes
+import ru.protolink.communicator.data.CloudEntityClassify
 import ru.protolink.communicator.data.api.EntityDto
 import ru.protolink.communicator.sync.model.SyncItemMeta
 
@@ -36,8 +37,9 @@ object CloudInteractiveListing {
 
     fun isSyntheticDisplayName(entity: EntityDto, displayName: String): Boolean {
         if (EntityMeta.isSyntheticCloudFileDisplayName(entity, displayName)) return true
-        return (entity.code == CloudCodes.CLOUD_FOLDER || entity.code == CloudCodes.CLOUD_ROOT) &&
-            displayName.equals(EntityMeta.fallbackName(entity.id, entity.code), ignoreCase = true)
+        return CloudEntityClassify.isFolder(entity.typeEntityId, entity.code) &&
+            !CloudEntityClassify.isCloudRootCode(entity.code) &&
+            displayName.equals(EntityMeta.fallbackName(entity.id, CloudCodes.CLOUD_FOLDER), ignoreCase = true)
     }
 
     /**
@@ -114,15 +116,13 @@ object CloudInteractiveListing {
         return out
     }
 
-    /** Count only CloudFolder/CloudRoot — junk CloudFiles must not win SameNamed heal. */
+    /** Count only folders/roots — junk CloudFiles must not win SameNamed heal. */
     fun folderChildCount(children: List<EntityDto>): Int =
-        children.count {
-            it.code == CloudCodes.CLOUD_FOLDER || it.code == CloudCodes.CLOUD_ROOT
-        }
+        children.count { CloudEntityClassify.isFolder(it.typeEntityId, it.code) }
 
     /** CloudFile children only — used with [healRichnessScore] for near-clone junk twins. */
     fun fileChildCount(children: List<EntityDto>): Int =
-        children.count { it.code == CloudCodes.CLOUD_FILE }
+        children.count { CloudEntityClassify.isFile(it.typeEntityId, it.code) }
 
     /**
      * SameNamed heal score: folders win, but junk-file bloat loses near-clone ties.

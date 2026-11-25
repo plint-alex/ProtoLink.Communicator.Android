@@ -44,4 +44,36 @@ class SafPrimarySnapshotTest {
         assertThat(file.contentHash).isNotEmpty()
         assertThat(file.sizeBytes).isEqualTo(3L)
     }
+
+    @Test
+    fun snapshot_omitsDeletedFolder_soClassifierCanRemove() {
+        // Win GetDirectories: gone path absent from snap → LocalChange.Removed → DeleteEntity.
+        val root = tmp.newFolder("delete-root")
+        val fixture = java.io.File(root, "at-sync-threeway-delete-test").also { it.mkdirs() }
+        java.io.File(fixture, "readme-test.txt").writeText("threeway")
+        assertThat(
+            SafPrimarySnapshot.snapshot(root, computeContentHashes = false)
+                .any { it.relativePath == "at-sync-threeway-delete-test" && it.isFolder }
+        ).isTrue()
+
+        fixture.deleteRecursively()
+        val after = SafPrimarySnapshot.snapshot(root, computeContentHashes = false)
+        assertThat(after.any { it.relativePath.startsWith("at-sync-threeway-delete-test") })
+            .isFalse()
+    }
+
+    @Test
+    fun snapshot_doesNotInventFolderStub_forUnlistableName() {
+        // Regression: ghost folder stubs at former file/folder paths blocked Removed (1.0.111).
+        val root = tmp.newFolder("ghost-root")
+        val real = java.io.File(root, "keep").also { it.mkdirs() }
+        java.io.File(real, "a.txt").writeText("x")
+        // Simulate Os.listdir ghost: create then delete so walk only sees real kids.
+        val ghost = java.io.File(root, "ghost-name")
+        ghost.mkdirs()
+        ghost.deleteRecursively()
+        val snap = SafPrimarySnapshot.snapshot(root, computeContentHashes = false)
+        assertThat(snap.any { it.relativePath == "ghost-name" }).isFalse()
+        assertThat(snap.any { it.relativePath == "keep" && it.isFolder }).isTrue()
+    }
 }
