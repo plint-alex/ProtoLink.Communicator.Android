@@ -731,6 +731,87 @@ class SyncEngineTest {
     }
 
     @Test
+    fun reconcile_agentsQueueChurn_stillDownloadsApiOnly_andDeletesLocalRemoved() = runTest {
+        // Tip 1.0.115: sticky Syncing after 1.0.114 — Agents exclude must apply on Sync
+        // Walk/ApplyRemote/ApplyLocal so Api-only download + local-delete converge.
+        val (store, fs, remote) = harness()
+        val keepBytes = "stable-keep".toByteArray()
+        val dlBytes = "api-only-download".toByteArray()
+        remote.seedFile("keep-f", "cloud-root", "keep.txt", keepBytes)
+        remote.seedFile("dl-f", "cloud-root", "at-sync-threeway-download-test", dlBytes)
+        remote.seedFolder("del-f", "cloud-root", "at-sync-threeway-delete-test")
+        // Agents cloud churn under map root (unknown kids would IncludeValues forever).
+        remote.seedFolder("agents-root", "cloud-root", "Agents")
+        remote.seedFolder("agents-roles", "agents-root", "roles")
+        remote.seedFolder("agents-fe", "agents-roles", "frontend-developer")
+        remote.seedFolder("agents-todo", "agents-fe", "todo")
+        remote.seedFolder("agents-task", "agents-todo", "P0-churn-shell")
+        remote.seedFile(
+            "agents-idx",
+            "agents-task",
+            "index.html",
+            "agents-cloud-v1".toByteArray()
+        )
+        fs.writeFile(root, "keep.txt", keepBytes)
+        // Local Agents present (must not be wiped when Walk skips Agents BFS).
+        val agentsLocal = "Agents/roles/frontend-developer/todo/P0-churn-shell/index.html"
+        fs.createDirectory(root, PathUtil.parentOf(agentsLocal))
+        fs.writeFile(root, agentsLocal, "agents-local".toByteArray())
+        // Delete fixture: meta+remote exist; local gone → ApplyLocal Removed → DeleteEntity.
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "keep-f",
+                parentRemoteId = "cloud-root",
+                relativePath = "keep.txt",
+                isFolder = false,
+                sizeBytes = keepBytes.size.toLong(),
+                contentHash = ContentHashUtil.sha256Hex(keepBytes)
+            )
+        )
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "del-f",
+                parentRemoteId = "cloud-root",
+                relativePath = "at-sync-threeway-delete-test",
+                isFolder = true,
+                sizeBytes = 0
+            )
+        )
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "agents-root",
+                parentRemoteId = "cloud-root",
+                relativePath = "Agents",
+                isFolder = true,
+                sizeBytes = 0
+            )
+        )
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "agents-idx",
+                parentRemoteId = "agents-task",
+                relativePath = agentsLocal,
+                isFolder = false,
+                sizeBytes = 12,
+                contentHash = ContentHashUtil.sha256Hex("agents-local".toByteArray())
+            )
+        )
+
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        assertThat(fs.exists(root, "at-sync-threeway-download-test")).isTrue()
+        assertThat(String(fs.readFile(root, "at-sync-threeway-download-test"))).isEqualTo("api-only-download")
+        assertThat(remote.get("del-f")).isNull()
+        assertThat(store.getAll("m1").none { it.remoteId == "del-f" }).isTrue()
+        assertThat(fs.exists(root, agentsLocal)).isTrue()
+        assertThat(store.getLastSyncUtc("m1")).isNotNull()
+    }
+
+    @Test
     fun agentsRoleQueuePaths_protectsMailboxQueues_inboxOutbox() {
         assertThat(
             AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(
@@ -2468,6 +2549,8 @@ class SyncEngineTest {
      * Populated local tree + sparse non-empty remote: children survive full Sync and upload
      * (Win AddEntity/AddFile parity — ADR sync-simple-win-reference). Former
      * reconcile_prunesCloudAbsentLocalWhenRemoteNonEmpty asserted Android-only delete-ghost.
+     * Tip 1.0.115: Agents mailbox queues use AutoPush exclude on Sync ApplyLocal — local
+     * Agents survives but is not uploaded (sticky Syncing / Agents churn class).
      */
     @Test
     fun reconcile_sparseRemote_uploadsLocalOnlyChildren() = runTest {
@@ -2487,7 +2570,7 @@ class SyncEngineTest {
         assertThat(fs.exists(root, "Agents/inbox/todo/note.txt")).isTrue()
         assertThat(remote.childrenOf("cloud-root").any { it.name.equals("tor browser", true) }).isTrue()
         assertThat(remote.childrenOf("cloud-root").any { it.name.equals("confluence", true) }).isTrue()
-        assertThat(remote.childrenOf("cloud-root").any { it.name.equals("Agents", true) }).isTrue()
+        assertThat(remote.childrenOf("cloud-root").none { it.name.equals("Agents", true) }).isTrue()
     }
 
     /** Empty remote still allows local-only upload (first map / push path). */

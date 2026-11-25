@@ -503,13 +503,29 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
             built = if (built.isEmpty()) part else "$built/$part"
             val partFile = SafPrimaryPath.tryResolve(tree, built)
             if (partFile != null && !partFile.isDirectory) partFile.mkdirs()
-            // Prefer parent listChildren (authoritative SAF) over DocumentFile.exists guess —
-            // stale MediaProvider ids after shell rm / File-only mkdirs skipped createDocument
-            // and left Api downloads invisible to SAF (1.0.113 DOWNLOAD residual).
+            val fileOk = partFile?.isDirectory == true
+            // Win CreateDirectory does not list the parent on every segment. Tip 1.0.114 always
+            // listChildren-first starved ApplyRemote under wide Agents parents (sticky Syncing).
+            // Guess-first when File confirms (or non-primary); listChildren only on miss.
+            // Trust DocumentFile.exists only with File confirm — stale MediaProvider ids after
+            // shell rm / File-only mkdirs skipped createDocument (1.0.113 DOWNLOAD residual).
+            val guessed = SafChildResolve.nextChildDocumentId(
+                emptyList(),
+                part,
+                curId
+            ) { guessId ->
+                val uri = SafTreeLister.documentUri(tree, guessId)
+                DocumentFile.fromSingleUri(context, uri)?.exists() == true
+            }
+            if (guessed != null && (partFile == null || fileOk)) {
+                curId = guessed
+                continue
+            }
             val existing = SafTreeLister.listChildren(context, tree, curId)
                 .firstOrNull { it.isDirectory && it.name.equals(part, true) }
             if (existing != null) {
                 curId = existing.documentId
+                if (partFile != null && !partFile.isDirectory) partFile.mkdirs()
                 continue
             }
             val created = DocumentsContract.createDocument(
@@ -520,27 +536,31 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
             )
             if (created != null) {
                 curId = DocumentsContract.getDocumentId(created)
+                if (partFile != null && !partFile.isDirectory) partFile.mkdirs()
                 continue
             }
-            // createDocument miss: one short flush then re-list / re-create (SAF lag only).
-            SafPrimaryPath.flushListing(
-                context, tree, PathUtil.parentOf(built), waitMs = SafPrimaryPath.FLUSH_WAIT_ROOT_MS
-            )
-            val afterFlush = SafTreeLister.listChildren(context, tree, curId)
-                .firstOrNull { it.isDirectory && it.name.equals(part, true) }
-            if (afterFlush != null) {
-                curId = afterFlush.documentId
-                continue
-            }
-            val retry = DocumentsContract.createDocument(
-                context.contentResolver,
-                SafTreeLister.documentUri(tree, curId),
-                DocumentsContract.Document.MIME_TYPE_DIR,
-                part
-            )
-            if (retry != null) {
-                curId = DocumentsContract.getDocumentId(retry)
-                continue
+            // DocumentsContract create failed — File.mkdirs may still have won (primary maps).
+            if (fileOk || (partFile != null && partFile.mkdirs() && partFile.isDirectory)) {
+                SafPrimaryPath.flushListing(
+                    context, tree, built, waitMs = SafPrimaryPath.FLUSH_WAIT_NESTED_MS
+                )
+                val afterMkdir = SafChildResolve.nextChildDocumentId(
+                    emptyList(), part, curId
+                ) { guessId ->
+                    DocumentFile.fromSingleUri(
+                        context, SafTreeLister.documentUri(tree, guessId)
+                    )?.exists() == true
+                }
+                if (afterMkdir != null) {
+                    curId = afterMkdir
+                    continue
+                }
+                val afterFlush = SafTreeLister.listChildren(context, tree, curId)
+                    .firstOrNull { it.isDirectory && it.name.equals(part, true) }
+                if (afterFlush != null) {
+                    curId = afterFlush.documentId
+                    continue
+                }
             }
             error("Cannot create $part")
         }

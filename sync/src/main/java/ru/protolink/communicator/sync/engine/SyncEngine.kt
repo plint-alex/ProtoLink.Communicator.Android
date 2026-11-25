@@ -147,7 +147,16 @@ class SyncEngine(
                 dirty
             )
             val remoteForMapping = enrichedRemote.filter { it.mappingId == mapping.id }
-            localCount += applyLocalPhase(mapping, dirty, skipSizeUpdates = true, remoteForMapping)
+            // Win PushLocalChanges Agents exclude: extend to Sync ApplyLocal so mapped
+            // MyNotesFolder can stamp LastSync while AgentTeam rewrites queues (Android SAF
+            // hung sticky Syncing on 1.0.114; Win File IO finished without this).
+            localCount += applyLocalPhase(
+                mapping,
+                dirty,
+                skipSizeUpdates = true,
+                remoteForMapping,
+                excludeAgentsQueues = true
+            )
             store.setLastSyncUtc(mapping.id, Instant.now())
         }
         return Result(localCount, remoteCount)
@@ -217,11 +226,14 @@ class SyncEngine(
             // ensureActive left mutex held >120s on MyNotesFolder → FORCE_SYNC_LOCK_TIMEOUT).
             coroutineContext.ensureActive()
             if (meta.isFolder) continue
+            val path = PathUtil.normalize(meta.relativePath)
+            // Same Agents exclude class as AutoPush/Force — getFile×Agents churn starved
+            // ApplyRemote download fixtures (sticky Syncing after 1.0.114).
+            if (AgentsRoleQueuePaths.shouldSkipLocalPush(path)) continue
             val located = remoteById[meta.remoteId] ?: continue
             if (located.mappingId != mapping.id) continue
-            if (PathUtil.normalize(located.relativePath) != PathUtil.normalize(meta.relativePath)) continue
+            if (PathUtil.normalize(located.relativePath) != path) continue
 
-            val path = PathUtil.normalize(meta.relativePath)
             val localSize = fs.fileLengthBytes(mapping.localRootPath, path)
 
             // Missing local while meta exists = user deleted (or rename). Let structural
@@ -843,6 +855,17 @@ class SyncEngine(
                 is RemoteChange.Added -> {
                     val located = cross.find { it.entry.id == c.remote.id } ?: continue
                     if (located.mappingId != mapping.id) continue
+                    // AutoPush/Force Agents exclude: skip Sync materialize under queues so
+                    // Api-only fixtures at map root reach LastSync (1.0.114 DOWNLOAD residual).
+                    if (AgentsRoleQueuePaths.shouldSkipLocalPush(c.relativePath)) {
+                        SyncRemoteDownload.logMaterializeFailed(
+                            "ApplyRemotePhase.AgentsQueueSkip",
+                            c.relativePath,
+                            c.remote.id,
+                            "skip Sync materialize under Agents queues"
+                        )
+                        continue
+                    }
                     try {
                         if (c.remote.isFolder) {
                             fs.createDirectory(mapping.localRootPath, c.relativePath)
@@ -897,6 +920,10 @@ class SyncEngine(
                 is RemoteChange.Removed -> {
                     if (c.meta.mappingId != mapping.id) continue
                     if (cross.any { it.entry.id == c.meta.remoteId }) continue
+                    // Walk skips Agents BFS — do not wipe local queues as remote-Removed.
+                    if (AgentsRoleQueuePaths.isForcePruneProtected(c.meta.relativePath, null)) {
+                        continue
+                    }
                     try {
                         if (fs.exists(mapping.localRootPath, c.meta.relativePath)) {
                             fs.delete(mapping.localRootPath, c.meta.relativePath, c.meta.isFolder)
@@ -982,14 +1009,21 @@ class SyncEngine(
         // Warm reconcile: structure-only first; if every child is already in meta, reuse
         // RelativePath names. Any unknown child → one IncludeValues re-list for that folder.
         val warm = metaByRemoteId.isNotEmpty()
+        // Agents queue parents: never IncludeValues re-list (AgentTeam churn → unknown kids
+        // forever). Same exclude class as AutoPush/Force; live 1.0.114 sticky Syncing.
+        val agentsParent = relativeParent.isNotEmpty() &&
+            AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(relativeParent)
         var children = throttle.withPermit {
             remote.listChildrenPaged(folderId, includeValues = !warm)
         }
         var useMetaNames = false
         if (warm) {
             val allKnown = children.isEmpty() || children.all { metaByRemoteId.containsKey(it.id) }
-            if (allKnown) {
+            if (allKnown || agentsParent) {
                 useMetaNames = true
+                if (agentsParent && !allKnown) {
+                    children = children.filter { metaByRemoteId.containsKey(it.id) }
+                }
             } else {
                 children = throttle.withPermit {
                     remote.listChildrenPaged(folderId, includeValues = true)
@@ -1025,7 +1059,10 @@ class SyncEngine(
                         relativePath = rel
                     )
                 )
-                if (child.isFolder) {
+                if (child.isFolder &&
+                    !AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(rel)
+                ) {
+                    // Do not BFS under Agents role/mailbox queues (Force open-queue stop class).
                     subfolders.add(child.id to rel)
                 }
             }
