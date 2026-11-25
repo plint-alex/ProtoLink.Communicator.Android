@@ -732,7 +732,7 @@ class SyncEngineTest {
 
     @Test
     fun reconcile_agentsQueueChurn_stillDownloadsApiOnly_andDeletesLocalRemoved() = runTest {
-        // Tip 1.0.115: sticky Syncing after 1.0.114 — Agents exclude must apply on Sync
+        // Tip 1.0.115+: sticky Syncing after 1.0.114 — Agents exclude on Sync
         // Walk/ApplyRemote/ApplyLocal so Api-only download + local-delete converge.
         val (store, fs, remote) = harness()
         val keepBytes = "stable-keep".toByteArray()
@@ -809,6 +809,125 @@ class SyncEngineTest {
         assertThat(store.getAll("m1").none { it.remoteId == "del-f" }).isTrue()
         assertThat(fs.exists(root, agentsLocal)).isTrue()
         assertThat(store.getLastSyncUtc("m1")).isNotNull()
+    }
+
+    @Test
+    fun reconcile_warmAgentsDocsMeta_doesNotFalseRemove_stillDownloadsAndDeletes() = runTest {
+        // Tip 1.0.116 live shape (1.0.115 FAIL): Walk stops at Agents; warm meta under
+        // Agents/docs/** is NOT queue-protected — must not SAF-delete before Api-only Added.
+        val (store, fs, remote) = harness()
+        val keepBytes = "stable-keep".toByteArray()
+        val dlBytes = "api-only-download-116".toByteArray()
+        val docsBytes = "agents-docs-body".toByteArray()
+        remote.seedFile("keep-f", "cloud-root", "keep.txt", keepBytes)
+        remote.seedFile("dl-f", "cloud-root", "at-sync-threeway-download-test", dlBytes)
+        remote.seedFolder("del-f", "cloud-root", "at-sync-threeway-delete-test")
+        remote.seedFolder("agents-root", "cloud-root", "Agents")
+        // Cloud also has docs (Walk will not descend; meta is warm from prior full walk).
+        remote.seedFolder("agents-docs", "agents-root", "docs")
+        remote.seedFolder("agents-ops", "agents-docs", "ops")
+        remote.seedFile("agents-ops-idx", "agents-ops", "index.html", docsBytes)
+
+        fs.writeFile(root, "keep.txt", keepBytes)
+        val docsLocal = "Agents/docs/ops/index.html"
+        fs.createDirectory(root, PathUtil.parentOf(docsLocal))
+        fs.writeFile(root, docsLocal, docsBytes)
+
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "keep-f",
+                parentRemoteId = "cloud-root",
+                relativePath = "keep.txt",
+                isFolder = false,
+                sizeBytes = keepBytes.size.toLong(),
+                contentHash = ContentHashUtil.sha256Hex(keepBytes)
+            )
+        )
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "del-f",
+                parentRemoteId = "cloud-root",
+                relativePath = "at-sync-threeway-delete-test",
+                isFolder = true,
+                sizeBytes = 0
+            )
+        )
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "agents-root",
+                parentRemoteId = "cloud-root",
+                relativePath = "Agents",
+                isFolder = true,
+                sizeBytes = 0
+            )
+        )
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "agents-docs",
+                parentRemoteId = "agents-root",
+                relativePath = "Agents/docs",
+                isFolder = true,
+                sizeBytes = 0
+            )
+        )
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "agents-ops",
+                parentRemoteId = "agents-docs",
+                relativePath = "Agents/docs/ops",
+                isFolder = true,
+                sizeBytes = 0
+            )
+        )
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "agents-ops-idx",
+                parentRemoteId = "agents-ops",
+                relativePath = docsLocal,
+                isFolder = false,
+                sizeBytes = docsBytes.size.toLong(),
+                contentHash = ContentHashUtil.sha256Hex(docsBytes)
+            )
+        )
+
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        assertThat(fs.exists(root, "at-sync-threeway-download-test")).isTrue()
+        assertThat(String(fs.readFile(root, "at-sync-threeway-download-test")))
+            .isEqualTo("api-only-download-116")
+        assertThat(remote.get("del-f")).isNull()
+        assertThat(store.getAll("m1").none { it.remoteId == "del-f" }).isTrue()
+        // Must not wipe Agents/docs as false remote-Removed (1.0.115 queue-only protect gap).
+        assertThat(fs.exists(root, docsLocal)).isTrue()
+        assertThat(store.getAll("m1").any { it.remoteId == "agents-ops-idx" }).isTrue()
+        assertThat(store.getLastSyncUtc("m1")).isNotNull()
+    }
+
+    @Test
+    fun agentsRoleQueuePaths_isUnderAgentsTree_coversDocsAndQueues() {
+        assertThat(AgentsRoleQueuePaths.isUnderAgentsTree("Agents")).isTrue()
+        assertThat(
+            AgentsRoleQueuePaths.isUnderAgentsTree("Protolink.ru/Agents/docs/ops/index.html")
+        ).isTrue()
+        assertThat(
+            AgentsRoleQueuePaths.isUnderAgentsTree(
+                "Protolink.ru/Agents/roles/frontend-developer/todo/P0/index.html"
+            )
+        ).isTrue()
+        assertThat(AgentsRoleQueuePaths.isUnderAgentsTree("notes/keep.txt")).isFalse()
+        assertThat(AgentsRoleQueuePaths.isUnderAgentsTree("films/AgentsBackup")).isFalse()
+        // Queue matcher still false for docs (gap that 1.0.115 left open).
+        assertThat(
+            AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(
+                "Protolink.ru/Agents/docs/ops/index.html"
+            )
+        ).isFalse()
     }
 
     @Test

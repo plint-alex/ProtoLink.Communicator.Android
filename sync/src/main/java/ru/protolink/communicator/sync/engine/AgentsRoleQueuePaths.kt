@@ -50,6 +50,20 @@ object AgentsRoleQueuePaths {
     }
 
     /**
+     * True when [relativePath] is under any `Agents` segment (including non-queue
+     * Agents/docs trees). Sync Walk stops BFS at the Agents folder itself
+     * ([matchesOpenQueueOrAgentsRolesAncestor]); warm meta under docs/architecture/output
+     * then looks remote-Removed. Tip 1.0.115 only prune-protected queue paths → SAF
+     * recursive delete storm before ApplyRemote Added (DOWNLOAD residual + sticky Syncing).
+     */
+    fun isUnderAgentsTree(relativePath: String): Boolean {
+        val parts = PathUtil.normalize(relativePath)
+            .split('/')
+            .filter { it.isNotEmpty() }
+        return parts.any { it.equals("Agents", ignoreCase = true) }
+    }
+
+    /**
      * AutoPush must not upload AgentTeam queue churn under a mapped MyNotesFolder
      * (Win 1.0.118: continuous Uploading… + LastSync missing while roles/inbox rewrite).
      * Same path class as Force prune protection.

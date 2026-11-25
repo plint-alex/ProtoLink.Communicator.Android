@@ -147,15 +147,15 @@ class SyncEngine(
                 dirty
             )
             val remoteForMapping = enrichedRemote.filter { it.mappingId == mapping.id }
-            // Win PushLocalChanges Agents exclude: extend to Sync ApplyLocal so mapped
-            // MyNotesFolder can stamp LastSync while AgentTeam rewrites queues (Android SAF
-            // hung sticky Syncing on 1.0.114; Win File IO finished without this).
+            // Sync Walk stops at Agents folder — ApplyLocal must skip the whole Agents tree
+            // (not only queues) or Agents/docs looks local-Added and re-uploads forever
+            // (companion to ApplyRemote isUnderAgentsTree Removed protect; 1.0.115 FAIL).
             localCount += applyLocalPhase(
                 mapping,
                 dirty,
                 skipSizeUpdates = true,
                 remoteForMapping,
-                excludeAgentsQueues = true
+                excludeEntireAgentsTree = true
             )
             store.setLastSyncUtc(mapping.id, Instant.now())
         }
@@ -227,9 +227,8 @@ class SyncEngine(
             coroutineContext.ensureActive()
             if (meta.isFolder) continue
             val path = PathUtil.normalize(meta.relativePath)
-            // Same Agents exclude class as AutoPush/Force — getFile×Agents churn starved
-            // ApplyRemote download fixtures (sticky Syncing after 1.0.114).
-            if (AgentsRoleQueuePaths.shouldSkipLocalPush(path)) continue
+            // Sync Walk stops at Agents — skip getFile for any Agents path (queues + docs).
+            if (AgentsRoleQueuePaths.isUnderAgentsTree(path)) continue
             val located = remoteById[meta.remoteId] ?: continue
             if (located.mappingId != mapping.id) continue
             if (PathUtil.normalize(located.relativePath) != path) continue
@@ -475,11 +474,16 @@ class SyncEngine(
         dirty: MutableSet<String>,
         skipSizeUpdates: Boolean,
         remoteInMapping: List<RemoteChangeClassifier.RemoteLocated> = emptyList(),
-        excludeAgentsQueues: Boolean = false
+        excludeAgentsQueues: Boolean = false,
+        excludeEntireAgentsTree: Boolean = false
     ): Int {
         // Win ApplyLocal: reconcile → size/structure only; push → hash for same-size Updated.
-        val skipPath: ((String) -> Boolean)? =
-            if (excludeAgentsQueues) AgentsRoleQueuePaths::shouldSkipLocalPush else null
+        // AutoPush: queue-only skip (Win 1.0.118). Sync+Walk Agents stop: whole Agents tree.
+        val skipPath: ((String) -> Boolean)? = when {
+            excludeEntireAgentsTree -> AgentsRoleQueuePaths::isUnderAgentsTree
+            excludeAgentsQueues -> AgentsRoleQueuePaths::shouldSkipLocalPush
+            else -> null
+        }
         val snap = fs.snapshot(
             mapping.localRootPath,
             computeContentHashes = !skipSizeUpdates,
@@ -487,8 +491,13 @@ class SyncEngine(
         )
         // Pair snap+meta filters so skipped Agents paths do not classify as Removed.
         val meta = store.getAll(mapping.id).let { all ->
-            if (!excludeAgentsQueues) all
-            else all.filter { !AgentsRoleQueuePaths.shouldSkipLocalPush(it.relativePath) }
+            when {
+                excludeEntireAgentsTree ->
+                    all.filter { !AgentsRoleQueuePaths.isUnderAgentsTree(it.relativePath) }
+                excludeAgentsQueues ->
+                    all.filter { !AgentsRoleQueuePaths.shouldSkipLocalPush(it.relativePath) }
+                else -> all
+            }
         }
         val changes = localClassifier.classify(snap, meta)
         var applied = 0
@@ -855,14 +864,14 @@ class SyncEngine(
                 is RemoteChange.Added -> {
                     val located = cross.find { it.entry.id == c.remote.id } ?: continue
                     if (located.mappingId != mapping.id) continue
-                    // AutoPush/Force Agents exclude: skip Sync materialize under queues so
-                    // Api-only fixtures at map root reach LastSync (1.0.114 DOWNLOAD residual).
-                    if (AgentsRoleQueuePaths.shouldSkipLocalPush(c.relativePath)) {
+                    // Walk stops at Agents — skip materialize under whole Agents tree so
+                    // Api-only fixtures at map root reach LastSync (1.0.115 DOWNLOAD residual).
+                    if (AgentsRoleQueuePaths.isUnderAgentsTree(c.relativePath)) {
                         SyncRemoteDownload.logMaterializeFailed(
-                            "ApplyRemotePhase.AgentsQueueSkip",
+                            "ApplyRemotePhase.AgentsTreeSkip",
                             c.relativePath,
                             c.remote.id,
-                            "skip Sync materialize under Agents queues"
+                            "skip Sync materialize under Agents tree"
                         )
                         continue
                     }
@@ -920,8 +929,11 @@ class SyncEngine(
                 is RemoteChange.Removed -> {
                     if (c.meta.mappingId != mapping.id) continue
                     if (cross.any { it.entry.id == c.meta.remoteId }) continue
-                    // Walk skips Agents BFS — do not wipe local queues as remote-Removed.
-                    if (AgentsRoleQueuePaths.isForcePruneProtected(c.meta.relativePath, null)) {
+                    // Walk stops BFS at Agents folder — queue protect alone left Agents/docs/**
+                    // warm meta as false Removed → SAF delete storm before Added (1.0.115 FAIL).
+                    if (AgentsRoleQueuePaths.isUnderAgentsTree(c.meta.relativePath) ||
+                        AgentsRoleQueuePaths.isForcePruneProtected(c.meta.relativePath, null)
+                    ) {
                         continue
                     }
                     try {

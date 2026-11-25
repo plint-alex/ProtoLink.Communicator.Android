@@ -571,12 +571,25 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
         if (parent.isNotEmpty()) createDirectory(rootPath, parent)
         val name = PathUtil.nameOf(relativePath)
         val tree = treeUri(rootPath)
+        val n = relativePath.replace('\\', '/').trim('/')
+        // Win File.WriteAllBytes: primary File first. Tip 1.0.115 still paid DocumentsContract
+        // listChildren of the wide map root per ApplyRemote Added — DOWNLOAD fixture never
+        // landed under SAF/File while Sync stayed Syncing (1.0.115 reverify FAIL).
+        val primary = SafPrimaryPath.tryResolve(tree, n)
+        if (primary != null) {
+            primary.parentFile?.mkdirs()
+            primary.writeBytes(bytes)
+            SafPrimaryPath.flushListing(
+                context, tree, parent, waitMs = SafPrimaryPath.FLUSH_WAIT_NESTED_MS
+            )
+            return
+        }
         val parentId = if (parent.isEmpty()) {
             SafTreeLister.treeDocumentId(tree)
         } else {
             NotesTreeBuilder.folderDocumentId(tree, parent)
         }
-        // Guess-first then listChildren fallback — avoids O(parent width) query per Force file.
+        // Non-primary trees: guess-first then listChildren fallback.
         val guessId = SafChildResolve.nextChildDocumentId(
             emptyList(),
             name,
