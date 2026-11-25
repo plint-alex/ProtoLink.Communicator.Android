@@ -76,4 +76,28 @@ class SafPrimarySnapshotTest {
         assertThat(snap.any { it.relativePath == "ghost-name" }).isFalse()
         assertThat(snap.any { it.relativePath == "keep" && it.isFolder }).isTrue()
     }
+
+    @Test
+    fun snapshot_seesEmptyFolder_afterFileMkdirs_winCreateDirectoryParity() {
+        // 1.0.112 Omit + DocumentsContract-only create: empty Api download missed File snap.
+        // Tip 1.0.113: File.mkdirs in createDirectory → empty folder must be Directory in snap.
+        val root = tmp.newFolder("download-root")
+        val empty = java.io.File(root, "at-sync-threeway-download-test").also { it.mkdirs() }
+        assertThat(empty.isDirectory).isTrue()
+        val snap = SafPrimarySnapshot.snapshot(root, computeContentHashes = false)
+        assertThat(snap.any { it.relativePath == "at-sync-threeway-download-test" && it.isFolder })
+            .isTrue()
+    }
+
+    @Test
+    fun classifyPrimaryChild_omitsEmptyGhost_keepsRealEmptyDir() {
+        val root = tmp.newFolder("classify-root")
+        val realEmpty = java.io.File(root, "real-empty").also { it.mkdirs() }
+        assertThat(SafPrimaryPath.classifyPrimaryChild(realEmpty))
+            .isEqualTo(SafPrimaryPath.PrimaryChildKind.Directory)
+        val ghost = java.io.File(root, "ghost-empty")
+        assertThat(ghost.exists()).isFalse()
+        assertThat(SafPrimaryPath.classifyPrimaryChild(ghost))
+            .isEqualTo(SafPrimaryPath.PrimaryChildKind.Omit)
+    }
 }

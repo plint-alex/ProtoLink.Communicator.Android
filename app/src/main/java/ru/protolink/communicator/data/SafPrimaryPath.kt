@@ -52,6 +52,24 @@ object SafPrimaryPath {
         tryResolve(treeUri, relativePath)?.takeIf { it.exists() }
 
     /**
+     * Win GetDirectories/GetFiles decision for one Os.listdir name under a primary root.
+     * Real directory or non-empty laggy dir → Directory; readable file → File; else Omit
+     * (no ghost folder stubs — those blocked [LocalChange.Removed] after shell rm on 1.0.111).
+     * Do not open inputStream (OEM hang risk on unlistable names → sticky Syncing).
+     */
+    enum class PrimaryChildKind { Directory, File, Omit }
+
+    fun classifyPrimaryChild(child: File): PrimaryChildKind {
+        if (child.isDirectory) return PrimaryChildKind.Directory
+        if (child.isFile) return PrimaryChildKind.File
+        if (!child.exists()) return PrimaryChildKind.Omit
+        // Laggy directory metadata with visible kids (DocumentsContract mkdir race).
+        val kids = listChildNames(child).filter { it != "." && it != ".." }
+        if (kids.isNotEmpty()) return PrimaryChildKind.Directory
+        return PrimaryChildKind.Omit
+    }
+
+    /**
      * Child names under a primary directory. Uses [File.list] first; on scoped-storage null,
      * [Files.list] then reflective `android.system.Os.listdir` so adb mkdir fixtures still
      * enter the SAF File merge (Win File.Exists discovery parity).

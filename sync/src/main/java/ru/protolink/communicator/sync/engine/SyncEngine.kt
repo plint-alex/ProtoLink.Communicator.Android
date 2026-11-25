@@ -746,9 +746,14 @@ class SyncEngine(
 
         for (rm in removes) {
             coroutineContext.ensureActive()
+            val removedPath = PathUtil.normalize(rm.meta.relativePath)
+            // SAF peculiarity: ApplyRemote may have just materialized this path while File
+            // snapshot still lags — do not DeleteEntity the same-pass download (Win CreateDirectory
+            // is immediately visible so this guard is a no-op there).
+            if (dirty.contains(removedPath)) continue
             remote.delete(rm.meta.remoteId)
             store.delete(mapping.id, rm.meta.relativePath)
-            dirty.add(PathUtil.normalize(rm.meta.relativePath))
+            dirty.add(removedPath)
             applied++
         }
 
@@ -760,7 +765,7 @@ class SyncEngine(
         mappingsById: Map<String, SyncMapping>,
         @Suppress("UNUSED_PARAMETER") remoteInMapping: List<RemoteChangeClassifier.RemoteLocated>,
         allRemote: List<RemoteChangeClassifier.RemoteLocated>,
-        dirty: Set<String>
+        dirty: MutableSet<String>
     ): Int {
         val meta = store.getAll(mapping.id)
         val allIds = store.getAllRemoteIds()
@@ -866,6 +871,8 @@ class SyncEngine(
                         )
                         continue
                     }
+                    // Mark materialized so same-pass ApplyLocal snapshot lag cannot Removed→DeleteEntity.
+                    dirty.add(PathUtil.normalize(c.relativePath))
                     applied++
                 }
                 is RemoteChange.Removed -> {

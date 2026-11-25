@@ -390,15 +390,15 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
             val f = File(dir, rawName)
             val childRel = if (rel.isEmpty()) nameKey else "$rel/$nameKey"
             // Win GetDirectories/GetFiles — no ghost folder stubs (blocks LocalChange.Removed).
-            when {
-                f.isDirectory -> {
+            when (SafPrimaryPath.classifyPrimaryChild(f)) {
+                SafPrimaryPath.PrimaryChildKind.Directory -> {
                     folderSizes.putIfAbsent(childRel, 0L)
                     mergePrimaryFileChildren(
                         tree, childRel, mutableSetOf(), files, folderSizes,
                         computeContentHashes, rollSize
                     )
                 }
-                f.isFile || runCatching { f.inputStream().use { true } }.getOrDefault(false) -> {
+                SafPrimaryPath.PrimaryChildKind.File -> {
                     if (computeContentHashes) {
                         val bytes = runCatching { f.readBytes() }.getOrNull() ?: continue
                         files.add(
@@ -416,7 +416,7 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                         rollSize(childRel, len)
                     }
                 }
-                else -> {
+                SafPrimaryPath.PrimaryChildKind.Omit -> {
                     // Omit unlistable names — Win SnapshotFs does not invent stubs.
                 }
             }
@@ -457,11 +457,13 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                 if (key in seen) continue
                 seen.add(key)
                 val f = File(dir, rawName)
+                val kind = SafPrimaryPath.classifyPrimaryChild(f)
+                if (kind == SafPrimaryPath.PrimaryChildKind.Omit) continue
                 val childRel = if (parentNorm.isEmpty()) rawName else "$parentNorm/$rawName"
                 fromFile.add(
                     FsEntry(
                         relativePath = childRel.replace('\\', '/'),
-                        isFolder = f.isDirectory || !f.isFile,
+                        isFolder = kind == SafPrimaryPath.PrimaryChildKind.Directory,
                         sizeBytes = 0L,
                         contentHash = ""
                     )
@@ -475,9 +477,22 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
         val n = relativePath.replace('\\', '/').trim('/')
         if (n.isEmpty()) return
         val tree = treeUri(rootPath)
+        // Win Directory.CreateDirectory: primary File path first so ApplyLocal SnapshotFs sees
+        // the folder in the same Sync pass (DocumentsContract-only create lagged File/Os →
+        // Omit → false LocalChange.Removed / DOWNLOAD_API_ONLY_NOT_ON_SAF after 1.0.112).
+        val primaryFull = SafPrimaryPath.tryResolve(tree, n)
+        if (primaryFull != null && !primaryFull.isDirectory) {
+            primaryFull.mkdirs()
+        }
         var curId = SafTreeLister.treeDocumentId(tree)
+        var built = ""
         for (part in n.split('/').filter { it.isNotEmpty() }) {
+            built = if (built.isEmpty()) part else "$built/$part"
+            val partFile = SafPrimaryPath.tryResolve(tree, built)
+            val fileOk = partFile?.isDirectory == true
             // Guess-first: Force materialize was spending ~6–7s/file on listChildren of wide parents.
+            // Trust DocumentFile.exists only when File confirms (or non-primary tree) — stale
+            // MediaProvider ids after shell rm / before File mkdir skipped createDocument.
             val guessed = SafChildResolve.nextChildDocumentId(
                 emptyList(),
                 part,
@@ -486,7 +501,7 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                 val uri = SafTreeLister.documentUri(tree, guessId)
                 DocumentFile.fromSingleUri(context, uri)?.exists() == true
             }
-            if (guessed != null) {
+            if (guessed != null && (partFile == null || fileOk)) {
                 curId = guessed
                 continue
             }
@@ -494,6 +509,7 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                 .firstOrNull { it.isDirectory && it.name.equals(part, true) }
             if (existing != null) {
                 curId = existing.documentId
+                if (partFile != null && !partFile.isDirectory) partFile.mkdirs()
                 continue
             }
             val created = DocumentsContract.createDocument(
@@ -501,8 +517,30 @@ class SafLocalFileSystem(private val context: Context) : LocalFileSystem {
                 SafTreeLister.documentUri(tree, curId),
                 DocumentsContract.Document.MIME_TYPE_DIR,
                 part
-            ) ?: error("Cannot create $part")
-            curId = DocumentsContract.getDocumentId(created)
+            )
+            if (created != null) {
+                curId = DocumentsContract.getDocumentId(created)
+                if (partFile != null && !partFile.isDirectory) partFile.mkdirs()
+                continue
+            }
+            // DocumentsContract create failed — File.mkdirs may still have won (primary maps).
+            if (fileOk || (partFile != null && partFile.mkdirs() && partFile.isDirectory)) {
+                SafPrimaryPath.flushListing(
+                    context, tree, built, waitMs = SafPrimaryPath.FLUSH_WAIT_NESTED_MS
+                )
+                val afterMkdir = SafChildResolve.nextChildDocumentId(
+                    emptyList(), part, curId
+                ) { guessId ->
+                    DocumentFile.fromSingleUri(
+                        context, SafTreeLister.documentUri(tree, guessId)
+                    )?.exists() == true
+                }
+                if (afterMkdir != null) {
+                    curId = afterMkdir
+                    continue
+                }
+            }
+            error("Cannot create $part")
         }
     }
 

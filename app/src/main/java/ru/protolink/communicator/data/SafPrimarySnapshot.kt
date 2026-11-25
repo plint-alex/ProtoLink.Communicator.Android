@@ -53,20 +53,6 @@ object SafPrimarySnapshot {
             }
         }
 
-        /**
-         * Win File.Exists / FileInfo: real directory, else readable file.
-         * Scoped-storage OEMs sometimes leave isFile=false while the path is still a readable
-         * blob — probe open rather than inventing a folder stub (delete-converge hazard).
-         */
-        fun classifyChild(child: File): ChildKind {
-            if (child.isDirectory) return ChildKind.Directory
-            if (child.isFile) return ChildKind.File
-            val readableFile = runCatching {
-                child.inputStream().use { true }
-            }.getOrDefault(false)
-            return if (readableFile) ChildKind.File else ChildKind.Omit
-        }
-
         fun walk(dir: File, rel: String) {
             if (rel.isNotEmpty()) rememberFolder(rel)
             val names = SafPrimaryPath.listChildNames(dir)
@@ -75,13 +61,13 @@ object SafPrimarySnapshot {
                 val nameKey = rawName.lowercase()
                 val child = File(dir, rawName)
                 val childRel = if (rel.isEmpty()) nameKey else "$rel/$nameKey"
-                when (classifyChild(child)) {
-                    ChildKind.Directory -> {
+                when (SafPrimaryPath.classifyPrimaryChild(child)) {
+                    SafPrimaryPath.PrimaryChildKind.Directory -> {
                         rememberFolder(childRel)
                         walk(child, childRel)
                     }
-                    ChildKind.File -> addFile(childRel, child)
-                    ChildKind.Omit -> {
+                    SafPrimaryPath.PrimaryChildKind.File -> addFile(childRel, child)
+                    SafPrimaryPath.PrimaryChildKind.Omit -> {
                         // Win SnapshotFs omits unlistable names — do not stub as folders.
                     }
                 }
@@ -96,6 +82,4 @@ object SafPrimarySnapshot {
         }
         return out
     }
-
-    private enum class ChildKind { Directory, File, Omit }
 }

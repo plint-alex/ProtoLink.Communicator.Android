@@ -3628,8 +3628,15 @@ class MainViewModel @Inject constructor(
                     SyncFlight.deferredFull.getAndSet(false) && !SyncFlight.forcePreferred.get()
                 )
                 if (SyncFlight.forcePreferred.get()) {
-                    // Leave Force banner intact when we yielded mid-pass.
-                    _state.update { it.copy(syncing = false) }
+                    // Clear sticky "Syncing…" when Force preempts (1.0.112 Force 0-files success
+                    // no longer overwrote status; tester chrome stayed Syncing after yield).
+                    _state.update { cur ->
+                        val clearSyncingText = cur.status.startsWith("Syncing")
+                        cur.copy(
+                            syncing = false,
+                            status = if (clearSyncingText) "Sync deferred for Force…" else cur.status
+                        )
+                    }
                 } else {
                     _state.update {
                         it.copy(
