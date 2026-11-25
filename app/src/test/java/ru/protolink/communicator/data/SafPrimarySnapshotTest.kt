@@ -90,6 +90,28 @@ class SafPrimarySnapshotTest {
     }
 
     @Test
+    fun snapshot_skipRelativePath_omitsAgentsQueues_keepsSibling() {
+        // Win SnapshotFs(skipRelativePath: ShouldSkipLocalPush) — AutoPush hash budget.
+        val root = tmp.newFolder("skip-root")
+        java.io.File(root, "notes").also { it.mkdirs() }
+        java.io.File(root, "notes/keep.txt").writeText("stable-keep")
+        val agentsTask = java.io.File(
+            root,
+            "Protolink.ru/Agents/roles/frontend-developer/todo/P0-churn-task"
+        ).also { it.mkdirs() }
+        java.io.File(agentsTask, "index.html").writeText("agents-v1")
+
+        val snap = SafPrimarySnapshot.snapshot(
+            root,
+            computeContentHashes = true,
+            skipRelativePath = ru.protolink.communicator.sync.engine.AgentsRoleQueuePaths::shouldSkipLocalPush
+        )
+        assertThat(snap.any { !it.isFolder && it.relativePath == "notes/keep.txt" }).isTrue()
+        assertThat(snap.any { it.relativePath.contains("P0-churn-task") }).isFalse()
+        assertThat(snap.any { it.relativePath.contains("Agents", ignoreCase = true) }).isFalse()
+    }
+
+    @Test
     fun classifyPrimaryChild_omitsEmptyGhost_keepsRealEmptyDir() {
         val root = tmp.newFolder("classify-root")
         val realEmpty = java.io.File(root, "real-empty").also { it.mkdirs() }

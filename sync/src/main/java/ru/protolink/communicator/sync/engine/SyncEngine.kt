@@ -174,7 +174,15 @@ class SyncEngine(
         for (mapping in ready) {
             coroutineContext.ensureActive()
             val dirty = mutableSetOf<String>()
-            applied += applyLocalPhase(mapping, dirty, skipSizeUpdates = false, remoteInMapping = emptyList())
+            // Win PushLocalChanges: excludeAgentsQueues so Autopush settles under mapped
+            // MyNotesFolder while AgentTeam rewrites task HTML (1.0.118 churn class).
+            applied += applyLocalPhase(
+                mapping,
+                dirty,
+                skipSizeUpdates = false,
+                remoteInMapping = emptyList(),
+                excludeAgentsQueues = true
+            )
             store.setLastSyncUtc(mapping.id, Instant.now())
         }
         return applied
@@ -454,11 +462,22 @@ class SyncEngine(
         mapping: SyncMapping,
         dirty: MutableSet<String>,
         skipSizeUpdates: Boolean,
-        remoteInMapping: List<RemoteChangeClassifier.RemoteLocated> = emptyList()
+        remoteInMapping: List<RemoteChangeClassifier.RemoteLocated> = emptyList(),
+        excludeAgentsQueues: Boolean = false
     ): Int {
         // Win ApplyLocal: reconcile → size/structure only; push → hash for same-size Updated.
-        val snap = fs.snapshot(mapping.localRootPath, computeContentHashes = !skipSizeUpdates)
-        val meta = store.getAll(mapping.id)
+        val skipPath: ((String) -> Boolean)? =
+            if (excludeAgentsQueues) AgentsRoleQueuePaths::shouldSkipLocalPush else null
+        val snap = fs.snapshot(
+            mapping.localRootPath,
+            computeContentHashes = !skipSizeUpdates,
+            skipRelativePath = skipPath
+        )
+        // Pair snap+meta filters so skipped Agents paths do not classify as Removed.
+        val meta = store.getAll(mapping.id).let { all ->
+            if (!excludeAgentsQueues) all
+            else all.filter { !AgentsRoleQueuePaths.shouldSkipLocalPush(it.relativePath) }
+        }
         val changes = localClassifier.classify(snap, meta)
         var applied = 0
         val remoteByPath = remoteInMapping.associateBy { PathUtil.normalize(it.relativePath) }

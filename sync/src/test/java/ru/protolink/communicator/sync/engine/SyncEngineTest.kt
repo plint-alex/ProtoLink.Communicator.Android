@@ -614,6 +614,123 @@ class SyncEngineTest {
     }
 
     @Test
+    fun shouldSkipLocalPush_matchesAgentsQueues_notDocs() {
+        // Win SyncAutopushAgentsChurnTests — AutoPush exclude class (1.0.118).
+        assertThat(
+            AgentsRoleQueuePaths.shouldSkipLocalPush(
+                "Protolink.ru/Agents/roles/frontend-developer/todo/P0-x/index.html"
+            )
+        ).isTrue()
+        assertThat(AgentsRoleQueuePaths.shouldSkipLocalPush("Protolink.ru/Agents")).isTrue()
+        assertThat(
+            AgentsRoleQueuePaths.shouldSkipLocalPush(
+                "Protolink.ru/Agents/inbox/todo/ask/index.html"
+            )
+        ).isTrue()
+        assertThat(AgentsRoleQueuePaths.shouldSkipLocalPush("notes/keep.txt")).isFalse()
+        assertThat(
+            AgentsRoleQueuePaths.shouldSkipLocalPush("Protolink.ru/Agents/docs/ops/index.html")
+        ).isFalse()
+    }
+
+    @Test
+    fun pushLocal_agentsQueueChurn_doesNotUpload_andStampsLastSync() = runTest {
+        // Win SyncAutopushAgentsChurnTests.PushLocal_AgentsQueueChurn_DoesNotUpload_AndStampsLastSync
+        val (store, fs, remote) = harness()
+        fs.createDirectory(root, "notes")
+        fs.writeFile(root, "notes/keep.txt", "stable-keep".toByteArray())
+        // Agents at map root (same skip class as Protolink.ru/Agents/…).
+        val agentsTask = "Agents/roles/frontend-developer/todo/P0-churn-task/index.html"
+        fs.createDirectory(root, PathUtil.parentOf(agentsTask))
+        fs.writeFile(root, agentsTask, "agents-v1".toByteArray())
+        val keepBytes = "stable-keep".toByteArray()
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "notes-f",
+                parentRemoteId = "cloud-root",
+                relativePath = "notes",
+                isFolder = true,
+                sizeBytes = keepBytes.size.toLong()
+            )
+        )
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "keep-f",
+                parentRemoteId = "notes-f",
+                relativePath = "notes/keep.txt",
+                isFolder = false,
+                sizeBytes = keepBytes.size.toLong(),
+                contentHash = ContentHashUtil.sha256Hex(keepBytes)
+            )
+        )
+
+        repeat(3) { i ->
+            fs.writeFile(root, agentsTask, "agents-v${i + 2}".toByteArray())
+            val applied = SyncEngine(store, fs, remote).pushLocalChanges(listOf(mapping))
+            assertThat(applied).isEqualTo(0)
+            assertThat(
+                remote.childrenOf("cloud-root").none {
+                    it.name.contains("P0-churn-task", ignoreCase = true) ||
+                        it.name.equals("Agents", ignoreCase = true)
+                }
+            ).isTrue()
+        }
+        assertThat(store.getLastSyncUtc("m1")).isNotNull()
+    }
+
+    @Test
+    fun pushLocal_deleteFixture_notBlockedByAgentsChurn() = runTest {
+        // Sibling three-way delete must still DeleteEntity while Agents queues churn.
+        val (store, fs, remote) = harness()
+        remote.seedFolder("del-f", "cloud-root", "at-sync-threeway-delete-test")
+        fs.createDirectory(root, "notes")
+        fs.writeFile(root, "notes/keep.txt", "stable".toByteArray())
+        val agentsTask = "Agents/roles/frontend-developer/todo/P0-churn/index.html"
+        fs.createDirectory(root, PathUtil.parentOf(agentsTask))
+        fs.writeFile(root, agentsTask, "churn".toByteArray())
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "notes-f",
+                parentRemoteId = "cloud-root",
+                relativePath = "notes",
+                isFolder = true,
+                sizeBytes = 0
+            )
+        )
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "keep-f",
+                parentRemoteId = "notes-f",
+                relativePath = "notes/keep.txt",
+                isFolder = false,
+                sizeBytes = 6,
+                contentHash = ContentHashUtil.sha256Hex("stable".toByteArray())
+            )
+        )
+        store.upsert(
+            SyncItemMeta(
+                mappingId = "m1",
+                remoteId = "del-f",
+                parentRemoteId = "cloud-root",
+                relativePath = "at-sync-threeway-delete-test",
+                isFolder = true,
+                sizeBytes = 0
+            )
+        )
+        // Local gone → Removed; Agents dirty must not starve DeleteEntity.
+        fs.writeFile(root, agentsTask, "churn-v2".toByteArray())
+        val applied = SyncEngine(store, fs, remote).pushLocalChanges(listOf(mapping))
+        assertThat(applied).isAtLeast(1)
+        assertThat(remote.get("del-f")).isNull()
+        assertThat(store.getAll("m1").none { it.remoteId == "del-f" }).isTrue()
+        assertThat(store.getLastSyncUtc("m1")).isNotNull()
+    }
+
+    @Test
     fun agentsRoleQueuePaths_protectsMailboxQueues_inboxOutbox() {
         assertThat(
             AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(
@@ -1562,9 +1679,13 @@ class SyncEngineTest {
         val (store, innerFs, remote) = harness()
         var snapshots = 0
         val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
-            override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> {
+            override fun snapshot(
+                rootPath: String,
+                computeContentHashes: Boolean,
+                skipRelativePath: ((String) -> Boolean)?
+            ): List<FsEntry> {
                 snapshots++
-                return innerFs.snapshot(rootPath, computeContentHashes)
+                return innerFs.snapshot(rootPath, computeContentHashes, skipRelativePath)
             }
         }
         remote.seedFolder("films", "cloud-root", "Films")
@@ -2122,9 +2243,13 @@ class SyncEngineTest {
         var snapshots = 0
         var lengthProbes = 0
         val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
-            override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> {
+            override fun snapshot(
+                rootPath: String,
+                computeContentHashes: Boolean,
+                skipRelativePath: ((String) -> Boolean)?
+            ): List<FsEntry> {
                 snapshots++
-                return innerFs.snapshot(rootPath, computeContentHashes)
+                return innerFs.snapshot(rootPath, computeContentHashes, skipRelativePath)
             }
 
             override fun fileLengthBytes(rootPath: String, relativePath: String): Long? {
@@ -2166,9 +2291,13 @@ class SyncEngineTest {
         var hashedSnaps = 0
         var sizeOnlySnaps = 0
         val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
-            override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> {
+            override fun snapshot(
+                rootPath: String,
+                computeContentHashes: Boolean,
+                skipRelativePath: ((String) -> Boolean)?
+            ): List<FsEntry> {
                 if (computeContentHashes) hashedSnaps++ else sizeOnlySnaps++
-                return innerFs.snapshot(rootPath, computeContentHashes)
+                return innerFs.snapshot(rootPath, computeContentHashes, skipRelativePath)
             }
         }
         remote.seedFolder("keep-f", "cloud-root", "keep")
@@ -2206,9 +2335,13 @@ class SyncEngineTest {
         var snapshots = 0
         var lengthProbes = 0
         val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
-            override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> {
+            override fun snapshot(
+                rootPath: String,
+                computeContentHashes: Boolean,
+                skipRelativePath: ((String) -> Boolean)?
+            ): List<FsEntry> {
                 snapshots++
-                return innerFs.snapshot(rootPath, computeContentHashes)
+                return innerFs.snapshot(rootPath, computeContentHashes, skipRelativePath)
             }
 
             override fun fileLengthBytes(rootPath: String, relativePath: String): Long? {
@@ -2251,9 +2384,13 @@ class SyncEngineTest {
         val (store, innerFs, remote) = harness()
         var hashedSnaps = 0
         val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
-            override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> {
+            override fun snapshot(
+                rootPath: String,
+                computeContentHashes: Boolean,
+                skipRelativePath: ((String) -> Boolean)?
+            ): List<FsEntry> {
                 if (computeContentHashes) hashedSnaps++
-                return innerFs.snapshot(rootPath, computeContentHashes)
+                return innerFs.snapshot(rootPath, computeContentHashes, skipRelativePath)
             }
         }
         innerFs.writeFile(root, "upload-me.txt", "payload".toByteArray())
@@ -2273,9 +2410,13 @@ class SyncEngineTest {
         val (store, innerFs, remote) = harness()
         var snapshots = 0
         val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
-            override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> {
+            override fun snapshot(
+                rootPath: String,
+                computeContentHashes: Boolean,
+                skipRelativePath: ((String) -> Boolean)?
+            ): List<FsEntry> {
                 snapshots++
-                return innerFs.snapshot(rootPath, computeContentHashes)
+                return innerFs.snapshot(rootPath, computeContentHashes, skipRelativePath)
             }
         }
         remote.seedFolder("films-f", "cloud-root", "films")

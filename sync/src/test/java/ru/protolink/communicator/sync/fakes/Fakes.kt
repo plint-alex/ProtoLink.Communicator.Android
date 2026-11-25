@@ -78,19 +78,26 @@ class InMemoryFileSystem : LocalFileSystem {
 
     private fun k(root: String, rel: String) = "${root.trimEnd('/', '\\')}|${PathUtil.normalize(rel)}"
 
-    override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> {
+    override fun snapshot(
+        rootPath: String,
+        computeContentHashes: Boolean,
+        skipRelativePath: ((String) -> Boolean)?
+    ): List<FsEntry> {
         val prefix = "${rootPath.trimEnd('/', '\\')}|"
         val fileRels = files.keys.filter { it.startsWith(prefix) }.map { it.removePrefix(prefix) }
         val dirRels = dirs.filter { it.startsWith(prefix) }.map { it.removePrefix(prefix) }.filter { it.isNotEmpty() }
 
         val result = mutableListOf<FsEntry>()
         for (rel in fileRels) {
+            if (skipRelativePath?.invoke(PathUtil.normalize(rel)) == true) continue
             val bytes = files.getValue(prefix + rel)
             val hash = if (computeContentHashes) ContentHashUtil.sha256Hex(bytes) else ""
             result.add(FsEntry(rel, false, bytes.size.toLong(), hash))
         }
         for (rel in dirRels) {
+            if (skipRelativePath?.invoke(PathUtil.normalize(rel)) == true) continue
             val size = fileRels.filter { it == rel || it.startsWith("$rel/") }
+                .filter { skipRelativePath?.invoke(PathUtil.normalize(it)) != true }
                 .sumOf { files.getValue(prefix + it).size.toLong() }
             result.add(FsEntry(rel, true, size))
         }

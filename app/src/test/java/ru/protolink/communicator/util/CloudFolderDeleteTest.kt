@@ -185,9 +185,14 @@ class CloudFolderDeleteTest {
         val folders = ConcurrentHashMap.newKeySet<String>()
         val deleted = mutableListOf<String>()
 
-        override fun snapshot(rootPath: String, computeContentHashes: Boolean): List<FsEntry> =
-            folders.map { FsEntry(it, true, 0) } +
-                files.map { FsEntry(it.key, false, it.value.size.toLong()) }
+        override fun snapshot(
+            rootPath: String,
+            computeContentHashes: Boolean,
+            skipRelativePath: ((String) -> Boolean)?
+        ): List<FsEntry> =
+            (folders.map { FsEntry(it, true, 0) } +
+                files.map { FsEntry(it.key, false, it.value.size.toLong()) })
+                .filter { skipRelativePath?.invoke(it.relativePath) != true }
 
         override fun listImmediate(rootPath: String, relativePath: String): List<FsEntry> {
             val parent = relativePath.trim('/').lowercase()

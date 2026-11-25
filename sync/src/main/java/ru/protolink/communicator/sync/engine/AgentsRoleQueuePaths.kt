@@ -50,6 +50,14 @@ object AgentsRoleQueuePaths {
     }
 
     /**
+     * AutoPush must not upload AgentTeam queue churn under a mapped MyNotesFolder
+     * (Win 1.0.118: continuous Uploading… + LastSync missing while roles/inbox rewrite).
+     * Same path class as Force prune protection.
+     */
+    fun shouldSkipLocalPush(relativePath: String): Boolean =
+        matchesOpenQueueOrAgentsRolesAncestor(relativePath)
+
+    /**
      * Skip mkdir-only Force materialize for task/ask shells under role or mailbox queues
      * (`…/Agents/roles/<role>/todo|…/<task>`, `…/Agents/inbox|outbox/todo|done/<ask>`).
      */

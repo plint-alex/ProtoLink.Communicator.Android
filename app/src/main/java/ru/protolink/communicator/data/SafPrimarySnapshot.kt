@@ -20,9 +20,15 @@ import java.io.File
  * names that are neither a real dir nor a readable file. Promoting those names to folder stubs
  * blocked [LocalChange.Removed] after shell/SAF delete (tester FAIL_CLASS
  * `LOCAL_DELETE_NOT_REMOTE_DELETE` on 1.0.111) and made Force Upload see “folders only”.
+ *
+ * [skipRelativePath] matches Win SnapshotFs skip (AutoPush Agents queue exclude).
  */
 object SafPrimarySnapshot {
-    fun snapshot(root: File, computeContentHashes: Boolean): List<FsEntry> {
+    fun snapshot(
+        root: File,
+        computeContentHashes: Boolean,
+        skipRelativePath: ((String) -> Boolean)? = null
+    ): List<FsEntry> {
         if (!root.isDirectory && !root.exists()) return emptyList()
         val folderSizes = linkedMapOf<String, Long>()
         val files = mutableListOf<FsEntry>()
@@ -34,6 +40,7 @@ object SafPrimarySnapshot {
         fun rollSizeIntoAncestors(fileRel: String, size: Long) {
             var parent = PathUtil.parentOf(fileRel)
             while (parent.isNotEmpty()) {
+                if (skipRelativePath?.invoke(parent) == true) break
                 folderSizes[parent] = (folderSizes[parent] ?: 0L) + size
                 parent = PathUtil.parentOf(parent)
             }
@@ -54,13 +61,17 @@ object SafPrimarySnapshot {
         }
 
         fun walk(dir: File, rel: String) {
-            if (rel.isNotEmpty()) rememberFolder(rel)
+            if (rel.isNotEmpty()) {
+                if (skipRelativePath?.invoke(rel) == true) return
+                rememberFolder(rel)
+            }
             val names = SafPrimaryPath.listChildNames(dir)
             for (rawName in names) {
                 if (rawName == "." || rawName == "..") continue
                 val nameKey = rawName.lowercase()
                 val child = File(dir, rawName)
                 val childRel = if (rel.isEmpty()) nameKey else "$rel/$nameKey"
+                if (skipRelativePath?.invoke(childRel) == true) continue
                 when (SafPrimaryPath.classifyPrimaryChild(child)) {
                     SafPrimaryPath.PrimaryChildKind.Directory -> {
                         rememberFolder(childRel)
