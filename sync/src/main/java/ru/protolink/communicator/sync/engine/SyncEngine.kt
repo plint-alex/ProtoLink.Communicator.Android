@@ -891,6 +891,18 @@ class SyncEngine(
                     try {
                         if (c.remote.isFolder) {
                             fs.createDirectory(mapping.localRootPath, c.relativePath)
+                            // Win Directory.CreateDirectory + File.Exists: do not upsert meta on
+                            // phantom SAF mkdir — next Sync retries Added (progressive parity;
+                            // 1.0.120 DOWNLOAD lateSAF=NO when meta claimed without land).
+                            if (!fs.exists(mapping.localRootPath, c.relativePath)) {
+                                SyncRemoteDownload.logMaterializeFailed(
+                                    "ApplyRemotePhase.Added",
+                                    c.relativePath,
+                                    c.remote.id,
+                                    "createDirectory did not materialize path"
+                                )
+                                continue
+                            }
                             store.upsert(
                                 SyncItemMeta(
                                     mappingId = mapping.id,
@@ -912,6 +924,15 @@ class SyncEngine(
                                 continue
                             }
                             fs.writeFile(mapping.localRootPath, c.relativePath, bytes)
+                            if (!fs.exists(mapping.localRootPath, c.relativePath)) {
+                                SyncRemoteDownload.logMaterializeFailed(
+                                    "ApplyRemotePhase.Added",
+                                    c.relativePath,
+                                    c.remote.id,
+                                    "writeFile did not materialize path"
+                                )
+                                continue
+                            }
                             store.upsert(
                                 SyncItemMeta(
                                     mappingId = mapping.id,

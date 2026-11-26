@@ -236,6 +236,33 @@ class SyncEngineTest {
     }
 
     /**
+     * Tip 1.0.121: ApplyRemote Added must not upsert meta on phantom mkdir when progressive
+     * is off (bootstrap / Force-class path) — else warm Walk treats id as known and DOWNLOAD
+     * never retries (1.0.120 lateSAF=NO class).
+     */
+    @Test
+    fun reconcile_applyRemote_phantomMkdir_doesNotClaimMeta() = runTest {
+        val (store, innerFs, remote) = harness()
+        remote.seedFolder("dl-f", "cloud-root", "at-sync-threeway-download-test")
+        var phantomAttempts = 0
+        val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
+            override fun createDirectory(rootPath: String, relativePath: String) {
+                val n = PathUtil.normalize(relativePath)
+                if (n == "at-sync-threeway-download-test") {
+                    phantomAttempts++
+                    return
+                }
+                innerFs.createDirectory(rootPath, relativePath)
+            }
+        }
+        // Cold bootstrap uses progressiveMaterialize=false — hits ApplyRemote Added only.
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+        assertThat(phantomAttempts).isAtLeast(1)
+        assertThat(fs.exists(root, "at-sync-threeway-download-test")).isFalse()
+        assertThat(store.getAll("m1").any { it.remoteId == "dl-f" }).isFalse()
+    }
+
+    /**
      * Tip 1.0.120: Sync-first local delete must still DeleteEntity after progressive Walk
      * (1.0.119 soft full budget aborted before ApplyLocal Removed).
      */

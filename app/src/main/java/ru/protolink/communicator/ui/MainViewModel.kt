@@ -43,6 +43,7 @@ import ru.protolink.communicator.sync.ports.MetadataStore
 import ru.protolink.communicator.syncadapt.ApiRemoteCloud
 import ru.protolink.communicator.syncadapt.ForceStatusGuard
 import ru.protolink.communicator.syncadapt.SafLocalFileSystem
+import ru.protolink.communicator.syncadapt.SyncDeferredDrain
 import ru.protolink.communicator.syncadapt.SyncFlight
 import ru.protolink.communicator.data.messenger.MessengerChatFolderResolver
 import ru.protolink.communicator.data.messenger.PendingAttachmentDraft
@@ -3540,7 +3541,11 @@ class MainViewModel @Inject constructor(
     }
 
     fun syncNow() {
-        requestFullSync()
+        // Manual Sync must acquire the lane (Win RequestFullSync WaitAsync when idle /
+        // CancelBudgeted+drain when AutoPush holds). Coalesce-only tryLock orphans
+        // deferredFull after AutoPush paints "No local changes" → DOWNLOAD chrome miss
+        // (1.0.120 FAIL_CLASS DOWNLOAD_API_ONLY_NOT_ON_SAF on c01a45a2).
+        requestFullSync(waitForLane = true)
     }
 
     /** Force (or conflict resolve) owns the status banner — do not clobber with coalesce text. */
@@ -3564,8 +3569,13 @@ class MainViewModel @Inject constructor(
         }
     }
 
-    /** Full reconcile (startup / SignalR / manual). Coalesces if busy. */
-    private fun requestFullSync() {
+    /**
+     * Full reconcile (startup / SignalR / manual).
+     * @param waitForLane manual Sync ([syncNow]): wait for mutex after CancelBudgeted (Win
+     *   RequestFullSync WaitAsync / CancelBudgeted drain). SignalR/startup keep coalesce-only
+     *   tryLock so spam cannot stack waiters.
+     */
+    private fun requestFullSync(waitForLane: Boolean = false) {
         viewModelScope.launch {
             if (!auth.isAuthenticated) {
                 _state.update {
@@ -3597,27 +3607,46 @@ class MainViewModel @Inject constructor(
             }
             if (!SyncFlight.mutex.tryLock()) {
                 // Win CancelBudgetedExclusiveOnly — abort hung AutoPush so deferred full can run.
-                // deferredFull already claimed above.
                 SyncFlight.cancelBudgetedExclusiveOnly()
-                // Do not paint "Full sync queued…" over an in-flight Syncing… banner (1.0.117
-                // delete-plant: SignalR/second request overwrote Syncing → sticky queued forever).
-                // Do not use setStatusUnlessForce: AutoPush syncing=true would keep Uploading…
-                // (1.0.116 DOWNLOAD chrome miss) — only skip when full Sync already owns chrome.
-                if (!_state.value.forceRunning &&
-                    !SyncFlight.forcePreferred.get() &&
-                    !_state.value.syncing
-                ) {
-                    _state.update { it.copy(status = "Full sync queued…") }
+                var acquired = false
+                if (waitForLane) {
+                    // Manual Sync: wait for AutoPush to unlock after CancelBudgeted (Win WaitAsync
+                    // when reclaiming). Re-claim deferredFull — AutoPush may have drained our
+                    // first claim while we waited (1.0.120 DOWNLOAD orphan race).
+                    repeat(SYNC_LANE_WAIT_RETRIES) {
+                        if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) {
+                            return@launch
+                        }
+                        delay(SYNC_LANE_WAIT_MS)
+                        SyncFlight.cancelBudgetedExclusiveOnly()
+                        if (SyncFlight.mutex.tryLock()) {
+                            acquired = true
+                            return@repeat
+                        }
+                    }
                 }
-                return@launch
+                if (!acquired) {
+                    // Do not paint "Full sync queued…" over an in-flight Syncing… banner (1.0.117
+                    // delete-plant: SignalR/second request overwrote Syncing → sticky queued forever).
+                    if (!_state.value.forceRunning &&
+                        !SyncFlight.forcePreferred.get() &&
+                        !_state.value.syncing
+                    ) {
+                        _state.update { it.copy(status = "Full sync queued…") }
+                    }
+                    return@launch
+                }
             }
+            // Re-claim after acquire — holder may have Exchange-drained the startup claim.
+            SyncFlight.deferredFull.set(true)
             // Mutex owner must not be the Force preempt target (1.0.65: cancelling this Job
             // trapped finally behind reconcile child joins). runDeferringToForce binds work.
             _state.update { it.copy(status = "Syncing ${mappings.size} folder(s)…", syncing = true) }
             var reloadAfterRelease = false
             try {
-                // deferredFull claimed above → Win-style drain runs ≥1 reconcileAll.
-                val drained = drainDeferredFullWhileHoldingExclusive()
+                // deferredFull claimed → Win-style drain; re-drain if Sync/SignalR re-claims
+                // while we still hold exclusive (AutoPush "No local changes" orphan class).
+                val drained = drainDeferredFullUntilQuiescent()
                 val lastLocal = drained.localChanges
                 val lastRemote = drained.remoteChanges
                 if (SyncFlight.forcePreferred.get()) {
@@ -3714,6 +3743,29 @@ class MainViewModel @Inject constructor(
             }
             last = result
             passes++
+        }
+        return last
+    }
+
+    /**
+     * Drain until [SyncFlight.deferredFull] stays clear while we still hold exclusive.
+     * Win RunExclusiveAsync keeps the lane until deferred Exchange settles; Android AutoPush
+     * previously drained once then painted "No local changes" while Sync's coalesce claim
+     * arrived after the Exchange loop — orphan deferredFull + DOWNLOAD miss (1.0.120).
+     */
+    private suspend fun drainDeferredFullUntilQuiescent(): SyncEngine.Result {
+        var last = drainDeferredFullWhileHoldingExclusive()
+        var extra = 0
+        while (
+            SyncDeferredDrain.shouldDrainAgain(
+                deferredFull = SyncFlight.deferredFull.get(),
+                forcePreferred = SyncFlight.forcePreferred.get(),
+                extraPassesUsed = extra,
+                maxExtraPasses = MAX_DEFERRED_FULL_PASSES_PER_HOLD
+            )
+        ) {
+            last = drainDeferredFullWhileHoldingExclusive()
+            extra++
         }
         return last
     }
@@ -3894,14 +3946,29 @@ class MainViewModel @Inject constructor(
                 // Win RunExclusiveAsync: always DrainDeferredWhileHoldingExclusive after push/cancel
                 // (no-op when deferredFull clear). Do not unlock then requestFullSync.
                 SyncFlight.markBudgetedExclusive(false)
-                val wantFullChrome = budgetExpired || SyncFlight.deferredFull.get()
+                var wantFullChrome = budgetExpired || SyncFlight.deferredFull.get()
                 if (wantFullChrome) {
                     val maps = mappingStore.load()
                     _state.update {
                         it.copy(status = "Syncing ${maps.size} folder(s)…", syncing = true)
                     }
                 }
-                val drained = drainDeferredFullWhileHoldingExclusive()
+                var drained = drainDeferredFullUntilQuiescent()
+                // Sync tap may claim deferredFull after first quiescent check while we hold
+                // mutex — drain again and flip chrome to Syncing…/Sync complete (1.0.120
+                // DOWNLOAD idle "No local changes" with orphaned deferredFull).
+                if (SyncDeferredDrain.shouldRefuseIdlePaint(
+                        SyncFlight.deferredFull.get(),
+                        SyncFlight.forcePreferred.get()
+                    )
+                ) {
+                    wantFullChrome = true
+                    val maps = mappingStore.load()
+                    _state.update {
+                        it.copy(status = "Syncing ${maps.size} folder(s)…", syncing = true)
+                    }
+                    drained = drainDeferredFullUntilQuiescent()
+                }
                 drainedFull = wantFullChrome
                 if (wantFullChrome) {
                     if (SyncFlight.forcePreferred.get()) {
@@ -3925,6 +3992,25 @@ class MainViewModel @Inject constructor(
                                 mappings = mappingStore.load()
                             )
                         }
+                    }
+                } else if (SyncDeferredDrain.shouldRefuseIdlePaint(
+                        SyncFlight.deferredFull.get(),
+                        SyncFlight.forcePreferred.get()
+                    )
+                ) {
+                    // Own lane — refuse idle paint if Sync coalesced in the last instant.
+                    drainedFull = true
+                    val maps = mappingStore.load()
+                    _state.update {
+                        it.copy(status = "Syncing ${maps.size} folder(s)…", syncing = true)
+                    }
+                    drained = drainDeferredFullUntilQuiescent()
+                    _state.update {
+                        it.copy(
+                            status = "Sync complete (local ${drained.localChanges}, remote ${drained.remoteChanges})",
+                            syncing = false,
+                            mappings = mappingStore.load()
+                        )
                     }
                 } else {
                     // Own lane — do not call forceOwnsStatus(syncing=true) or completion is skipped.
@@ -3969,6 +4055,13 @@ class MainViewModel @Inject constructor(
          * sticky-Sync forever on phone Walk cost (1.0.116 LOCAL_DELETE residual).
          */
         const val MAX_DEFERRED_FULL_PASSES_PER_HOLD = 2
+
+        /**
+         * Manual Sync lane wait after CancelBudgeted (Win WaitAsync reclaim). ~3s covers
+         * AutoPush unlock after budgeted cancel; longer waits belong to Force acquire.
+         */
+        const val SYNC_LANE_WAIT_MS = 50L
+        const val SYNC_LANE_WAIT_RETRIES = 60
     }
 
     private suspend fun notifyOtherDevices() {
