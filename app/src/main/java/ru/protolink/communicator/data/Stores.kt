@@ -5,6 +5,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.google.gson.Gson
 import dagger.hilt.android.qualifiers.ApplicationContext
+import ru.protolink.communicator.util.NotesRootSettings
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -40,10 +41,19 @@ class SettingsStore @Inject constructor(@ApplicationContext context: Context) {
 
     fun load(): AppSettings {
         val json = prefs.getString("settings", null) ?: return AppSettings()
-        val parsed = runCatching { gson.fromJson(json, AppSettings::class.java) }.getOrDefault(AppSettings())
+        var parsed = runCatching { gson.fromJson(json, AppSettings::class.java) }.getOrDefault(AppSettings())
         // Gson sets absent boolean fields to false; default for new installs / old JSON is ON.
-        return if (json.contains("\"reducePhotoSizeBeforeSend\"")) parsed
-        else parsed.copy(reducePhotoSizeBeforeSend = true)
+        if (!json.contains("\"reducePhotoSizeBeforeSend\"")) {
+            parsed = parsed.copy(reducePhotoSizeBeforeSend = true)
+        }
+        // E11: migrate legacy single notesRootUri → ordered list + last-selected.
+        val roots = NotesRootSettings.resolveRoots(parsed)
+        val selected = NotesRootSettings.resolveSelected(parsed, roots)
+        val migrated = NotesRootSettings.write(parsed, roots, selected)
+        if (NotesRootSettings.needsPersistMigration(parsed)) {
+            save(migrated)
+        }
+        return migrated
     }
 
     fun save(settings: AppSettings) {

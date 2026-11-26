@@ -27,7 +27,15 @@ data class AppSettings(
     val theme: String = "Light",
     val apiBaseAddress: String = "http://protolink.ru/",
     val publicSiteBaseUrl: String = "https://protolink.ru/",
+    /**
+     * Legacy single Notes SAF tree URI. Mirrored from [lastSelectedNotesRootUri] on write (E11).
+     * Readers should use NotesRootSettings.resolveRoots / resolveSelected.
+     */
     val notesRootUri: String? = null,
+    /** E11: ordered local Notes SAF tree URIs. Empty/null → fall back to [notesRootUri]. */
+    val notesRootUris: List<String>? = null,
+    /** E11: last selected Notes root URI (must be in [notesRootUris] when set). */
+    val lastSelectedNotesRootUri: String? = null,
     /** Cache: "ownerUserId:partnerUserId" → chat folder entity id (client-contract §4). */
     val messengerChatFolderIds: Map<String, String> = emptyMap(),
     /**

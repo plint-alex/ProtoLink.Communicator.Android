@@ -121,6 +121,7 @@ import ru.protolink.communicator.ui.share.ShareSheetScreen
 import ru.protolink.communicator.util.AuthShellGate
 import ru.protolink.communicator.util.MapLocalFolderStrings
 import ru.protolink.communicator.util.MapLocalFolderUi
+import ru.protolink.communicator.util.NotesRootSettings
 import ru.protolink.communicator.util.ChangePasswordStrings
 import ru.protolink.communicator.util.MessengerAttachMenuStrings
 import ru.protolink.communicator.util.MessengerAttachmentRender
@@ -526,6 +527,18 @@ fun SettingsScreen(
     val tgDivider = Color(0xFFD1D1D6)
     val tgMuted = Color(0xFF8E8E93)
     val accountLang = remember { java.util.Locale.getDefault().toLanguageTag() }
+    val settingsContext = LocalContext.current
+    val pickNotesRoot = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            settingsContext.contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+            vm.addNotesRoot(uri.toString())
+        }
+    }
 
     if (showChangePassword && state.authenticated) {
         ChangePasswordDialog(
@@ -644,6 +657,59 @@ fun SettingsScreen(
                             )
                         }
                     )
+                }
+            }
+
+            item {
+                val notesRoots = NotesRootSettings.resolveRoots(state.settings)
+                val selectedRoot = NotesRootSettings.resolveSelected(state.settings, notesRoots)
+                TgSettingsSectionLabel("Notes")
+                TgSettingsCard {
+                    if (notesRoots.isEmpty()) {
+                        TgSettingsRow(
+                            title = "Notes root folders",
+                            subtitle = "Add a local folder for offline Notes",
+                            trailing = {
+                                TextButton(onClick = { pickNotesRoot.launch(null) }) {
+                                    Text("Add folder", color = tgBlue)
+                                }
+                            }
+                        )
+                    } else {
+                        notesRoots.forEachIndexed { index, uri ->
+                            if (index > 0) {
+                                Divider(Modifier.padding(start = 16.dp), color = tgDivider, thickness = 0.5.dp)
+                            }
+                            val label = MapLocalFolderStrings.suggestedFolderNameFromUri(uri)
+                            val isSelected = NotesRootSettings.urisEqual(uri, selectedRoot)
+                            TgSettingsRow(
+                                title = if (isSelected) "$label (selected)" else label,
+                                subtitle = "Remove drops from list only — files stay",
+                                trailing = {
+                                    Row {
+                                        if (!isSelected) {
+                                            TextButton(onClick = { vm.selectNotesRoot(uri) }) {
+                                                Text("Select", color = tgBlue)
+                                            }
+                                        }
+                                        TextButton(onClick = { vm.removeNotesRoot(uri) }) {
+                                            Text("Remove", color = Color(0xFFFF3B30))
+                                        }
+                                    }
+                                }
+                            )
+                        }
+                        Divider(Modifier.padding(start = 16.dp), color = tgDivider, thickness = 0.5.dp)
+                        TgSettingsRow(
+                            title = "Add Notes folder",
+                            subtitle = "OpenDocumentTree — take persistable permission",
+                            trailing = {
+                                TextButton(onClick = { pickNotesRoot.launch(null) }) {
+                                    Text("Add", color = tgBlue)
+                                }
+                            }
+                        )
+                    }
                 }
             }
 
@@ -2579,12 +2645,28 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
             context.contentResolver.takePersistableUriPermission(
                 uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
             )
-            vm.setNotesRoot(uri.toString())
+            vm.addNotesRoot(uri.toString())
         }
     }
 
-    LaunchedEffect(state.settings.notesRootUri) {
-        if (!state.settings.notesRootUri.isNullOrBlank() && state.notesTreeRows.isEmpty()) {
+    val notesRoots = remember(state.settings, state.mappings) {
+        val roots = NotesRootSettings.resolveRoots(state.settings)
+        val selected = NotesRootSettings.resolveSelected(state.settings, roots)
+        val mappingRoots = state.mappings.map { it.localPath }
+        roots.map { uri ->
+            NotesRootChip(
+                uri = uri,
+                label = MapLocalFolderStrings.suggestedFolderNameFromUri(uri),
+                selected = NotesRootSettings.urisEqual(uri, selected),
+                notInCloud = MapLocalFolderUi.showNotesNudge(uri, mappingRoots)
+            )
+        }
+    }
+    val selectedNotesRootUri = notesRoots.firstOrNull { it.selected }?.uri
+        ?: NotesRootSettings.resolveSelected(state.settings)
+
+    LaunchedEffect(selectedNotesRootUri) {
+        if (!selectedNotesRootUri.isNullOrBlank() && state.notesTreeRows.isEmpty()) {
             vm.refreshNotesTree()
         }
     }
@@ -2651,7 +2733,7 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
 
     val notesLang = remember { java.util.Locale.getDefault().toLanguageTag() }
     val showNotesNudge = MapLocalFolderUi.showNotesNudge(
-        state.settings.notesRootUri,
+        selectedNotesRootUri,
         state.mappings.map { it.localPath }
     )
 
@@ -2660,11 +2742,12 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
             NotesTreePane(
                 rows = state.notesTreeRows,
                 selectedId = state.selectedNoteDocumentId,
-                hasRoot = !state.settings.notesRootUri.isNullOrBlank(),
+                hasRoot = notesRoots.isNotEmpty(),
+                roots = notesRoots,
                 showCloudNudge = showNotesNudge,
                 cloudNudgeText = MapLocalFolderStrings.notesNudgeText(notesLang),
                 onCloudNudge = {
-                    vm.requestAddLocalFolderWizard(state.settings.notesRootUri)
+                    vm.requestAddLocalFolderWizard(selectedNotesRootUri)
                 },
                 shareAffordanceEpoch = state.notesShareAffordanceEpoch,
                 lang = notesLang,
@@ -2672,7 +2755,10 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
                 showsShared = { vm.showsExternalShareForNotesRow(it) },
                 onShare = { vm.openShareForNotesRow(it) },
                 onPrefetchShare = { vm.prefetchNotesShareAffordance(it) },
-                onPickRoot = { pickTree.launch(null) },
+                onAddRoot = { pickTree.launch(null) },
+                onRemoveRoot = { uri -> vm.removeNotesRoot(uri) },
+                onSelectRoot = { uri -> vm.selectNotesRoot(uri) },
+                onMapRoot = { uri -> vm.requestAddLocalFolderWizard(uri) },
                 onRefresh = { vm.refreshNotesTree() },
                 onToggleExpand = { vm.toggleNotesExpand(it) },
                 onOpen = { vm.selectNotesNode(it) },
@@ -2705,11 +2791,12 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
             NotesTreePane(
                 rows = state.notesTreeRows,
                 selectedId = state.selectedNoteDocumentId,
-                hasRoot = !state.settings.notesRootUri.isNullOrBlank(),
+                hasRoot = notesRoots.isNotEmpty(),
+                roots = notesRoots,
                 showCloudNudge = showNotesNudge,
                 cloudNudgeText = MapLocalFolderStrings.notesNudgeText(notesLang),
                 onCloudNudge = {
-                    vm.requestAddLocalFolderWizard(state.settings.notesRootUri)
+                    vm.requestAddLocalFolderWizard(selectedNotesRootUri)
                 },
                 shareAffordanceEpoch = state.notesShareAffordanceEpoch,
                 lang = notesLang,
@@ -2717,7 +2804,10 @@ fun NotesScreen(vm: MainViewModel, state: UiState, compactWidth: Boolean = true)
                 showsShared = { vm.showsExternalShareForNotesRow(it) },
                 onShare = { vm.openShareForNotesRow(it) },
                 onPrefetchShare = { vm.prefetchNotesShareAffordance(it) },
-                onPickRoot = { pickTree.launch(null) },
+                onAddRoot = { pickTree.launch(null) },
+                onRemoveRoot = { uri -> vm.removeNotesRoot(uri) },
+                onSelectRoot = { uri -> vm.selectNotesRoot(uri) },
+                onMapRoot = { uri -> vm.requestAddLocalFolderWizard(uri) },
                 onRefresh = { vm.refreshNotesTree() },
                 onToggleExpand = { vm.toggleNotesExpand(it) },
                 onOpen = { vm.selectNotesNode(it) },
@@ -2880,11 +2970,21 @@ private fun NewNoteDialog(vm: MainViewModel, pending: PendingCreateNote) {
 
 private val NotesHeaderBg = Color(0xFF527998)
 
+/** E11: one Notes SAF root chip (select / muted Not-in-Cloud cue). */
+private data class NotesRootChip(
+    val uri: String,
+    val label: String,
+    val selected: Boolean,
+    val notInCloud: Boolean
+)
+
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun NotesTreePane(
     rows: List<NoteTreeRow>,
     selectedId: String?,
     hasRoot: Boolean,
+    roots: List<NotesRootChip> = emptyList(),
     showCloudNudge: Boolean = false,
     cloudNudgeText: String = "",
     onCloudNudge: () -> Unit = {},
@@ -2894,7 +2994,10 @@ private fun NotesTreePane(
     showsShared: (NoteTreeRow) -> Boolean = { false },
     onShare: (NoteTreeRow) -> Unit = {},
     onPrefetchShare: (NoteTreeRow) -> Unit = {},
-    onPickRoot: () -> Unit,
+    onAddRoot: () -> Unit,
+    onRemoveRoot: (String) -> Unit = {},
+    onSelectRoot: (String) -> Unit = {},
+    onMapRoot: (String) -> Unit = {},
     onRefresh: () -> Unit,
     onToggleExpand: (String) -> Unit,
     onOpen: (NoteTreeRow) -> Unit,
@@ -2903,6 +3006,7 @@ private fun NotesTreePane(
     onDeleteNote: (NoteTreeRow) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val selectedRootUri = roots.firstOrNull { it.selected }?.uri
     Box(modifier.background(MaterialTheme.colorScheme.surface)) {
         Column(Modifier.fillMaxSize()) {
             Row(
@@ -2912,13 +3016,74 @@ private fun NotesTreePane(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text("Notes", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
-                TextButton(onClick = onPickRoot) { Text(if (hasRoot) "Folder" else "Choose") }
+                TextButton(onClick = onAddRoot) { Text(if (hasRoot) "+" else "Choose") }
+                if (hasRoot) {
+                    TextButton(
+                        onClick = { selectedRootUri?.let(onRemoveRoot) },
+                        enabled = selectedRootUri != null
+                    ) { Text("−") }
+                }
                 TextButton(onClick = onRefresh) { Text("Refresh") }
                 if (hasRoot && LocalConfiguration.current.screenWidthDp >= 600) {
                     TextButton(onClick = onCreateNote) { Text("New note") }
                 }
             }
             Divider()
+            if (roots.isNotEmpty()) {
+                LazyRow(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    items(roots, key = { it.uri }) { root ->
+                        var menuOpen by remember(root.uri) { mutableStateOf(false) }
+                        Box {
+                            Text(
+                                text = root.label,
+                                color = when {
+                                    root.notInCloud -> Color(0xFF8E8E93)
+                                    root.selected -> Color(0xFF2AABEE)
+                                    else -> Color(0xFF111B21)
+                                },
+                                fontSize = 13.sp,
+                                fontWeight = if (root.selected) FontWeight.SemiBold else FontWeight.Normal,
+                                fontStyle = if (root.notInCloud) androidx.compose.ui.text.font.FontStyle.Italic
+                                else androidx.compose.ui.text.font.FontStyle.Normal,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(
+                                        if (root.selected) Color(0x1A2AABEE) else Color.Transparent
+                                    )
+                                    .combinedClickable(
+                                        onClick = { onSelectRoot(root.uri) },
+                                        onLongClick = { menuOpen = true }
+                                    )
+                                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                            )
+                            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                                if (root.notInCloud) {
+                                    DropdownMenuItem(
+                                        text = { Text(ShareSheetStrings.notInCloudYet(lang) + " — Map…") },
+                                        onClick = {
+                                            menuOpen = false
+                                            onMapRoot(root.uri)
+                                        }
+                                    )
+                                }
+                                DropdownMenuItem(
+                                    text = { Text("Remove from Notes list") },
+                                    onClick = {
+                                        menuOpen = false
+                                        onRemoveRoot(root.uri)
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+                Divider()
+            }
             if (hasRoot && showCloudNudge) {
                 TextButton(
                     onClick = onCloudNudge,
@@ -2942,7 +3107,7 @@ private fun NotesTreePane(
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text("No notes folder", color = Color(0xFF667781))
                         Spacer(Modifier.height(8.dp))
-                        Button(onClick = onPickRoot) { Text("Choose notes folder") }
+                        Button(onClick = onAddRoot) { Text("Choose notes folder") }
                     }
                 }
             } else {

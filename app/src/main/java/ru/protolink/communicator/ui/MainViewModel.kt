@@ -79,6 +79,7 @@ import ru.protolink.communicator.util.UserContactsBagClient
 import androidx.core.content.FileProvider
 import ru.protolink.communicator.util.NoteRemoteIdResolver
 import ru.protolink.communicator.util.NotesDeleteNavigate
+import ru.protolink.communicator.util.NotesRootSettings
 import ru.protolink.communicator.util.NotesTreeCreateVisibility
 import ru.protolink.communicator.util.NotesTreeShare
 import ru.protolink.communicator.util.PhotosLibrary
@@ -464,7 +465,7 @@ class MainViewModel @Inject constructor(
                 requestFullSync()
             }
         }
-        if (!settingsStore.load().notesRootUri.isNullOrBlank()) {
+        if (NotesRootSettings.resolveSelected(settingsStore.load()) != null) {
             refreshNotesTree()
         }
         PendingDebugIntent.takeCreateNoteTitle()?.let { title ->
@@ -586,7 +587,7 @@ class MainViewModel @Inject constructor(
             val openChat = _state.value.selectedContact
             if (openChat != null) loadMessages(openChat)
             loadContacts()
-            if (!settingsStore.load().notesRootUri.isNullOrBlank()) {
+            if (NotesRootSettings.resolveSelected(settingsStore.load()) != null) {
                 refreshNotesTree()
             }
             if (commandType.equals("data_changed", ignoreCase = true)) {
@@ -2248,7 +2249,7 @@ class MainViewModel @Inject constructor(
 
     /** Same E2 gate as Copy link (AC-NS-1 / AT-S47): Cloud-linked note folder RemoteId. */
     fun tryResolveNotesRemoteId(relativePath: String?): String? {
-        val notesRoot = _state.value.settings.notesRootUri
+        val notesRoot = NotesRootSettings.resolveSelected(_state.value.settings)
         val mappings = mappingStore.load()
         return NoteRemoteIdResolver.resolve(
             notesRootUri = notesRoot,
@@ -6142,24 +6143,68 @@ class MainViewModel @Inject constructor(
             false
         }
     }
-fun setNotesRoot(uri: String) {
-        val s = settingsStore.load().copy(notesRootUri = uri)
+    /** E11: add SAF tree to ordered roots (dedupe) and select it. Legacy [setNotesRoot] alias. */
+    fun setNotesRoot(uri: String) = addNotesRoot(uri)
+
+    fun addNotesRoot(uri: String) {
+        val norm = NotesRootSettings.tryNormalize(uri) ?: return
+        val cur = settingsStore.load()
+        val roots = NotesRootSettings.resolveRoots(cur).toMutableList()
+        if (roots.none { NotesRootSettings.urisEqual(it, norm) }) {
+            roots.add(norm)
+        }
+        val s = NotesRootSettings.write(cur, roots, norm)
+        applyNotesRootSettings(s, clearSelection = true)
+        refreshNotesTree()
+    }
+
+    fun selectNotesRoot(uri: String) {
+        val norm = NotesRootSettings.tryNormalize(uri) ?: return
+        val cur = settingsStore.load()
+        val roots = NotesRootSettings.resolveRoots(cur)
+        if (roots.none { NotesRootSettings.urisEqual(it, norm) }) return
+        if (NotesRootSettings.urisEqual(norm, NotesRootSettings.resolveSelected(cur, roots))) {
+            _state.update { it.copy(settings = NotesRootSettings.write(cur, roots, norm)) }
+            return
+        }
+        val s = NotesRootSettings.write(cur, roots, norm)
+        applyNotesRootSettings(s, clearSelection = true)
+        refreshNotesTree()
+    }
+
+    fun removeNotesRoot(uri: String) {
+        val norm = NotesRootSettings.tryNormalize(uri) ?: return
+        val cur = settingsStore.load()
+        val roots = NotesRootSettings.resolveRoots(cur).toMutableList()
+        val idx = roots.indexOfFirst { NotesRootSettings.urisEqual(it, norm) }
+        if (idx < 0) return
+        val next = NotesRootSettings.preferNeighborAfterRemove(roots, idx)
+        roots.removeAt(idx)
+        val s = NotesRootSettings.write(cur, roots, next)
+        applyNotesRootSettings(s, clearSelection = true)
+        refreshNotesTree()
+    }
+
+    private fun applyNotesRootSettings(s: AppSettings, clearSelection: Boolean) {
         settingsStore.save(s)
         _state.update {
-            it.copy(
-                settings = s,
-                notesExpandedIds = emptySet(),
-                selectedNotePath = null,
-                selectedNoteRelativePath = null,
-                selectedNoteDocumentId = null,
-                selectedNoteSafDocumentId = null,
-                selectedNoteIndexUri = null,
-                notesSiblingFiles = emptyList(),
-                notesContent = "",
-                notesTreeRows = emptyList()
-            )
+            if (!clearSelection) {
+                it.copy(settings = s)
+            } else {
+                it.copy(
+                    settings = s,
+                    notesExpandedIds = emptySet(),
+                    selectedNotePath = null,
+                    selectedNoteRelativePath = null,
+                    selectedNoteDocumentId = null,
+                    selectedNoteSafDocumentId = null,
+                    selectedNoteIndexUri = null,
+                    notesSiblingFiles = emptyList(),
+                    notesContent = "",
+                    notesTreeRows = emptyList()
+                )
+            }
         }
-        refreshNotesTree()
     }
 
     /** Survives loadMessages races that rewrite state.messages. */
@@ -6169,7 +6214,7 @@ fun setNotesRoot(uri: String) {
     fun refreshNotesTree() = viewModelScope.launch { refreshNotesTreeSuspend() }
 
     private suspend fun refreshNotesTreeSuspend() {
-        val rootUriStr = settingsStore.load().notesRootUri
+        val rootUriStr = NotesRootSettings.resolveSelected(settingsStore.load())
         if (rootUriStr.isNullOrBlank()) {
             notesRootCache = null
             pendingCreatedNotes.clear()
@@ -6268,7 +6313,7 @@ fun setNotesRoot(uri: String) {
 
     /** FAB / long-press: parent = selected tree node (or explicit [parentRelativePath]). */
     fun requestCreateNote(parentRelativePath: String? = null) {
-        if (settingsStore.load().notesRootUri.isNullOrBlank()) {
+        if (NotesRootSettings.resolveSelected(settingsStore.load()).isNullOrBlank()) {
             _state.update { it.copy(syncError = "Choose a notes folder first") }
             return
         }
@@ -6297,7 +6342,7 @@ fun setNotesRoot(uri: String) {
 
     /** From editor menu: destination radios (default = same section / sibling). */
     fun requestCreateNoteFromEditor() {
-        if (settingsStore.load().notesRootUri.isNullOrBlank()) {
+        if (NotesRootSettings.resolveSelected(settingsStore.load()).isNullOrBlank()) {
             _state.update { it.copy(syncError = "Choose a notes folder first") }
             return
         }
@@ -6389,7 +6434,7 @@ fun setNotesRoot(uri: String) {
      */
     fun deleteNote(relativePath: String, displayName: String? = null) {
         viewModelScope.launch {
-            val rootUri = settingsStore.load().notesRootUri
+            val rootUri = NotesRootSettings.resolveSelected(settingsStore.load())
             if (rootUri.isNullOrBlank()) {
                 _state.update { it.copy(syncError = "Choose a notes folder first") }
                 return@launch
@@ -6552,7 +6597,7 @@ fun setNotesRoot(uri: String) {
      */
     fun createNote(parentRelativePath: String, name: String) {
         viewModelScope.launch {
-            val rootUri = settingsStore.load().notesRootUri
+            val rootUri = NotesRootSettings.resolveSelected(settingsStore.load())
             if (rootUri.isNullOrBlank()) {
                 _state.update { it.copy(pendingCreateNote = null, syncError = "Choose a notes folder first") }
                 return@launch
@@ -6739,7 +6784,7 @@ fun setNotesRoot(uri: String) {
     }
 
     private suspend fun openNotesNode(row: NoteTreeRow) {
-        val rootUriStr = settingsStore.load().notesRootUri ?: return
+        val rootUriStr = NotesRootSettings.resolveSelected(settingsStore.load()) ?: return
         val treeUri = Uri.parse(rootUriStr)
         _state.update { it.copy(status = "Opening ${row.name}…") }
         try {
@@ -6875,7 +6920,7 @@ fun setNotesRoot(uri: String) {
         safDocumentId: String? = _state.value.selectedNoteSafDocumentId,
         relativePath: String? = _state.value.selectedNoteRelativePath
     ) {
-        val rootUriStr = settingsStore.load().notesRootUri
+        val rootUriStr = NotesRootSettings.resolveSelected(settingsStore.load())
         if (rootUriStr.isNullOrBlank() || _state.value.selectedNoteDocumentId.isNullOrBlank()) {
             _state.update { it.copy(notesSiblingFiles = emptyList()) }
             return
