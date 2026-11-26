@@ -3541,11 +3541,12 @@ class MainViewModel @Inject constructor(
     }
 
     fun syncNow() {
-        // Manual Sync must acquire the lane (Win RequestFullSync WaitAsync when idle /
-        // CancelBudgeted+drain when AutoPush holds). Coalesce-only tryLock orphans
-        // deferredFull after AutoPush paints "No local changes" → DOWNLOAD chrome miss
-        // (1.0.120 FAIL_CLASS DOWNLOAD_API_ONLY_NOT_ON_SAF on c01a45a2).
-        requestFullSync(waitForLane = true)
+        // Win RequestFullSyncCoreAsync: when busy → deferredFull + CancelBudgetedExclusiveOnly
+        // + return (holder DrainDeferred). Do NOT WaitAsync/spin-acquire the mutex here —
+        // tip 1.0.121 waitForLane raced AutoPush idle "No local changes" and Force upload
+        // (FAIL_CLASS UPLOAD_SYNC_REGRESS_FORCE_ONLY+FORCE_UPLOAD_STUCK on c01a45a2).
+        // DOWNLOAD settle stays on AutoPush SyncDeferredDrain refuse-idle + re-drain.
+        requestFullSync()
     }
 
     /** Force (or conflict resolve) owns the status banner — do not clobber with coalesce text. */
@@ -3571,11 +3572,10 @@ class MainViewModel @Inject constructor(
 
     /**
      * Full reconcile (startup / SignalR / manual).
-     * @param waitForLane manual Sync ([syncNow]): wait for mutex after CancelBudgeted (Win
-     *   RequestFullSync WaitAsync / CancelBudgeted drain). SignalR/startup keep coalesce-only
-     *   tryLock so spam cannot stack waiters.
+     * Win [CloudMappedSyncCoordinator.RequestFullSyncCoreAsync]: coalesce-only when busy
+     * (deferredFull + CancelBudgetedExclusiveOnly + return). Holder DrainDeferred settles.
      */
-    private fun requestFullSync(waitForLane: Boolean = false) {
+    private fun requestFullSync() {
         viewModelScope.launch {
             if (!auth.isAuthenticated) {
                 _state.update {
@@ -3606,36 +3606,17 @@ class MainViewModel @Inject constructor(
                 return@launch
             }
             if (!SyncFlight.mutex.tryLock()) {
-                // Win CancelBudgetedExclusiveOnly — abort hung AutoPush so deferred full can run.
+                // Win: busy → CancelBudgetedExclusiveOnly + return; holder drains deferredFull.
                 SyncFlight.cancelBudgetedExclusiveOnly()
-                var acquired = false
-                if (waitForLane) {
-                    // Manual Sync: wait for AutoPush to unlock after CancelBudgeted (Win WaitAsync
-                    // when reclaiming). Re-claim deferredFull — AutoPush may have drained our
-                    // first claim while we waited (1.0.120 DOWNLOAD orphan race).
-                    repeat(SYNC_LANE_WAIT_RETRIES) {
-                        if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) {
-                            return@launch
-                        }
-                        delay(SYNC_LANE_WAIT_MS)
-                        SyncFlight.cancelBudgetedExclusiveOnly()
-                        if (SyncFlight.mutex.tryLock()) {
-                            acquired = true
-                            return@repeat
-                        }
-                    }
+                // Do not paint "Full sync queued…" over an in-flight Syncing… banner (1.0.117
+                // delete-plant: SignalR/second request overwrote Syncing → sticky queued forever).
+                if (!_state.value.forceRunning &&
+                    !SyncFlight.forcePreferred.get() &&
+                    !_state.value.syncing
+                ) {
+                    _state.update { it.copy(status = "Full sync queued…") }
                 }
-                if (!acquired) {
-                    // Do not paint "Full sync queued…" over an in-flight Syncing… banner (1.0.117
-                    // delete-plant: SignalR/second request overwrote Syncing → sticky queued forever).
-                    if (!_state.value.forceRunning &&
-                        !SyncFlight.forcePreferred.get() &&
-                        !_state.value.syncing
-                    ) {
-                        _state.update { it.copy(status = "Full sync queued…") }
-                    }
-                    return@launch
-                }
+                return@launch
             }
             // Re-claim after acquire — holder may have Exchange-drained the startup claim.
             SyncFlight.deferredFull.set(true)
@@ -4055,13 +4036,6 @@ class MainViewModel @Inject constructor(
          * sticky-Sync forever on phone Walk cost (1.0.116 LOCAL_DELETE residual).
          */
         const val MAX_DEFERRED_FULL_PASSES_PER_HOLD = 2
-
-        /**
-         * Manual Sync lane wait after CancelBudgeted (Win WaitAsync reclaim). ~3s covers
-         * AutoPush unlock after budgeted cancel; longer waits belong to Force acquire.
-         */
-        const val SYNC_LANE_WAIT_MS = 50L
-        const val SYNC_LANE_WAIT_RETRIES = 60
     }
 
     private suspend fun notifyOtherDevices() {

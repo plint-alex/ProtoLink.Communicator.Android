@@ -6,6 +6,9 @@ package ru.protolink.communicator.syncadapt
  * Live 1.0.120 DOWNLOAD residual: AutoPush drained once, painted "No local changes", then
  * Sync's coalesce set [SyncFlight.deferredFull] while the mutex was still held — orphaned
  * claim (interval AutoPush skips when deferredFull) so Api-only kids never Walk/ApplyRemote.
+ *
+ * Tip 1.0.122: keep holder re-drain / refuse-idle (DOWNLOAD PASS on 1.0.121). Do not add a
+ * Sync WaitAsync second waiter — that raced upload idle + Force sticky on c01a45a2.
  */
 object SyncDeferredDrain {
     /**

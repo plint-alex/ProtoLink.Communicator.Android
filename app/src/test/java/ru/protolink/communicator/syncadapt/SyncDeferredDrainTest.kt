@@ -4,8 +4,9 @@ import com.google.common.truth.Truth.assertThat
 import org.junit.Test
 
 /**
- * Tip 1.0.121: AutoPush must re-drain / refuse idle chrome when Sync claims deferredFull
+ * Tip 1.0.121+: AutoPush must re-drain / refuse idle chrome when Sync claims deferredFull
  * after the first Exchange drain (1.0.120 DOWNLOAD_API_ONLY_NOT_ON_SAF chrome No local changes).
+ * Tip 1.0.122 keeps these helpers; Sync stays Win coalesce-only (no waitForLane).
  */
 class SyncDeferredDrainTest {
     @Test
