@@ -125,4 +125,28 @@ class ForceStatusGuardTest {
             )
         ).isNull()
     }
+
+    @Test
+    fun statusOrNull_preservesUploadingWhenSyncing_blocksFullSyncQueued() {
+        // Live 1.0.116: AutoPush syncing=true made setStatusUnlessForce("Full sync queued…")
+        // a no-op — chrome stayed Uploading while deferredFull orphaned download/delete.
+        // requestFullSync coalesce must write "Full sync queued…" without ForceStatusGuard
+        // when only syncing (not Force) owns the banner.
+        assertThat(
+            ForceStatusGuard.statusOrNull(
+                forceRunning = false,
+                forcePreferred = false,
+                proposed = "Full sync queued…",
+                syncing = true
+            )
+        ).isNull()
+        assertThat(
+            ForceStatusGuard.statusOrNull(
+                forceRunning = false,
+                forcePreferred = false,
+                proposed = "Full sync queued…",
+                syncing = false
+            )
+        ).isEqualTo("Full sync queued…")
+    }
 }
