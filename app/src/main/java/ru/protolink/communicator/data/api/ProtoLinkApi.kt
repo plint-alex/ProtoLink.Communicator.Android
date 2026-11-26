@@ -132,6 +132,26 @@ data class AddEntityRequest(
     val permissions: List<AddPermissionRequest>? = null
 )
 
+/**
+ * Batch create row for [ProtoLinkApi.addEntities].
+ * Optional [tempId] becomes Entity.Id and may appear in later items' parentIds.
+ */
+data class AddEntitiesItemRequest(
+    val code: String,
+    val parentIds: List<String>,
+    val values: List<AddValueRequest>? = null,
+    val permissions: List<AddPermissionRequest>? = null,
+    val tempId: String? = null
+)
+
+data class AddEntitiesRequest(
+    val items: List<AddEntitiesItemRequest>
+)
+
+data class AddEntitiesResponse(
+    val ids: List<String>? = null
+)
+
 data class AddPermissionRequest(
     val permissionForId: String,
     val canWrite: Boolean = false,
@@ -238,6 +258,10 @@ interface ProtoLinkApi {
 
     @POST("api/Entities/AddEntity")
     suspend fun addEntity(@Body body: AddEntityRequest): IdResponse
+
+    /** Batch parent+children create; response ids match request order. */
+    @POST("api/Entities/AddEntities")
+    suspend fun addEntities(@Body body: AddEntitiesRequest): AddEntitiesResponse
 
     @POST("api/Entities/AddValue/{entityId}")
     suspend fun addValue(@Path("entityId") entityId: String, @Body body: AddValueRequest): ResponseBody

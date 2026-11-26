@@ -14,6 +14,8 @@ import ru.protolink.communicator.data.SafPrimaryPath
 import ru.protolink.communicator.data.SafPrimarySnapshot
 import ru.protolink.communicator.data.SafTreeLister
 import java.io.File
+import ru.protolink.communicator.data.api.AddEntitiesItemRequest
+import ru.protolink.communicator.data.api.AddEntitiesRequest
 import ru.protolink.communicator.data.api.AddEntityRequest
 import ru.protolink.communicator.data.api.AddParentRequest
 import ru.protolink.communicator.data.api.AddValueRequest
@@ -28,6 +30,7 @@ import ru.protolink.communicator.sync.model.FsEntry
 import ru.protolink.communicator.sync.model.RemoteEntry
 import ru.protolink.communicator.sync.ports.LocalFileSystem
 import ru.protolink.communicator.sync.ports.RemoteCloud
+import ru.protolink.communicator.sync.ports.RemoteCreateItem
 import ru.protolink.communicator.util.EntityMeta
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.MultipartBody
@@ -160,6 +163,34 @@ class ApiRemoteCloud(private val api: ProtoLinkApi) : RemoteCloud {
         val id = res.id ?: error("AddEntity file returned empty id")
         uploadFile(id, name, bytes, mimeType)
         return id
+    }
+
+    override suspend fun addEntities(items: List<RemoteCreateItem>): List<String> {
+        if (items.isEmpty()) return emptyList()
+        val body = AddEntitiesRequest(
+            items = items.map { item ->
+                AddEntitiesItemRequest(
+                    code = if (item.isFolder) CloudCodes.CLOUD_FOLDER else CloudCodes.CLOUD_FILE,
+                    parentIds = listOf(item.parentId),
+                    values = listOf(
+                        AddValueRequest(value = item.name, parentIds = listOf(CloudCodes.NAME_TYPE_ID))
+                    ),
+                    tempId = item.tempId
+                )
+            }
+        )
+        val res = api.addEntities(body)
+        val ids = res.ids ?: error("AddEntities returned null ids")
+        if (ids.size != items.size) {
+            error("AddEntities returned ${ids.size} ids for ${items.size} items")
+        }
+        for (i in items.indices) {
+            val item = items[i]
+            if (item.isFolder) {
+                reassertFolderDisplayName(ids[i], item.name)
+            }
+        }
+        return ids
     }
 
     override suspend fun uploadFile(entityId: String, name: String, bytes: ByteArray, mimeType: String) {

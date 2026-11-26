@@ -61,6 +61,7 @@ object AppModule {
             val isGetEntities = path.contains("GetEntities", true) && req.method.equals("POST", true)
             val watch = !isGetEntities && (
                 path.contains("AddEntity", true) ||
+                    path.contains("AddEntities", true) ||
                     path.contains("AddPermission", true) ||
                     path.contains("commands", true)
                 )

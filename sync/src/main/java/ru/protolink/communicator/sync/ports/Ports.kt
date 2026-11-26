@@ -68,6 +68,14 @@ interface LocalFileSystem {
         }.getOrNull()
 }
 
+/** One row for [RemoteCloud.addEntities] (Win CloudBatchCreate.PlannedItem). */
+data class RemoteCreateItem(
+    val tempId: String,
+    val parentId: String,
+    val name: String,
+    val isFolder: Boolean
+)
+
 interface RemoteCloud {
     /**
      * List CloudFolder/CloudFile children. [includeValues]=false is structure-only
@@ -94,6 +102,26 @@ interface RemoteCloud {
 
     suspend fun addFolder(parentId: String, name: String): String
     suspend fun addFile(parentId: String, name: String, bytes: ByteArray, mimeType: String): String
+
+    /**
+     * Batch create entity shells (CloudFolder / CloudFile) via AddEntities.
+     * Parents-before-children; [RemoteCreateItem.tempId] becomes persisted Entity.Id.
+     * File bytes are uploaded separately via [uploadFile]. Default: sequential [addFolder]
+     * (empty file shells use addFolder-equivalent create without bytes) for unit fakes.
+     */
+    suspend fun addEntities(items: List<RemoteCreateItem>): List<String> {
+        val ids = ArrayList<String>(items.size)
+        for (item in items) {
+            ids += if (item.isFolder) {
+                addFolder(item.parentId, item.name)
+            } else {
+                // Shell only — caller uploads bytes. Fake/default still needs a node id.
+                addFile(item.parentId, item.name, ByteArray(0), "application/octet-stream")
+            }
+        }
+        return ids
+    }
+
     suspend fun uploadFile(entityId: String, name: String, bytes: ByteArray, mimeType: String)
     suspend fun downloadFile(entityId: String): ByteArray?
     suspend fun fileSize(entityId: String): Long?

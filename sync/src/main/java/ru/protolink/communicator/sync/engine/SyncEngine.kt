@@ -19,6 +19,7 @@ import ru.protolink.communicator.sync.model.SyncMapping
 import ru.protolink.communicator.sync.ports.LocalFileSystem
 import ru.protolink.communicator.sync.ports.MetadataStore
 import ru.protolink.communicator.sync.ports.RemoteCloud
+import ru.protolink.communicator.sync.ports.RemoteCreateItem
 import java.time.Instant
 import kotlin.coroutines.coroutineContext
 
@@ -535,6 +536,10 @@ class SyncEngine(
         // finds freshly upserted folder meta. Deepest-first was leftover from removed PruneCloudAbsent.
         val adds = changes.filterIsInstance<LocalChange.Added>()
             .sortedBy { it.entry.relativePath.count { c -> c == '/' } }
+        // Buffer same-pass Creates → one AddEntities when planting parent+children (Win parity).
+        val pendingCreates = mutableListOf<PendingLocalCreate>()
+        val pendingCreatesByPath = mutableMapOf<String, String>()
+        val pendingCreateIds = mutableSetOf<String>()
         val renames = changes.filterIsInstance<LocalChange.Renamed>()
         val updates = changes.filterIsInstance<LocalChange.Updated>()
         val removes = changes.filterIsInstance<LocalChange.Removed>()
@@ -698,11 +703,25 @@ class SyncEngine(
             // sibling listing). Never recursive-delete solely because remote walk missed the path
             // (ADR sync-simple-win-reference). Force Download still uses pruneLocalAbsentFromRemote.
             val parentPath = PathUtil.parentOf(a.entry.relativePath)
-            val parentId = resolveParentId(mapping, parentPath) ?: mapping.cloudFolderId
+            val parentPathNorm = PathUtil.normalize(parentPath)
+            val parentId = pendingCreatesByPath[parentPathNorm]
+                ?: resolveParentId(mapping, parentPath)
+                ?: mapping.cloudFolderId
             val name = PathUtil.nameOf(a.entry.relativePath)
-            val (reuse, listingOk) = resolveExistingSibling(
-                parentId, name, a.entry.isFolder, remoteInMapping, siblingCache
-            )
+            val (reuse, listingOk) = if (
+                pendingCreatesByPath.containsKey(parentPathNorm) || parentId in pendingCreateIds
+            ) {
+                // New parent in this pass — skip live list (id not on server yet).
+                val kids = siblingCache.entries
+                    .firstOrNull { it.key.equals(parentId, ignoreCase = true) }
+                    ?.value
+                    .orEmpty()
+                SameNamedCloudSibling.preferExisting(parentId, name, a.entry.isFolder, kids) to true
+            } else {
+                resolveExistingSibling(
+                    parentId, name, a.entry.isFolder, remoteInMapping, siblingCache
+                )
+            }
             if (reuse == null && !listingOk) {
                 android.util.Log.w(
                     "ProtoLinkSync",
@@ -710,24 +729,85 @@ class SyncEngine(
                 )
                 continue
             }
-            val id: String
             try {
                 if (reuse != null) {
-                    id = reuse.id
+                    val id = reuse.id
                     if (!a.entry.isFolder) {
                         val bytes = fs.readFile(mapping.localRootPath, a.entry.relativePath)
                         if (bytes.isEmpty()) continue
                         remote.uploadFile(id, name, bytes, mimeOf(name))
                     }
-                } else if (a.entry.isFolder) {
-                    id = remote.addFolder(parentId, name)
-                    rememberSibling(siblingCache, parentId, id, name, isFolder = true)
-                } else {
-                    val bytes = fs.readFile(mapping.localRootPath, a.entry.relativePath)
+                    val addHash = if (a.entry.isFolder) {
+                        ""
+                    } else {
+                        a.entry.contentHash.ifEmpty {
+                            ContentHashUtil.trySha256Hex {
+                                fs.readFile(mapping.localRootPath, a.entry.relativePath)
+                            } ?: run {
+                                SyncMissingLocalPath.log("ApplyLocalPhase.Added", path, path)
+                                ""
+                            }
+                        }
+                    }
+                    store.upsert(
+                        SyncItemMeta(
+                            mappingId = mapping.id,
+                            remoteId = id,
+                            parentRemoteId = parentId,
+                            relativePath = PathUtil.normalize(a.entry.relativePath),
+                            isFolder = a.entry.isFolder,
+                            sizeBytes = a.entry.sizeBytes,
+                            contentHash = addHash,
+                            remoteUpdateTime = Instant.now()
+                        )
+                    )
+                    dirty.add(PathUtil.normalize(a.entry.relativePath))
+                    applied++
+                    continue
+                }
+
+                if (!a.entry.isFolder) {
+                    val bytes = try {
+                        fs.readFile(mapping.localRootPath, a.entry.relativePath)
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        if (SyncMissingLocalPath.isMissing(e)) {
+                            SyncMissingLocalPath.log("ApplyLocalPhase.Added", path, path, e)
+                            continue
+                        }
+                        throw e
+                    }
                     // Never push an empty / editor stub when we are about to adopt cloud content.
                     if (bytes.isEmpty()) continue
-                    id = remote.addFile(parentId, name, bytes, mimeOf(name))
-                    rememberSibling(siblingCache, parentId, id, name, isFolder = false)
+                    val tempId = java.util.UUID.randomUUID().toString()
+                    pendingCreates += PendingLocalCreate(
+                        tempId = tempId,
+                        parentId = parentId,
+                        name = name,
+                        relativePath = path,
+                        isFolder = false,
+                        sizeBytes = a.entry.sizeBytes,
+                        contentHash = a.entry.contentHash,
+                        fileBytes = bytes
+                    )
+                    pendingCreatesByPath[path] = tempId
+                    pendingCreateIds += tempId
+                    rememberSibling(siblingCache, parentId, tempId, name, isFolder = false)
+                } else {
+                    val tempId = java.util.UUID.randomUUID().toString()
+                    pendingCreates += PendingLocalCreate(
+                        tempId = tempId,
+                        parentId = parentId,
+                        name = name,
+                        relativePath = path,
+                        isFolder = true,
+                        sizeBytes = a.entry.sizeBytes,
+                        contentHash = "",
+                        fileBytes = null
+                    )
+                    pendingCreatesByPath[path] = tempId
+                    pendingCreateIds += tempId
+                    rememberSibling(siblingCache, parentId, tempId, name, isFolder = true)
                 }
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
@@ -737,32 +817,10 @@ class SyncEngine(
                 }
                 throw e
             }
-            val addHash = if (a.entry.isFolder) {
-                ""
-            } else {
-                a.entry.contentHash.ifEmpty {
-                    ContentHashUtil.trySha256Hex {
-                        fs.readFile(mapping.localRootPath, a.entry.relativePath)
-                    } ?: run {
-                        SyncMissingLocalPath.log("ApplyLocalPhase.Added", path, path)
-                        ""
-                    }
-                }
-            }
-            store.upsert(
-                SyncItemMeta(
-                    mappingId = mapping.id,
-                    remoteId = id,
-                    parentRemoteId = parentId,
-                    relativePath = PathUtil.normalize(a.entry.relativePath),
-                    isFolder = a.entry.isFolder,
-                    sizeBytes = a.entry.sizeBytes,
-                    contentHash = addHash,
-                    remoteUpdateTime = Instant.now()
-                )
-            )
-            dirty.add(PathUtil.normalize(a.entry.relativePath))
-            applied++
+        }
+
+        if (pendingCreates.isNotEmpty()) {
+            applied += flushPendingLocalCreates(mapping, pendingCreates, dirty)
         }
 
         if (!skipSizeUpdates) {
@@ -1895,6 +1953,100 @@ class SyncEngine(
             isFolder = isFolder,
             updateTime = Instant.now()
         )
+    }
+
+    private data class PendingLocalCreate(
+        val tempId: String,
+        val parentId: String,
+        val name: String,
+        val relativePath: String,
+        val isFolder: Boolean,
+        val sizeBytes: Long,
+        val contentHash: String,
+        val fileBytes: ByteArray?
+    )
+
+    /**
+     * Plant buffered Creates: AddEntities (≥2 parent+children) or addFolder/addFile (single),
+     * then file blobs for batch shells.
+     */
+    private suspend fun flushPendingLocalCreates(
+        mapping: SyncMapping,
+        pending: List<PendingLocalCreate>,
+        dirty: MutableSet<String>
+    ): Int {
+        if (pending.isEmpty()) return 0
+        val remoteItems = pending.map {
+            RemoteCreateItem(
+                tempId = it.tempId,
+                parentId = it.parentId,
+                name = it.name,
+                isFolder = it.isFolder
+            )
+        }
+        val ids: List<String> = if (CloudBatchCreate.shouldUseBatch(pending.size)) {
+            if (!CloudBatchCreate.parentsBeforeChildren(remoteItems)) {
+                error("AddEntities batch requires parents-before-children TempId order.")
+            }
+            remote.addEntities(remoteItems)
+        } else {
+            val only = pending[0]
+            listOf(
+                if (only.isFolder) {
+                    remote.addFolder(only.parentId, only.name)
+                } else {
+                    remote.addFile(
+                        only.parentId,
+                        only.name,
+                        only.fileBytes ?: ByteArray(0),
+                        mimeOf(only.name)
+                    )
+                }
+            )
+        }
+
+        var applied = 0
+        for (i in pending.indices) {
+            coroutineContext.ensureActive()
+            val p = pending[i]
+            val id = ids[i]
+            try {
+                if (!p.isFolder && CloudBatchCreate.shouldUseBatch(pending.size)) {
+                    val bytes = p.fileBytes ?: continue
+                    if (bytes.isEmpty()) continue
+                    remote.uploadFile(id, p.name, bytes, mimeOf(p.name))
+                }
+                val addHash = if (p.isFolder) {
+                    ""
+                } else {
+                    p.contentHash.ifEmpty {
+                        p.fileBytes?.let { ContentHashUtil.sha256Hex(it) } ?: ""
+                    }
+                }
+                store.upsert(
+                    SyncItemMeta(
+                        mappingId = mapping.id,
+                        remoteId = id,
+                        parentRemoteId = p.parentId,
+                        relativePath = p.relativePath,
+                        isFolder = p.isFolder,
+                        sizeBytes = p.sizeBytes,
+                        contentHash = addHash,
+                        remoteUpdateTime = Instant.now()
+                    )
+                )
+                dirty.add(p.relativePath)
+                applied++
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                if (SyncMissingLocalPath.isMissing(e)) {
+                    SyncMissingLocalPath.log("ApplyLocalPhase.Added", p.relativePath, p.relativePath, e)
+                    continue
+                }
+                throw e
+            }
+        }
+        return applied
     }
 
     private fun mimeOf(name: String): String = when {
