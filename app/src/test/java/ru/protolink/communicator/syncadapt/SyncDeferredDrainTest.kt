@@ -8,6 +8,7 @@ import org.junit.Test
  * after the first Exchange drain (1.0.120 DOWNLOAD_API_ONLY_NOT_ON_SAF chrome No local changes).
  * Tip 1.0.122: Sync stays Win coalesce-only (no waitForLane).
  * Tip 1.0.123: soft-cap handoff so deferredFull is not orphaned after unlock.
+ * Tip 1.0.124: reclaim when deferredFull sits with lane free (1.0.123 DOWNLOAD idle orphan).
  */
 class SyncDeferredDrainTest {
     @Test
@@ -84,6 +85,38 @@ class SyncDeferredDrainTest {
             SyncDeferredDrain.shouldHandoffDeferred(
                 deferredFull = false,
                 forcePreferred = false
+            )
+        ).isFalse()
+    }
+
+    @Test
+    fun shouldReclaimOrphanedDeferred_whenClaimPendingAndLaneFree() {
+        assertThat(
+            SyncDeferredDrain.shouldReclaimOrphanedDeferred(
+                deferredFull = true,
+                forcePreferred = false,
+                laneHeld = false
+            )
+        ).isTrue()
+        assertThat(
+            SyncDeferredDrain.shouldReclaimOrphanedDeferred(
+                deferredFull = true,
+                forcePreferred = false,
+                laneHeld = true
+            )
+        ).isFalse()
+        assertThat(
+            SyncDeferredDrain.shouldReclaimOrphanedDeferred(
+                deferredFull = true,
+                forcePreferred = true,
+                laneHeld = false
+            )
+        ).isFalse()
+        assertThat(
+            SyncDeferredDrain.shouldReclaimOrphanedDeferred(
+                deferredFull = false,
+                forcePreferred = false,
+                laneHeld = false
             )
         ).isFalse()
     }

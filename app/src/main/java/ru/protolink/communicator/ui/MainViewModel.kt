@@ -494,7 +494,22 @@ class MainViewModel @Inject constructor(
                 // Win _cloudMutationSuspend — skip AutoPush during Cloud delete/mirror cleanup.
                 if (SyncFlight.isCloudMutationSuspended()) continue
                 // Win RequestLocalPushAsync: skip when deferredFull — do not re-arm Uploading.
-                if (SyncFlight.deferredFull.get()) continue
+                // Tip 1.0.124: if deferredFull is orphaned (lane free), reclaim full Sync like
+                // Win RequestFullSync when _syncActive==0 — interval skip alone left DOWNLOAD
+                // idle No local changes after coalesce (1.0.123 c01a45a2).
+                if (SyncFlight.deferredFull.get()) {
+                    if (SyncDeferredDrain.shouldReclaimOrphanedDeferred(
+                            deferredFull = true,
+                            forcePreferred = SyncFlight.forcePreferred.get(),
+                            laneHeld = SyncFlight.mutex.isLocked ||
+                                _state.value.syncing ||
+                                _state.value.forceRunning
+                        )
+                    ) {
+                        requestFullSync()
+                    }
+                    continue
+                }
                 if (_state.value.syncing || SyncFlight.mutex.isLocked) continue
                 requestLocalPush()
             }
@@ -3544,8 +3559,8 @@ class MainViewModel @Inject constructor(
         // Win RequestFullSyncCoreAsync: when busy (_syncActive) → deferredFull +
         // CancelBudgetedExclusiveOnly + return (holder DrainDeferred). Do NOT multi-second
         // WaitAsync/spin (tip 1.0.121 waitForLane → UPLOAD Sync miss + Force sticky).
-        // Tip 1.0.123: busy path one-shot reclaim after CancelBudgeted + post-unlock
-        // SyncDeferredDrain handoff so DOWNLOAD/delete-plant are not orphaned.
+        // Tip 1.0.123/124: CancelBudgeted one-shot reclaim + soft-cap handoff + orphan
+        // reclaim when deferredFull sits with lane free (1.0.123 DOWNLOAD idle).
         requestFullSync()
     }
 
@@ -3616,9 +3631,37 @@ class MainViewModel @Inject constructor(
                 }
                 delay(SYNC_CANCEL_RECLAIM_MS)
                 acquired = SyncFlight.mutex.tryLock()
+                // Holder may have unlocked during cancel/delay while our deferredFull claim
+                // remains — Win idle path WaitAsync/runs; do not park orphan for interval skip
+                // (1.0.123 DOWNLOAD chrome idle No local changes / lateSAF=NO).
+                if (!acquired &&
+                    SyncDeferredDrain.shouldReclaimOrphanedDeferred(
+                        deferredFull = SyncFlight.deferredFull.get(),
+                        forcePreferred = SyncFlight.forcePreferred.get(),
+                        laneHeld = SyncFlight.mutex.isLocked || _state.value.syncing
+                    )
+                ) {
+                    acquired = SyncFlight.mutex.tryLock()
+                }
                 if (!acquired) {
                     if (!_state.value.syncing) {
                         _state.update { it.copy(status = "Full sync queued…") }
+                    }
+                    // Coalesce return — Win holder DrainDeferred settles. If the holder unlocks
+                    // without handoff (soft-cap TOCTOU / SyncWorker), reclaim shortly without
+                    // waitForLane spin so DOWNLOAD Sync taps are not stuck on idle chrome.
+                    viewModelScope.launch {
+                        delay(SYNC_ORPHAN_RECLAIM_MS)
+                        if (SyncDeferredDrain.shouldReclaimOrphanedDeferred(
+                                deferredFull = SyncFlight.deferredFull.get(),
+                                forcePreferred = SyncFlight.forcePreferred.get(),
+                                laneHeld = SyncFlight.mutex.isLocked ||
+                                    _state.value.syncing ||
+                                    _state.value.forceRunning
+                            )
+                        ) {
+                            requestFullSync()
+                        }
                     }
                     return@launch
                 }
@@ -4074,6 +4117,13 @@ class MainViewModel @Inject constructor(
          * a single tryLock reclaim (Win cancel-push reclaim). Not waitForLane spin.
          */
         const val SYNC_CANCEL_RECLAIM_MS = 50L
+
+        /**
+         * After coalesce-return ("Full sync queued…"), brief pause then orphan reclaim if
+         * deferredFull remains with lane free (1.0.123 DOWNLOAD idle). Shorter than AutoPush
+         * interval; not waitForLane mutex spin.
+         */
+        const val SYNC_ORPHAN_RECLAIM_MS = 250L
     }
 
     private suspend fun notifyOtherDevices() {

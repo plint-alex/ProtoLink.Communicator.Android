@@ -53,6 +53,7 @@ class SyncWorker @AssistedInject constructor(
         }
         // Do not bind this worker Job as exclusive — Force preempt must cancel detached work
         // inside runDeferringToForce, not the mutex owner (1.0.65 structured-join stall).
+        var handoffDeferred = false
         return try {
             // Win DrainDeferred: Exchange deferred→0 then reconcile. Worker entry is itself a
             // full pass claim — set deferred so the loop runs ≥1 (parity with requestFullSync).
@@ -74,6 +75,11 @@ class SyncWorker @AssistedInject constructor(
                 Log.i(TAG, "Done local=${result.localChanges} remote=${result.remoteChanges}")
                 passes++
             }
+            // Soft-cap may leave Sync/UI deferredFull — Win never unlocks with Exchange set.
+            handoffDeferred = SyncDeferredDrain.shouldHandoffDeferred(
+                SyncFlight.deferredFull.get(),
+                SyncFlight.forcePreferred.get()
+            )
             Result.success()
         } catch (e: CancellationException) {
             Log.i(TAG, "Reconcile cancelled (Force preempt)")
@@ -83,6 +89,11 @@ class SyncWorker @AssistedInject constructor(
             Result.retry()
         } finally {
             SyncFlight.mutex.unlock()
+            // Re-enter via one-shot worker so UI Sync coalesce is not orphaned while interval
+            // AutoPush skips deferredFull (1.0.123 DOWNLOAD_API_ONLY_NOT_ON_SAF class).
+            if (handoffDeferred && !SyncFlight.forcePreferred.get()) {
+                runNow(applicationContext)
+            }
         }
     }
 

@@ -13,6 +13,12 @@ package ru.protolink.communicator.syncadapt
  * SAF/SignalR soft cap may exit Exchange early — [shouldHandoffDeferred] re-enters
  * requestFullSync after unlock so DOWNLOAD/delete-plant Sync taps are not orphaned into
  * idle "No local changes" (1.0.122 FAIL_CLASS DOWNLOAD_API_ONLY_NOT_ON_SAF on c01a45a2).
+ *
+ * Tip 1.0.124: soft-cap handoff alone left DOWNLOAD idle on 1.0.123 — Sync coalesce can set
+ * deferredFull after the holder already unlocked (or CancelBudgeted reclaim misses), then
+ * interval AutoPush skips forever while chrome stays "No local changes". Win never parks
+ * `_deferredFullSync` without a holder. [shouldReclaimOrphanedDeferred] re-enters full Sync
+ * when the claim is pending and the lane is free (no waitForLane spin — keep upload PASS).
  */
 object SyncDeferredDrain {
     /**
@@ -40,4 +46,16 @@ object SyncDeferredDrain {
      */
     fun shouldHandoffDeferred(deferredFull: Boolean, forcePreferred: Boolean): Boolean =
         deferredFull && !forcePreferred
+
+    /**
+     * Coalesce claimed deferredFull but no holder owns the lane — reclaim like a fresh Win
+     * [RequestFullSyncCoreAsync] when `_syncActive==0` (WaitAsync/run). Do not spin-wait a
+     * busy lane (1.0.121 waitForLane → UPLOAD/Force race).
+     */
+    fun shouldReclaimOrphanedDeferred(
+        deferredFull: Boolean,
+        forcePreferred: Boolean,
+        laneHeld: Boolean
+    ): Boolean =
+        deferredFull && !forcePreferred && !laneHeld
 }
