@@ -1859,7 +1859,11 @@ class SyncEngine(
         // Size/structure first; hash each file at upload (readFile). Win SnapshotFs hashes via
         // fast File IO — SAF openInputStream×whole MyNotesFolder before first Api was the
         // FORCE_UPLOAD_STUCK_NO_PROGRESS residual (same decision table, SAF cost model only).
+        // Skip whole Agents tree (Sync Walk stop / AutoPush churn class) so Force upload
+        // cannot sticky-walk Agents on SAF while delete-plant fixture sits at map root
+        // (1.0.122 FORCE_UPLOAD_STUCK on c01a45a2).
         val snap = fs.snapshot(mapping.localRootPath, computeContentHashes = false)
+            .filter { !AgentsRoleQueuePaths.isUnderAgentsTree(PathUtil.normalize(it.relativePath)) }
             .sortedWith(compareBy({ it.relativePath.count { c -> c == '/' } }, { if (it.isFolder) 0 else 1 }))
         if (snap.isEmpty()) {
             throw SyncException(

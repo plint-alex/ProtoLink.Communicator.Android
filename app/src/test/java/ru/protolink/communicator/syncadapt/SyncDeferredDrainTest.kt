@@ -6,7 +6,8 @@ import org.junit.Test
 /**
  * Tip 1.0.121+: AutoPush must re-drain / refuse idle chrome when Sync claims deferredFull
  * after the first Exchange drain (1.0.120 DOWNLOAD_API_ONLY_NOT_ON_SAF chrome No local changes).
- * Tip 1.0.122 keeps these helpers; Sync stays Win coalesce-only (no waitForLane).
+ * Tip 1.0.122: Sync stays Win coalesce-only (no waitForLane).
+ * Tip 1.0.123: soft-cap handoff so deferredFull is not orphaned after unlock.
  */
 class SyncDeferredDrainTest {
     @Test
@@ -59,6 +60,28 @@ class SyncDeferredDrainTest {
         ).isTrue()
         assertThat(
             SyncDeferredDrain.shouldRefuseIdlePaint(
+                deferredFull = false,
+                forcePreferred = false
+            )
+        ).isFalse()
+    }
+
+    @Test
+    fun shouldHandoffDeferred_whenSoftCapLeftClaim() {
+        assertThat(
+            SyncDeferredDrain.shouldHandoffDeferred(
+                deferredFull = true,
+                forcePreferred = false
+            )
+        ).isTrue()
+        assertThat(
+            SyncDeferredDrain.shouldHandoffDeferred(
+                deferredFull = true,
+                forcePreferred = true
+            )
+        ).isFalse()
+        assertThat(
+            SyncDeferredDrain.shouldHandoffDeferred(
                 deferredFull = false,
                 forcePreferred = false
             )

@@ -3541,11 +3541,11 @@ class MainViewModel @Inject constructor(
     }
 
     fun syncNow() {
-        // Win RequestFullSyncCoreAsync: when busy → deferredFull + CancelBudgetedExclusiveOnly
-        // + return (holder DrainDeferred). Do NOT WaitAsync/spin-acquire the mutex here —
-        // tip 1.0.121 waitForLane raced AutoPush idle "No local changes" and Force upload
-        // (FAIL_CLASS UPLOAD_SYNC_REGRESS_FORCE_ONLY+FORCE_UPLOAD_STUCK on c01a45a2).
-        // DOWNLOAD settle stays on AutoPush SyncDeferredDrain refuse-idle + re-drain.
+        // Win RequestFullSyncCoreAsync: when busy (_syncActive) → deferredFull +
+        // CancelBudgetedExclusiveOnly + return (holder DrainDeferred). Do NOT multi-second
+        // WaitAsync/spin (tip 1.0.121 waitForLane → UPLOAD Sync miss + Force sticky).
+        // Tip 1.0.123: busy path one-shot reclaim after CancelBudgeted + post-unlock
+        // SyncDeferredDrain handoff so DOWNLOAD/delete-plant are not orphaned.
         requestFullSync()
     }
 
@@ -3605,18 +3605,23 @@ class MainViewModel @Inject constructor(
                 }
                 return@launch
             }
-            if (!SyncFlight.mutex.tryLock()) {
+            var acquired = SyncFlight.mutex.tryLock()
+            if (!acquired) {
                 // Win: busy → CancelBudgetedExclusiveOnly + return; holder drains deferredFull.
+                // One-shot reclaim after cancel — AutoPush unlocks promptly; do not spin
+                // waitForLane (1.0.121 UPLOAD/Force race). Unlimited Sync holder stays coalesce.
                 SyncFlight.cancelBudgetedExclusiveOnly()
-                // Do not paint "Full sync queued…" over an in-flight Syncing… banner (1.0.117
-                // delete-plant: SignalR/second request overwrote Syncing → sticky queued forever).
-                if (!_state.value.forceRunning &&
-                    !SyncFlight.forcePreferred.get() &&
-                    !_state.value.syncing
-                ) {
-                    _state.update { it.copy(status = "Full sync queued…") }
+                if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) {
+                    return@launch
                 }
-                return@launch
+                delay(SYNC_CANCEL_RECLAIM_MS)
+                acquired = SyncFlight.mutex.tryLock()
+                if (!acquired) {
+                    if (!_state.value.syncing) {
+                        _state.update { it.copy(status = "Full sync queued…") }
+                    }
+                    return@launch
+                }
             }
             // Re-claim after acquire — holder may have Exchange-drained the startup claim.
             SyncFlight.deferredFull.set(true)
@@ -3624,6 +3629,7 @@ class MainViewModel @Inject constructor(
             // trapped finally behind reconcile child joins). runDeferringToForce binds work.
             _state.update { it.copy(status = "Syncing ${mappings.size} folder(s)…", syncing = true) }
             var reloadAfterRelease = false
+            var handoffDeferred: Boolean
             try {
                 // deferredFull claimed → Win-style drain; re-drain if Sync/SignalR re-claims
                 // while we still hold exclusive (AutoPush "No local changes" orphan class).
@@ -3668,7 +3674,19 @@ class MainViewModel @Inject constructor(
                 Log.e("ProtoLinkSync", "sync failed", e)
                 handleSyncFailure(e)
             } finally {
+                handoffDeferred = SyncDeferredDrain.shouldHandoffDeferred(
+                    SyncFlight.deferredFull.get(),
+                    SyncFlight.forcePreferred.get()
+                )
                 if (SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
+            }
+            // Soft pass-cap may leave deferredFull set — re-enter like a fresh Win full
+            // request so DOWNLOAD Sync taps are not orphaned (1.0.122 No local changes).
+            if (handoffDeferred &&
+                !SyncFlight.forcePreferred.get() &&
+                !_state.value.forceRunning
+            ) {
+                requestFullSync()
             }
             // Win ReloadCurrentFolderIfForceIdleAsync — never hold exclusive across GetEntities paint.
             if (reloadAfterRelease &&
@@ -3887,6 +3905,7 @@ class MainViewModel @Inject constructor(
             var budgetExpired = false
             var applied = 0
             var drainedFull = false
+            var handoffDeferred: Boolean
             SyncFlight.markBudgetedExclusive(true)
             try {
                 try {
@@ -4015,7 +4034,19 @@ class MainViewModel @Inject constructor(
                 handleSyncFailure(e)
             } finally {
                 SyncFlight.markBudgetedExclusive(false)
+                handoffDeferred = SyncDeferredDrain.shouldHandoffDeferred(
+                    SyncFlight.deferredFull.get(),
+                    SyncFlight.forcePreferred.get()
+                )
                 if (SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
+            }
+            // Soft cap / TOCTOU may leave deferredFull — hand off so Sync coalesce is not
+            // orphaned into idle "No local changes" (1.0.122 DOWNLOAD REGRESS).
+            if (handoffDeferred &&
+                !SyncFlight.forcePreferred.get() &&
+                !_state.value.forceRunning
+            ) {
+                requestFullSync()
             }
             // Win: notify + folder paint after exclusive release (not under Uploading/Syncing hold).
             if (!_state.value.forceRunning && !SyncFlight.forcePreferred.get()) {
@@ -4033,9 +4064,16 @@ class MainViewModel @Inject constructor(
 
         /**
          * Max reconcile passes per exclusive hold (1 + coalesce). Continuous SignalR must not
-         * sticky-Sync forever on phone Walk cost (1.0.116 LOCAL_DELETE residual).
+         * sticky-Sync forever on phone Walk cost (1.0.116 LOCAL_DELETE residual). Residual
+         * deferredFull after this soft cap → [SyncDeferredDrain.shouldHandoffDeferred].
          */
         const val MAX_DEFERRED_FULL_PASSES_PER_HOLD = 2
+
+        /**
+         * After CancelBudgetedExclusiveOnly, one short pause so AutoPush can unlock before
+         * a single tryLock reclaim (Win cancel-push reclaim). Not waitForLane spin.
+         */
+        const val SYNC_CANCEL_RECLAIM_MS = 50L
     }
 
     private suspend fun notifyOtherDevices() {

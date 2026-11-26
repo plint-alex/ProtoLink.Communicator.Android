@@ -632,14 +632,36 @@ class SyncEngineTest {
     @Test
     fun forcePush_existingSameNameFolder_reusesId_noSecondFolder() = runTest {
         val (store, fs, remote) = harness()
-        val existingFolder = remote.addFolder("cloud-root", "Agents")
-        fs.createDirectory(root, "Agents")
-        fs.writeFile(root, "Agents/note.txt", "x".toByteArray())
+        // Not "Agents" — Force push skips whole Agents tree (1.0.123 SAF churn / sticky).
+        val existingFolder = remote.addFolder("cloud-root", "SharedDocs")
+        fs.createDirectory(root, "SharedDocs")
+        fs.writeFile(root, "SharedDocs/note.txt", "x".toByteArray())
         SyncEngine(store, fs, remote).forcePushMapping(mapping)
-        assertThat(remote.childrenOf("cloud-root").filter { it.isFolder && it.name.equals("Agents", true) })
-            .hasSize(1)
-        assertThat(store.getAll("m1").first { it.relativePath == "agents" }.remoteId)
+        assertThat(
+            remote.childrenOf("cloud-root").filter { it.isFolder && it.name.equals("SharedDocs", true) }
+        ).hasSize(1)
+        assertThat(store.getAll("m1").first { it.relativePath == "shareddocs" }.remoteId)
             .isEqualTo(existingFolder)
+    }
+
+    /** Force upload must not walk/upload Agents tree (Sync Walk stop; 1.0.122 FORCE sticky). */
+    @Test
+    fun forcePush_skipsAgentsTree_uploadsMapRootOnly() = runTest {
+        val (store, fs, remote) = harness()
+        fs.writeFile(root, "plant-test.txt", "ok".toByteArray())
+        fs.createDirectory(root, "Agents")
+        fs.writeFile(root, "Agents/roles/todo/x.txt", "churn".toByteArray())
+        val count = SyncEngine(store, fs, remote).forcePushMapping(mapping)
+        assertThat(count).isEqualTo(1)
+        assertThat(remote.childrenOf("cloud-root").any {
+            it.name.equals("plant-test.txt", ignoreCase = true)
+        }).isTrue()
+        assertThat(remote.childrenOf("cloud-root").none {
+            it.isFolder && it.name.equals("Agents", ignoreCase = true)
+        }).isTrue()
+        assertThat(store.getAll("m1").none {
+            AgentsRoleQueuePaths.isUnderAgentsTree(it.relativePath)
+        }).isTrue()
     }
 
     @Test
