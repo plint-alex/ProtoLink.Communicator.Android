@@ -2252,6 +2252,8 @@ private fun MessengerChatPane(
                                         m = row.message,
                                         api = api,
                                         publicSiteBaseUrl = publicSiteBaseUrl,
+                                        lang = uiLang,
+                                        onCopyId = { vm.copyEntityId(row.message.id) },
                                         onRetry = { vm.retryFailedSend(row.message.id) },
                                         onCancelFailed = { vm.cancelFailedSend(row.message.id) }
                                     )
@@ -2469,11 +2471,14 @@ private fun DateChip(label: String, modifier: Modifier = Modifier) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MessageBubble(
     m: MessageItem,
     api: ru.protolink.communicator.data.api.ProtoLinkApi,
     publicSiteBaseUrl: String,
+    lang: String,
+    onCopyId: () -> Unit,
     onRetry: () -> Unit = {},
     onCancelFailed: () -> Unit = {}
 ) {
@@ -2498,6 +2503,8 @@ private fun MessageBubble(
     val imageOnly = (hasServerAttachments || hasLocalPreview) && m.text.isBlank()
     val bubblePadding = if (imageOnly) Modifier.padding(2.dp) else Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
     val bubbleAlpha = if (failed) 0.7f else 1f
+    var menuOpen by remember(m.id) { mutableStateOf(false) }
+    val canCopyId = ShareAccountStrings.canCopyMessageEntityId(m.id)
     Box(Modifier.fillMaxWidth(), contentAlignment = align) {
         Column(
             modifier = Modifier
@@ -2512,96 +2519,112 @@ private fun MessageBubble(
                 modifier = Modifier
                     .align(if (m.mine) Alignment.End else Alignment.Start)
             ) {
-                Column(
-                    modifier = Modifier
-                        .background(bubbleColor.copy(alpha = bubbleAlpha), shape = RoundedCornerShape(12.dp))
-                        .then(bubblePadding)
-                ) {
-                    if (hasServerAttachments) {
-                        Box {
-                            ru.protolink.communicator.ui.messenger.MessageAttachmentsColumn(
-                                attachmentIds = m.attachmentIds,
-                                api = api,
-                                multiImageMaxHeight = m.attachmentIds.size > 1,
-                                seedsByEntityId = attachmentSeeds
+                Box {
+                    Column(
+                        modifier = Modifier
+                            .background(bubbleColor.copy(alpha = bubbleAlpha), shape = RoundedCornerShape(12.dp))
+                            .combinedClickable(
+                                onClick = {},
+                                onLongClick = { menuOpen = true }
                             )
-                            if (uploading) {
-                                UploadProgressOverlay(m.uploadProgress)
+                            .then(bubblePadding)
+                    ) {
+                        if (hasServerAttachments) {
+                            Box {
+                                ru.protolink.communicator.ui.messenger.MessageAttachmentsColumn(
+                                    attachmentIds = m.attachmentIds,
+                                    api = api,
+                                    multiImageMaxHeight = m.attachmentIds.size > 1,
+                                    seedsByEntityId = attachmentSeeds
+                                )
+                                if (uploading) {
+                                    UploadProgressOverlay(m.uploadProgress)
+                                }
+                            }
+                        } else if (hasLocalPreview) {
+                            Box {
+                                Column {
+                                    pendingLocal.forEach { d ->
+                                        Text(
+                                            d.fileName,
+                                            color = Color(0xFF111111),
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)
+                                        )
+                                    }
+                                }
+                                if (uploading) {
+                                    UploadProgressOverlay(m.uploadProgress)
+                                }
                             }
                         }
-                    } else if (hasLocalPreview) {
-                        Box {
-                            Column {
-                                pendingLocal.forEach { d ->
+                        if (m.text.isNotBlank()) {
+                            Text(m.text, color = Color(0xFF111111))
+                        }
+                        if (m.text.isNotBlank() && !failed && !uploading) {
+                            ru.protolink.communicator.ui.messenger.MessageUnfurlCards(
+                                bodyText = m.text,
+                                publicSiteBaseUrl = publicSiteBaseUrl,
+                                api = api
+                            )
+                        }
+                        if (failed) {
+                            Text(
+                                m.statusLine ?: "Couldn't send",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = Color(0xFF667781),
+                                modifier = Modifier.padding(top = 4.dp, start = 4.dp)
+                            )
+                            Row(
+                                Modifier.fillMaxWidth().padding(top = 2.dp),
+                                horizontalArrangement = Arrangement.End
+                            ) {
+                                TextButton(onClick = onRetry) {
+                                    Text("Retry", color = TgAccent)
+                                }
+                                TextButton(onClick = onCancelFailed) {
+                                    Text("Cancel", color = Color(0xFF667781))
+                                }
+                            }
+                        } else if (m.timeLabel.isNotBlank() || m.showTicks) {
+                            Row(
+                                modifier = Modifier.align(Alignment.End).padding(top = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (sending && !uploading) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(12.dp).padding(end = 4.dp),
+                                        strokeWidth = 1.5.dp,
+                                        color = TgAccent
+                                    )
+                                }
+                                if (m.timeLabel.isNotBlank()) {
                                     Text(
-                                        d.fileName,
-                                        color = Color(0xFF111111),
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)
+                                        m.timeLabel,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = Color(0xFF667781)
+                                    )
+                                }
+                                if (m.showTicks) {
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(
+                                        m.ticksText,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (m.ticksRead) TgTickRead else TgTickSent
                                     )
                                 }
                             }
-                            if (uploading) {
-                                UploadProgressOverlay(m.uploadProgress)
-                            }
                         }
                     }
-                    if (m.text.isNotBlank()) {
-                        Text(m.text, color = Color(0xFF111111))
-                    }
-                    if (m.text.isNotBlank() && !failed && !uploading) {
-                        ru.protolink.communicator.ui.messenger.MessageUnfurlCards(
-                            bodyText = m.text,
-                            publicSiteBaseUrl = publicSiteBaseUrl,
-                            api = api
+                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        DropdownMenuItem(
+                            text = { Text(ShareAccountStrings.copyIdLabel(lang)) },
+                            onClick = {
+                                menuOpen = false
+                                onCopyId()
+                            },
+                            enabled = canCopyId
                         )
-                    }
-                    if (failed) {
-                        Text(
-                            m.statusLine ?: "Couldn't send",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = Color(0xFF667781),
-                            modifier = Modifier.padding(top = 4.dp, start = 4.dp)
-                        )
-                        Row(
-                            Modifier.fillMaxWidth().padding(top = 2.dp),
-                            horizontalArrangement = Arrangement.End
-                        ) {
-                            TextButton(onClick = onRetry) {
-                                Text("Retry", color = TgAccent)
-                            }
-                            TextButton(onClick = onCancelFailed) {
-                                Text("Cancel", color = Color(0xFF667781))
-                            }
-                        }
-                    } else if (m.timeLabel.isNotBlank() || m.showTicks) {
-                        Row(
-                            modifier = Modifier.align(Alignment.End).padding(top = 2.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            if (sending && !uploading) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(12.dp).padding(end = 4.dp),
-                                    strokeWidth = 1.5.dp,
-                                    color = TgAccent
-                                )
-                            }
-                            if (m.timeLabel.isNotBlank()) {
-                                Text(
-                                    m.timeLabel,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = Color(0xFF667781)
-                                )
-                            }
-                            if (m.showTicks) {
-                                Spacer(Modifier.width(4.dp))
-                                Text(
-                                    m.ticksText,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = if (m.ticksRead) TgTickRead else TgTickSent
-                                )
-                            }
-                        }
                     }
                 }
             }

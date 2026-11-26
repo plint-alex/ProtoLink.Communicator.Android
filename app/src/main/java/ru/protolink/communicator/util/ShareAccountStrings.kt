@@ -42,4 +42,11 @@ object ShareAccountStrings {
 
     /** Entity Guid D for Cloud Copy id; same gate as [formatUserIdForClipboard]. */
     fun formatEntityIdForClipboard(entityId: String?): String? = formatUserIdForClipboard(entityId)
+
+    /**
+     * Messenger M13: lasting message entity Guid may be copied; optimistic `local-*` /
+     * Empty / invalid → false (disable Copy id, no Empty Guid on clipboard).
+     */
+    fun canCopyMessageEntityId(messageId: String?): Boolean =
+        formatEntityIdForClipboard(messageId) != null
 }
