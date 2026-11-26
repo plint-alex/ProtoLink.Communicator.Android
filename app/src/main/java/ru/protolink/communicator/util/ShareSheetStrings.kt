@@ -192,8 +192,10 @@ object ShareSheetStrings {
         else "No ProtoLink user with this ID or email"
 
     fun canEditHelper(lang: String?) =
-        if (ru(lang)) "Редактирование также позволяет делиться и отключать ссылки."
-        else "Can edit also lets them share and turn off links."
+        if (ru(lang))
+            "С правом редактирования можно добавлять, изменять и удалять. Также можно делиться и отключать ссылки."
+        else
+            "Can edit means add, edit, and delete. They can also share and turn off links."
 
     fun access(lang: String?) = if (ru(lang)) "Доступ" else "Access"
 

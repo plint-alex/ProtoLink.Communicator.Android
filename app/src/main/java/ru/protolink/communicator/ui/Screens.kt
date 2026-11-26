@@ -1567,36 +1567,86 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
     ProtoLinkShareSheetHost(vm = vm, state = state, lang = lang)
 
     state.pendingDeleteCloud?.let { pending ->
-        AlertDialog(
-            onDismissRequest = { vm.dismissDeleteCloud() },
-            title = {
-                Text(ru.protolink.communicator.util.CloudFolderDelete.confirmTitle(lang))
-            },
-            text = {
-                Text(
-                    ru.protolink.communicator.util.CloudFolderDelete.confirmBody(
-                        lang,
-                        pending.name,
-                        pending.isFolder
+        if (pending.shared) {
+            AlertDialog(
+                onDismissRequest = { vm.dismissDeleteCloud() },
+                title = {
+                    Text(ru.protolink.communicator.util.CloudFolderDelete.confirmTitle(lang))
+                },
+                text = {
+                    Text(
+                        ru.protolink.communicator.util.CloudFolderDelete.sharedConfirmBody(
+                            lang,
+                            pending.name,
+                            pending.isFolder
+                        )
                     )
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = { vm.confirmDeleteCloud() },
-                    colors = androidx.compose.material3.ButtonDefaults.textButtonColors(
-                        contentColor = MaterialTheme.colorScheme.error
+                },
+                confirmButton = {
+                    androidx.compose.foundation.layout.Column {
+                        if (pending.canWriteForAll) {
+                            TextButton(
+                                onClick = {
+                                    vm.confirmDeleteCloud(
+                                        ru.protolink.communicator.util.CloudFolderDelete.SharedDeleteChoice.ForAll
+                                    )
+                                },
+                                colors = androidx.compose.material3.ButtonDefaults.textButtonColors(
+                                    contentColor = MaterialTheme.colorScheme.error
+                                )
+                            ) {
+                                Text(ru.protolink.communicator.util.CloudFolderDelete.forAllUsers(lang))
+                            }
+                        }
+                        TextButton(
+                            onClick = {
+                                vm.confirmDeleteCloud(
+                                    ru.protolink.communicator.util.CloudFolderDelete.SharedDeleteChoice.ForMeOnly
+                                )
+                            }
+                        ) {
+                            Text(ru.protolink.communicator.util.CloudFolderDelete.forMeOnly(lang))
+                        }
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { vm.dismissDeleteCloud() }) {
+                        Text(ShareSheetStrings.cancel(lang))
+                    }
+                }
+            )
+        } else {
+            AlertDialog(
+                onDismissRequest = { vm.dismissDeleteCloud() },
+                title = {
+                    Text(ru.protolink.communicator.util.CloudFolderDelete.confirmTitle(lang))
+                },
+                text = {
+                    Text(
+                        ru.protolink.communicator.util.CloudFolderDelete.confirmBody(
+                            lang,
+                            pending.name,
+                            pending.isFolder
+                        )
                     )
-                ) {
-                    Text(ru.protolink.communicator.util.CloudFolderDelete.deleteMenu(lang))
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = { vm.confirmDeleteCloud() },
+                        colors = androidx.compose.material3.ButtonDefaults.textButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error
+                        )
+                    ) {
+                        Text(ru.protolink.communicator.util.CloudFolderDelete.deleteMenu(lang))
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { vm.dismissDeleteCloud() }) {
+                        Text(ShareSheetStrings.cancel(lang))
+                    }
                 }
-            },
-            dismissButton = {
-                TextButton(onClick = { vm.dismissDeleteCloud() }) {
-                    Text(ShareSheetStrings.cancel(lang))
-                }
-            }
-        )
+            )
+        }
     }
 
     leaveConfirmEntityId?.let { leaveId ->

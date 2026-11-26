@@ -68,6 +68,20 @@ class CloudFolderDeleteTest {
     }
 
     @Test
+    fun e12_sharedDeleteTarget_andCopy() {
+        assertThat(CloudFolderDelete.isSharedDeleteTarget(true, false, false)).isTrue()
+        assertThat(CloudFolderDelete.isSharedDeleteTarget(false, true, false)).isTrue()
+        assertThat(CloudFolderDelete.isSharedDeleteTarget(false, false, true)).isTrue()
+        assertThat(CloudFolderDelete.isSharedDeleteTarget(false, false, false)).isFalse()
+        assertThat(CloudFolderDelete.preferLeaveForMeOnly(true)).isTrue()
+        assertThat(CloudFolderDelete.preferLeaveForMeOnly(false)).isFalse()
+        val body = CloudFolderDelete.sharedConfirmBody("en", "Docs", true)
+        assertThat(body.lowercase()).contains("shared")
+        assertThat(CloudFolderDelete.forMeOnly("en")).isEqualTo("For me only")
+        assertThat(CloudFolderDelete.forAllUsers("ru")).isEqualTo("Для всех")
+    }
+
+    @Test
     fun resolveMirror_childUnderMappedBreadcrumb() {
         val mapId = "11111111-1111-4111-8111-111111111111"
         val childId = "22222222-2222-4222-8222-222222222222"

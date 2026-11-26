@@ -335,6 +335,14 @@ interface ProtoLinkApi {
     @POST("api/Share/LeaveSharedWithMe")
     suspend fun leaveSharedWithMe(@Body body: LeaveSharedWithMeRequest): LeaveSharedWithMeResult
 
+    /** E12 owner me-only: detach My Cloud parent relations; keep grants/binaries. */
+    @POST("api/Share/DetachFromMyCloud")
+    suspend fun detachFromMyCloud(@Body body: DetachFromMyCloudRequest): DetachFromMyCloudResult
+
+    /** E12 CanWrite for-all: revoke external grants + cascade DeleteEntity. */
+    @POST("api/Share/DeleteSharedForAll")
+    suspend fun deleteSharedForAll(@Body body: DeleteSharedForAllRequest): DeleteSharedForAllResult
+
     /** Shared by me outbound inventory (AT-S51 / AT-S54). Signed-in user JWT only. */
     @GET("api/Share/ListSharedByMe")
     suspend fun listSharedByMe(
@@ -424,6 +432,25 @@ data class LeaveSharedWithMeResult(
     val entityId: String? = null,
     /** True when a direct personal grant was removed; false when already absent (idempotent). */
     val left: Boolean = true
+)
+
+/** E12 owner me-only. */
+data class DetachFromMyCloudRequest(val entityId: String)
+
+data class DetachFromMyCloudResult(
+    val entityId: String? = null,
+    val detached: Boolean = true,
+    val removedRelationCount: Int = 0,
+    val mainParentCleared: Boolean = false
+)
+
+/** E12 CanWrite for-all. */
+data class DeleteSharedForAllRequest(val entityId: String)
+
+data class DeleteSharedForAllResult(
+    val entityId: String? = null,
+    val revokedPrincipalCount: Int = 0,
+    val deleted: Boolean = true
 )
 
 /** Shared by me root (AT-S51 / AT-S52). No raw tokens. */

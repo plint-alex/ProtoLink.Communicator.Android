@@ -21,6 +21,12 @@ object CloudFolderDelete {
         val isMappedRoot: Boolean
     )
 
+    enum class SharedDeleteChoice {
+        Cancel,
+        ForMeOnly,
+        ForAll
+    }
+
     fun canDeleteItem(
         isVirtualEntry: Boolean,
         itemId: String,
@@ -34,6 +40,17 @@ object CloudFolderDelete {
             shareRootCanWrite
         )
     }
+
+    /**
+     * E12: me/all for SWM/SBM share roots, known outbound roots, or grant probe — not nested SWM children.
+     */
+    fun isSharedDeleteTarget(
+        isSwmShareRoot: Boolean,
+        isKnownOutboundShareRoot: Boolean,
+        hasExternalGrants: Boolean
+    ): Boolean = isSwmShareRoot || isKnownOutboundShareRoot || hasExternalGrants
+
+    fun preferLeaveForMeOnly(isSwmShareRoot: Boolean): Boolean = isSwmShareRoot
 
     fun deleteMenu(lang: String?): String =
         if (isRu(lang)) "Удалить" else "Delete"
@@ -54,6 +71,35 @@ object CloudFolderDelete {
             else
                 "Delete \"$safe\"?"
         }
+    }
+
+    fun sharedConfirmBody(lang: String?, name: String, isFolder: Boolean): String {
+        val safe = name.ifBlank { "—" }
+        return if (isRu(lang)) {
+            if (isFolder)
+                "«$safe» доступна нескольким людям. Удалить только у себя или для всех?"
+            else
+                "«$safe» доступен нескольким людям. Удалить только у себя или для всех?"
+        } else {
+            if (isFolder)
+                "\"$safe\" is shared. Remove it for you only, or delete it for everyone?"
+            else
+                "\"$safe\" is shared. Remove it for you only, or delete it for everyone?"
+        }
+    }
+
+    fun forMeOnly(lang: String?): String =
+        if (isRu(lang)) "Только для меня" else "For me only"
+
+    fun forAllUsers(lang: String?): String =
+        if (isRu(lang)) "Для всех" else "For all users"
+
+    fun detachedStatus(lang: String?, name: String): String {
+        val safe = name.ifBlank { "—" }
+        return if (isRu(lang))
+            "Убрано из Моего облака: «$safe»"
+        else
+            "Removed from My Cloud: \"$safe\""
     }
 
     fun permissionDenied(lang: String?): String =

@@ -94,6 +94,8 @@ import ru.protolink.communicator.ui.share.ShareContactPickerItem
 import ru.protolink.communicator.ui.share.SharePersonUi
 import ru.protolink.communicator.ui.share.ShareSheetUiState
 import ru.protolink.communicator.data.api.CreateShareLinkRequest
+import ru.protolink.communicator.data.api.DeleteSharedForAllRequest
+import ru.protolink.communicator.data.api.DetachFromMyCloudRequest
 import ru.protolink.communicator.data.api.LeaveSharedWithMeRequest
 import ru.protolink.communicator.data.api.RemovePermissionRequest
 import ru.protolink.communicator.data.api.RevokeShareLinkRequest
@@ -256,11 +258,15 @@ data class PendingDeleteNote(
     val hasChildren: Boolean
 )
 
-/** Dialog: confirm Cloud folder/file delete (E10 / AT-CFD). */
+/** Dialog: confirm Cloud folder/file delete (E10 / E12). */
 data class PendingDeleteCloud(
     val id: String,
     val name: String,
-    val isFolder: Boolean
+    val isFolder: Boolean,
+    /** E12: show me-only / for-all when multi-principal share root. */
+    val shared: Boolean = false,
+    val canWriteForAll: Boolean = true,
+    val isSwmShareRoot: Boolean = false
 )
 
 data class UiState(
@@ -435,6 +441,10 @@ class MainViewModel @Inject constructor(
      * Win CloudViewModel._deletedRemoteIds (normalized dash-insensitive).
      */
     private val deletedRemoteIds =
+        java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** E12: outbound Shared-by-me root ids (lowercase) for me/all detect without re-probe. */
+    private val outboundShareRootIds =
         java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     init {
@@ -1588,6 +1598,7 @@ class MainViewModel @Inject constructor(
 
         return roots.mapNotNull { root ->
             val entityId = root.entityId?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            outboundShareRootIds.add(entityId.lowercase())
             val meta = metaById[entityId.lowercase()]
             val name = root.entityName?.takeIf { it.isNotBlank() }
                 ?: meta?.let { entityDisplayName(it) }
@@ -4570,7 +4581,7 @@ class MainViewModel @Inject constructor(
         loadCloudFolder(parent)
     }
 
-    /** E10 / AT-CFD: show confirm for Cloud item Delete (gated by CanWrite under Shared-with-me). */
+    /** E10 / E12: show confirm for Cloud item Delete (gated by CanWrite under Shared-with-me). */
     fun requestDeleteCloudItem(item: CloudItem) {
         val crumbIds = _state.value.breadcrumb.map { it.first }
         if (!CloudFolderDelete.canDeleteItem(
@@ -4583,28 +4594,92 @@ class MainViewModel @Inject constructor(
             _state.update { it.copy(status = CloudFolderDelete.permissionDenied(uiLang())) }
             return
         }
-        _state.update {
-            it.copy(
-                pendingDeleteCloud = PendingDeleteCloud(
-                    id = item.id,
-                    name = item.name,
-                    isFolder = item.isFolder
+        viewModelScope.launch {
+            val swmRoot = isSwmShareRootItem(item)
+            val knownOutbound = outboundShareRootIds.contains(item.id.lowercase())
+            var hasGrants = false
+            if (!CloudFolderDelete.isSharedDeleteTarget(swmRoot, knownOutbound, false)) {
+                hasGrants = try {
+                    api.listShareGrants(item.id).isNotEmpty()
+                } catch (_: Exception) {
+                    false
+                }
+                if (hasGrants) outboundShareRootIds.add(item.id.lowercase())
+            }
+            val shared = CloudFolderDelete.isSharedDeleteTarget(swmRoot, knownOutbound, hasGrants)
+            _state.update {
+                it.copy(
+                    pendingDeleteCloud = PendingDeleteCloud(
+                        id = item.id,
+                        name = item.name,
+                        isFolder = item.isFolder,
+                        shared = shared,
+                        canWriteForAll = true,
+                        isSwmShareRoot = swmRoot
+                    )
                 )
-            )
+            }
         }
+    }
+
+    private fun isSwmShareRootItem(item: CloudItem): Boolean {
+        if (item.isVirtualEntry || CloudVirtualNodes.isVirtual(item.id)) return false
+        val crumbs = _state.value.breadcrumb.map { it.first }
+        val onSwmListing = crumbs.lastOrNull()?.equals(CloudVirtualNodes.SHARED_WITH_ME_ID, ignoreCase = true) == true
+            || currentFolderId.equals(CloudVirtualNodes.SHARED_WITH_ME_ID, ignoreCase = true)
+        if (onSwmListing && item.isShareRoot) return true
+        val active = CloudSharedScope.tryGetActiveShareRootId(crumbs)
+        return active != null &&
+            active.equals(item.id, ignoreCase = true) &&
+            _state.value.shareRootCanWrite.containsKey(item.id.lowercase())
     }
 
     fun dismissDeleteCloud() {
         _state.update { it.copy(pendingDeleteCloud = null) }
     }
 
-    fun confirmDeleteCloud() {
+    fun confirmDeleteCloud(choice: CloudFolderDelete.SharedDeleteChoice = CloudFolderDelete.SharedDeleteChoice.ForAll) {
         val pending = _state.value.pendingDeleteCloud ?: return
         _state.update { it.copy(pendingDeleteCloud = null) }
-        deleteCloudItem(pending.id, pending.name, pending.isFolder)
+        when {
+            pending.shared && choice == CloudFolderDelete.SharedDeleteChoice.ForMeOnly ->
+                deleteSharedForMeOnly(pending)
+            pending.shared && choice == CloudFolderDelete.SharedDeleteChoice.ForAll ->
+                deleteCloudItem(pending.id, pending.name, pending.isFolder, forAllShared = true)
+            choice == CloudFolderDelete.SharedDeleteChoice.Cancel -> Unit
+            else -> deleteCloudItem(pending.id, pending.name, pending.isFolder, forAllShared = false)
+        }
     }
 
-    private fun deleteCloudItem(id: String, name: String, isFolder: Boolean) = viewModelScope.launch {
+    private fun deleteSharedForMeOnly(pending: PendingDeleteCloud) {
+        if (CloudFolderDelete.preferLeaveForMeOnly(pending.isSwmShareRoot)) {
+            leaveShared(pending.id)
+            return
+        }
+        viewModelScope.launch {
+            try {
+                api.detachFromMyCloud(DetachFromMyCloudRequest(entityId = pending.id))
+                outboundShareRootIds.remove(pending.id.lowercase())
+                val listed = currentFolderId
+                val statusOk = CloudFolderDelete.detachedStatus(uiLang(), pending.name)
+                if (listed != null) {
+                    loadCloudFolder(listed, statusAfterLoad = statusOk)
+                } else {
+                    _state.update { it.copy(status = statusOk) }
+                }
+                refreshFolderTree()
+            } catch (e: Exception) {
+                showError("Detach failed", httpDetail(e), e)
+            }
+        }
+    }
+
+    private fun deleteCloudItem(
+        id: String,
+        name: String,
+        isFolder: Boolean,
+        forAllShared: Boolean = false
+    ) = viewModelScope.launch {
         val crumbIds = _state.value.breadcrumb.map { it.first }
         if (!CloudFolderDelete.canDeleteItem(
                 isVirtualEntry = false,
@@ -4655,13 +4730,19 @@ class MainViewModel @Inject constructor(
                 deletedIds.add(id)
             }
 
-            CloudFolderDelete.deleteSingleRoot(
-                rootId = id,
-                deleteEntity = { entityId ->
-                    api.deleteEntity(DeleteEntityRequest(entityId))
-                },
-                deletedIds = deletedIds
-            )
+            if (forAllShared) {
+                api.deleteSharedForAll(DeleteSharedForAllRequest(entityId = id))
+                deletedIds.add(id)
+            } else {
+                CloudFolderDelete.deleteSingleRoot(
+                    rootId = id,
+                    deleteEntity = { entityId ->
+                        api.deleteEntity(DeleteEntityRequest(entityId))
+                    },
+                    deletedIds = deletedIds
+                )
+            }
+            outboundShareRootIds.remove(id.lowercase())
 
             // Soft Ready paints sync-meta when GetEntities empty — purge all cascade ids (Win).
             runCatching { metadataStore.removeByRemoteIds(deletedIds) }
