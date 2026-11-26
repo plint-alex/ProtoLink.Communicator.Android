@@ -146,8 +146,9 @@ object CloudFolderDelete {
 
     /**
      * Depth-first: delete CloudFile children, recurse CloudFolder children, then delete [folderId].
-     * Matches Windows DeleteFolderRecursiveAsync (Api has no cascade).
+     * Leaf-first defense-in-depth (Api CloudFolder cascade may also soft-hide the subtree).
      * [deletedIds] collects every successfully deleted remote id (for sync-meta purge / Soft Ready tombstones).
+     * Fail-closed: if [listChildren] throws, aborts without deleting [folderId] (no parent-only soft-hide → promote).
      */
     suspend fun deleteFolderRecursive(
         folderId: String,

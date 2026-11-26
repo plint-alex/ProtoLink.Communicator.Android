@@ -173,6 +173,40 @@ class CloudFolderDeleteTest {
     }
 
     @Test
+    fun deleteFolderRecursive_nestedDepth_leafFirst() = runBlocking {
+        val order = mutableListOf<String>()
+        val tree = mapOf(
+            "root" to listOf(CloudFolderDelete.ChildRef("mid", CloudCodes.CLOUD_FOLDER)),
+            "mid" to listOf(CloudFolderDelete.ChildRef("leafFolder", CloudCodes.CLOUD_FOLDER)),
+            "leafFolder" to listOf(CloudFolderDelete.ChildRef("leafFile", CloudCodes.CLOUD_FILE))
+        )
+        CloudFolderDelete.deleteFolderRecursive(
+            folderId = "root",
+            listChildren = { id -> tree[id].orEmpty() },
+            deleteEntity = { id -> order.add(id) }
+        )
+        assertThat(order).containsExactly("leafFile", "leafFolder", "mid", "root").inOrder()
+    }
+
+    @Test
+    fun deleteFolderRecursive_listChildrenThrows_doesNotDeleteParent() = runBlocking {
+        val order = mutableListOf<String>()
+        var threw = false
+        try {
+            CloudFolderDelete.deleteFolderRecursive(
+                folderId = "root",
+                listChildren = { error("simulated GetEntities 504") },
+                deleteEntity = { id -> order.add(id) }
+            )
+        } catch (e: IllegalStateException) {
+            threw = true
+            assertThat(e.message).contains("504")
+        }
+        assertThat(threw).isTrue()
+        assertThat(order).isEmpty()
+    }
+
+    @Test
     fun normalizeRemoteId_dashInsensitive() {
         assertThat(CloudFolderDelete.normalizeRemoteId("AAAAAAAA-aaaa-4aaa-8aaa-AAAAAAAAAAAA"))
             .isEqualTo("aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa")

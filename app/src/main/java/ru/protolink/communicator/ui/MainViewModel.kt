@@ -4613,7 +4613,8 @@ class MainViewModel @Inject constructor(
     }
 
     /**
-     * Full GetEntities pages for E10 cascade (Api does not cascade).
+     * Full GetEntities pages for E10 leaf-first cascade (defense-in-depth vs Api cascade).
+     * Fail-closed: HTTP/errors throw — caller must not soft-hide parent alone (promote).
      * Single take=500 left large folders with undeleted children → Soft Ready/Sync resurrect.
      */
     private suspend fun listCloudChildrenForDelete(folderId: String): List<CloudFolderDelete.ChildRef> {

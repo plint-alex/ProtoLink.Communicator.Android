@@ -810,6 +810,9 @@ class SyncEngine(
             }
         }
 
+        // Deepest-first so child meta usually goes first; folder Removed still cascades
+        // leaf-first so incomplete meta cannot DeleteEntity(parent) alone → promote.
+        val alreadyDeleted = linkedSetOf<String>()
         for (rm in removes) {
             coroutineContext.ensureActive()
             val removedPath = PathUtil.normalize(rm.meta.relativePath)
@@ -817,13 +820,49 @@ class SyncEngine(
             // snapshot still lags — do not DeleteEntity the same-pass download (Win CreateDirectory
             // is immediately visible so this guard is a no-op there).
             if (dirty.contains(removedPath)) continue
-            remote.delete(rm.meta.remoteId)
+            val remoteKey = rm.meta.remoteId.replace("-", "").lowercase()
+            if (!alreadyDeleted.add(remoteKey)) {
+                store.delete(mapping.id, rm.meta.relativePath)
+                dirty.add(removedPath)
+                continue
+            }
+            if (rm.meta.isFolder) {
+                val cascade = linkedSetOf<String>()
+                deleteRemoteFolderCascade(rm.meta.remoteId, cascade)
+                for (id in cascade) {
+                    alreadyDeleted.add(id.replace("-", "").lowercase())
+                }
+            } else {
+                remote.delete(rm.meta.remoteId)
+            }
             store.delete(mapping.id, rm.meta.relativePath)
             dirty.add(removedPath)
             applied++
         }
 
         return applied
+    }
+
+    /**
+     * E10 / no-promote: leaf-first DeleteEntity for a mapped CloudFolder (defense-in-depth).
+     * Fail-closed if [RemoteCloud.listChildrenPaged] throws — do not soft-hide parent alone.
+     */
+    private suspend fun deleteRemoteFolderCascade(
+        folderId: String,
+        deletedIds: MutableCollection<String>
+    ) {
+        val children = remote.listChildrenPaged(folderId, includeValues = false)
+        for (c in children) {
+            if (c.id.equals(folderId, ignoreCase = true)) continue
+            if (c.isFolder) {
+                deleteRemoteFolderCascade(c.id, deletedIds)
+            } else {
+                remote.delete(c.id)
+                deletedIds.add(c.id)
+            }
+        }
+        remote.delete(folderId)
+        deletedIds.add(folderId)
     }
 
     private suspend fun applyRemotePhase(
