@@ -131,7 +131,9 @@ class ForceStatusGuardTest {
         // Live 1.0.116: AutoPush syncing=true made setStatusUnlessForce("Full sync queued…")
         // a no-op — chrome stayed Uploading while deferredFull orphaned download/delete.
         // requestFullSync coalesce must write "Full sync queued…" without ForceStatusGuard
-        // when only syncing (not Force) owns the banner.
+        // when only syncing (not Force) owns the banner — BUT only when syncing is AutoPush
+        // (Uploading). Live 1.0.117 delete-plant: when syncing already means full Sync
+        // (Syncing…), ViewModel must not overwrite with Full sync queued (SignalR coalesce).
         assertThat(
             ForceStatusGuard.statusOrNull(
                 forceRunning = false,

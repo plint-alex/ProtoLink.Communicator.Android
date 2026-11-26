@@ -3573,15 +3573,20 @@ class MainViewModel @Inject constructor(
                 }
                 return@launch
             }
+            // Win-parity (1.0.117 DOWNLOAD/LOCAL_DELETE residual): claim deferredFull BEFORE heal
+            // so interval AutoPush skips (RequestLocalPushAsync deferred gate) and cannot finish
+            // with "No local changes" without DrainDeferred. Tip @6e9be86 drained only when
+            // deferred was already set — heal-before-claim left the Sync tap as AutoPush chrome.
+            SyncFlight.deferredFull.set(true)
             // Win: heal before exclusive/coalesce so remap persists even when Sync defers to Force.
             runCatching { healDuplicateSameNamedMappings() }
             if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) {
-                // Win parity: defer only — do not overwrite "Force download…" / lock wait.
-                SyncFlight.deferredFull.set(true)
+                // deferred already claimed — do not overwrite "Force download…" / lock wait.
                 return@launch
             }
             val mappings = mappingStore.load()
             if (mappings.isEmpty()) {
+                SyncFlight.deferredFull.set(false)
                 _state.update {
                     it.copy(
                         status = MapLocalFolderStrings.emptyMappingsHint(uiLang()),
@@ -3592,11 +3597,16 @@ class MainViewModel @Inject constructor(
             }
             if (!SyncFlight.mutex.tryLock()) {
                 // Win CancelBudgetedExclusiveOnly — abort hung AutoPush so deferred full can run.
-                SyncFlight.deferredFull.set(true)
+                // deferredFull already claimed above.
                 SyncFlight.cancelBudgetedExclusiveOnly()
-                // Do not use setStatusUnlessForce here: AutoPush still has syncing=true, so
-                // ForceStatusGuard would keep sticky "Uploading…" (1.0.116 DOWNLOAD chrome miss).
-                if (!_state.value.forceRunning && !SyncFlight.forcePreferred.get()) {
+                // Do not paint "Full sync queued…" over an in-flight Syncing… banner (1.0.117
+                // delete-plant: SignalR/second request overwrote Syncing → sticky queued forever).
+                // Do not use setStatusUnlessForce: AutoPush syncing=true would keep Uploading…
+                // (1.0.116 DOWNLOAD chrome miss) — only skip when full Sync already owns chrome.
+                if (!_state.value.forceRunning &&
+                    !SyncFlight.forcePreferred.get() &&
+                    !_state.value.syncing
+                ) {
                     _state.update { it.copy(status = "Full sync queued…") }
                 }
                 return@launch
@@ -3606,6 +3616,7 @@ class MainViewModel @Inject constructor(
             _state.update { it.copy(status = "Syncing ${mappings.size} folder(s)…", syncing = true) }
             var reloadAfterRelease = false
             try {
+                // deferredFull claimed above → Win-style drain runs ≥1 reconcileAll.
                 val drained = drainDeferredFullWhileHoldingExclusive()
                 val lastLocal = drained.localChanges
                 val lastRemote = drained.remoteChanges
@@ -3662,6 +3673,8 @@ class MainViewModel @Inject constructor(
     /**
      * Win [CloudMappedSyncCoordinator.DrainDeferredWhileHoldingExclusiveAsync].
      * Caller must hold [SyncFlight.mutex]. Does not paint Cloud (reload after unlock).
+     * Only runs reconcile while deferredFull was set (Win Exchange==1 loop) — never an
+     * unconditional first pass (1.0.117 drain always-reconciled once when mis-invoked).
      */
     private suspend fun drainDeferredFullWhileHoldingExclusive(): SyncEngine.Result {
         var last = SyncEngine.Result(localChanges = 0, remoteChanges = 0)
@@ -3669,9 +3682,11 @@ class MainViewModel @Inject constructor(
         // on SAF/phone Walk cost — first pass already applied download/delete; extra passes only
         // delay Sync complete chrome (1.0.116 LOCAL_DELETE sticky Syncing).
         var passes = 0
-        do {
-            if (SyncFlight.forcePreferred.get()) break
-            SyncFlight.deferredFull.set(false)
+        while (
+            passes < MAX_DEFERRED_FULL_PASSES_PER_HOLD &&
+                SyncFlight.deferredFull.getAndSet(false) &&
+                !SyncFlight.forcePreferred.get()
+        ) {
             val currentMappings = mappingStore.load()
             val result = withContext(Dispatchers.IO) {
                 val engineMappings = currentMappings.map {
@@ -3688,11 +3703,7 @@ class MainViewModel @Inject constructor(
             } ?: break
             last = result
             passes++
-        } while (
-            passes < MAX_DEFERRED_FULL_PASSES_PER_HOLD &&
-                SyncFlight.deferredFull.getAndSet(false) &&
-                !SyncFlight.forcePreferred.get()
-        )
+        }
         return last
     }
 
@@ -3869,18 +3880,19 @@ class MainViewModel @Inject constructor(
                     return@launch
                 }
 
-                // Win RunExclusiveAsync: DrainDeferredWhileHoldingExclusive after push/cancel.
-                // Do not unlock then requestFullSync — that left sticky Uploading when
-                // forceOwnsStatus(syncing=true) skipped "Full sync queued" (1.0.116 FAIL).
+                // Win RunExclusiveAsync: always DrainDeferredWhileHoldingExclusive after push/cancel
+                // (no-op when deferredFull clear). Do not unlock then requestFullSync.
                 SyncFlight.markBudgetedExclusive(false)
-                val shouldDrain = budgetExpired || SyncFlight.deferredFull.get()
-                if (shouldDrain) {
-                    drainedFull = true
+                val wantFullChrome = budgetExpired || SyncFlight.deferredFull.get()
+                if (wantFullChrome) {
                     val maps = mappingStore.load()
                     _state.update {
                         it.copy(status = "Syncing ${maps.size} folder(s)…", syncing = true)
                     }
-                    val drained = drainDeferredFullWhileHoldingExclusive()
+                }
+                val drained = drainDeferredFullWhileHoldingExclusive()
+                drainedFull = wantFullChrome
+                if (wantFullChrome) {
                     if (SyncFlight.forcePreferred.get()) {
                         _state.update { cur ->
                             val clearSyncingText = cur.status.startsWith("Syncing")
@@ -4200,10 +4212,56 @@ class MainViewModel @Inject constructor(
             }
         } finally {
             if (exclusive != null) SyncFlight.clearExclusiveJob(exclusive)
-            if (locked && SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
-            if (managePreferred) {
+            var reloadAfterForceDrain = false
+            if (locked && SyncFlight.mutex.isLocked) {
+                if (managePreferred) {
+                    // Win RunForceExclusiveAsync: clear preferred then DrainDeferred on same hold
+                    // (1.0.117 delete-plant Force unlock→requestFullSync left sticky Force upload /
+                    // orphaned Full sync queued while Sync never drained).
+                    SyncFlight.clearForcePreferred()
+                    if (SyncFlight.deferredFull.get()) {
+                        try {
+                            val maps = mappingStore.load()
+                            _state.update {
+                                it.copy(
+                                    forceRunning = false,
+                                    syncing = true,
+                                    status = "Syncing ${maps.size} folder(s)…"
+                                )
+                            }
+                            val drained = drainDeferredFullWhileHoldingExclusive()
+                            if (!SyncFlight.forcePreferred.get()) {
+                                _state.update {
+                                    it.copy(
+                                        status = "Sync complete (local ${drained.localChanges}, remote ${drained.remoteChanges})",
+                                        syncing = false,
+                                        mappings = mappingStore.load()
+                                    )
+                                }
+                                reloadAfterForceDrain = true
+                            } else {
+                                _state.update { it.copy(syncing = false) }
+                            }
+                        } catch (e: CancellationException) {
+                            _state.update { it.copy(syncing = false) }
+                            if (SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
+                            throw e
+                        } catch (e: Exception) {
+                            Log.e("ProtoLinkSync", "force drain deferred failed", e)
+                            handleSyncFailure(e)
+                        }
+                    }
+                }
+                if (SyncFlight.mutex.isLocked) SyncFlight.mutex.unlock()
+            } else if (managePreferred) {
                 SyncFlight.clearForcePreferred()
                 if (SyncFlight.deferredFull.get()) requestFullSync()
+            }
+            if (reloadAfterForceDrain &&
+                !_state.value.forceRunning &&
+                !SyncFlight.forcePreferred.get()
+            ) {
+                currentFolderId?.let { loadCloudFolder(it) }
             }
         }
     }

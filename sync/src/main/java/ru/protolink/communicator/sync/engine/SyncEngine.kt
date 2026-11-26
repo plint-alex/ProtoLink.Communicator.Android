@@ -890,6 +890,7 @@ class SyncEngine(
                                 )
                             )
                         } else {
+                            // Win DownloadBytesOrNullAsync ?? Empty + WriteAllBytes (incl. empty).
                             val bytes = remote.downloadFile(c.remote.id)
                             if (bytes == null) {
                                 SyncRemoteDownload.logFailed(
@@ -897,7 +898,6 @@ class SyncEngine(
                                 )
                                 continue
                             }
-                            if (bytes.isEmpty()) continue
                             fs.writeFile(mapping.localRootPath, c.relativePath, bytes)
                             store.upsert(
                                 SyncItemMeta(
@@ -907,7 +907,11 @@ class SyncEngine(
                                     relativePath = c.relativePath,
                                     isFolder = false,
                                     sizeBytes = bytes.size.toLong(),
-                                    contentHash = ContentHashUtil.sha256Hex(bytes),
+                                    contentHash = if (bytes.isNotEmpty()) {
+                                        ContentHashUtil.sha256Hex(bytes)
+                                    } else {
+                                        ""
+                                    },
                                     remoteUpdateTime = c.remote.updateTime
                                 )
                             )

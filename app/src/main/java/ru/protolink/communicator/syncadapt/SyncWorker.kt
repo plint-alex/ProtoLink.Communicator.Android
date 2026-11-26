@@ -54,12 +54,15 @@ class SyncWorker @AssistedInject constructor(
         // Do not bind this worker Job as exclusive — Force preempt must cancel detached work
         // inside runDeferringToForce, not the mutex owner (1.0.65 structured-join stall).
         return try {
-            do {
-                if (SyncFlight.forcePreferred.get()) {
-                    Log.i(TAG, "Stop reconcile; Force preferred")
-                    break
-                }
-                SyncFlight.deferredFull.set(false)
+            // Win DrainDeferred: Exchange deferred→0 then reconcile. Worker entry is itself a
+            // full pass claim — set deferred so the loop runs ≥1 (parity with requestFullSync).
+            SyncFlight.deferredFull.set(true)
+            var passes = 0
+            while (
+                passes < 2 &&
+                    SyncFlight.deferredFull.getAndSet(false) &&
+                    !SyncFlight.forcePreferred.get()
+            ) {
                 Log.i(TAG, "Reconcile ${mappings.size} mapping(s)")
                 val result = SyncFlight.runDeferringToForce {
                     SyncEngine(metadataStore, localFs, remote).reconcileAll(mappings)
@@ -69,7 +72,8 @@ class SyncWorker @AssistedInject constructor(
                     break
                 }
                 Log.i(TAG, "Done local=${result.localChanges} remote=${result.remoteChanges}")
-            } while (SyncFlight.deferredFull.getAndSet(false) && !SyncFlight.forcePreferred.get())
+                passes++
+            }
             Result.success()
         } catch (e: CancellationException) {
             Log.i(TAG, "Reconcile cancelled (Force preempt)")
