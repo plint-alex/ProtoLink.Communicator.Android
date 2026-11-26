@@ -1,8 +1,10 @@
 package ru.protolink.communicator.util
 
 /**
- * Client-only Cloud hub nodes (AT-S17 / C6 / AT-S54): My Cloud + Shared with me +
- * Shared by me + Recent as siblings. Ids are fixed and never sent to the API as parent/entity ids.
+ * Client-only Cloud virtual nodes (AT-S17 / C6 / AT-S54 / E9f).
+ * HUB_ID remains for internal/legacy paths but must not cold-open as the start listing (E9f).
+ * SWM / SBM / Recent stay reachable via secondary Locations chrome. Ids are fixed and never
+ * sent to the API as parent/entity ids.
  */
 object CloudVirtualNodes {
     const val HUB_ID = "a1111111-1111-4111-8111-111111111111"

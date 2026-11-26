@@ -26,7 +26,8 @@ class MapLocalFolderUiTest {
             MapLocalFolderUi.showHubCta(
                 authenticated = true,
                 currentFolderId = myCloud,
-                breadcrumbIds = listOf(CloudVirtualNodes.HUB_ID, myCloud),
+                // E9f: crumbs start at My Cloud (no hub).
+                breadcrumbIds = listOf(myCloud),
                 mappedFolderIds = emptySet(),
                 shareRootCanWrite = emptyMap()
             )

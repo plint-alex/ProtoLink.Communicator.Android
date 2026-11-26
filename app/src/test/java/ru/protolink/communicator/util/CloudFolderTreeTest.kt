@@ -180,13 +180,42 @@ class CloudFolderTreeTest {
     }
 
     @Test
-    fun composeBreadcrumb_prefixesHubAboveTreeRoot() {
-        val hub = "hub" to "Cloud"
+    fun composeBreadcrumb_prefixesAboveTreeRoot() {
+        val above = "zzzzzzzz-zzzz-4zzz-8zzz-zzzzzzzzzzzz" to "Above"
+        val root = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val existing = listOf(above, root to "My Cloud", child to "Child")
+        val tree = listOf(root to "My Cloud", child to "Child")
+        val composed = CloudFolderTree.composeBreadcrumb(existing, tree)
+        assertThat(composed).containsExactly(above, root to "My Cloud", child to "Child").inOrder()
+    }
+
+    @Test
+    fun composeBreadcrumb_e9f_omitsHubPrefix() {
+        val hub = CloudVirtualNodes.HUB_ID to "Cloud"
         val root = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         val child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         val existing = listOf(hub, root to "My Cloud", child to "Child")
         val tree = listOf(root to "My Cloud", child to "Child")
-        val composed = CloudFolderTree.composeBreadcrumb(existing, tree)
-        assertThat(composed).containsExactly(hub, root to "My Cloud", child to "Child").inOrder()
+        val composed = CloudFolderTree.composeBreadcrumb(
+            existing,
+            tree,
+            omitPrefixId = CloudVirtualNodes::isVirtual
+        )
+        assertThat(composed).containsExactly(root to "My Cloud", child to "Child").inOrder()
+        assertThat(composed.none { CloudBrowseRoot.isHubLanding(it.first) }).isTrue()
+    }
+
+    @Test
+    fun pickTreeRootId_e9f_myCloudFirstCrumb_noHub() {
+        val root = "11111111-1111-4111-8111-111111111111"
+        val folder = "22222222-2222-4222-8222-222222222222"
+        val crumbs = listOf(
+            root to CloudCodes.CLOUD_ROOT,
+            folder to CloudCodes.CLOUD_FOLDER
+        )
+        assertThat(
+            CloudFolderTree.pickTreeRootId(crumbs, photosLibraryId = null, CloudVirtualNodes::isVirtual)
+        ).isEqualTo(root)
     }
 }

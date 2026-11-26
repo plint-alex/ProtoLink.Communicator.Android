@@ -183,16 +183,19 @@ object CloudFolderTree {
     /**
      * Prefix existing breadcrumb crumbs that sit above the tree root, then append the tree trail
      * (which starts at the tree root). Parity with Windows CloudFolderNavigation.ComposeBreadcrumb.
+     * E9f: [omitPrefixId] skips virtual hub / Locations crumbs so Up never re-lands on hub.
      */
     fun composeBreadcrumb(
         existingCrumbs: List<Pair<String, String>>,
-        treeAncestorsToSelected: List<Pair<String, String>>
+        treeAncestorsToSelected: List<Pair<String, String>>,
+        omitPrefixId: ((String) -> Boolean)? = null
     ): List<Pair<String, String>> {
         if (treeAncestorsToSelected.isEmpty()) return existingCrumbs
         val treeRoot = treeAncestorsToSelected[0].first
         val prefix = ArrayList<Pair<String, String>>()
         for (c in existingCrumbs) {
             if (c.first.equals(treeRoot, ignoreCase = true)) break
+            if (omitPrefixId?.invoke(c.first) == true) continue
             prefix.add(c)
         }
         prefix.addAll(treeAncestorsToSelected)

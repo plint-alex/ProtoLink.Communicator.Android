@@ -59,6 +59,7 @@ import ru.protolink.communicator.util.CloudMainParent
 import ru.protolink.communicator.util.CloudRecentList
 import ru.protolink.communicator.util.CloudRootSelection
 import ru.protolink.communicator.util.CloudSharedScope
+import ru.protolink.communicator.util.CloudBrowseRoot
 import ru.protolink.communicator.util.CloudVirtualNodes
 import ru.protolink.communicator.util.EntityMeta
 import ru.protolink.communicator.util.JsonValues
@@ -423,7 +424,7 @@ class MainViewModel @Inject constructor(
     /**
      * Win CloudViewModel._listingLoadGeneration — Refresh / navigate must not paint a
      * superseded GetEntities (live CLOUD_BROWSE_EMPTY_DESPITE_API_KIDS under sync GE flood).
-     * Declared above [init]: ensureCloudRoot → openCloudHub → loadCloudFolder from init.
+     * Declared above [init]: ensureCloudRoot → openMyCloud → loadCloudFolder from init (E9f).
      */
     private val listingLoadGeneration = java.util.concurrent.atomic.AtomicInteger(0)
 
@@ -1196,22 +1197,71 @@ class MainViewModel @Inject constructor(
         val id = resolveCanonicalCloudRootId(userId) ?: return
         cloudRootId = id
         folderTreeCodes[id.lowercase()] = CloudCodes.CLOUD_ROOT
-        openCloudHub()
+        openMyCloud()
     }
 
-    /** AT-S17: Cloud hub with My Cloud + Photos + Shared with me + Recent siblings. */
-    fun openCloudHub() {
+    /**
+     * E9f: cold open = My Cloud (never HubId / buildHubListing as start).
+     * Name kept for soft-land call sites (Photos host, etc.).
+     */
+    fun openCloudHub() = openMyCloud()
+
+    /** E9f: open canonical My Cloud CloudRoot — real children + Folders tree. */
+    fun openMyCloud() {
         val lang = uiLang()
-        val hubName = ShareSheetCloudStrings.cloudHub(lang)
-        currentFolderId = CloudVirtualNodes.HUB_ID
+        val root = CloudBrowseRoot.coldOpenFolderId(cloudRootId) ?: return
+        val name = ShareSheetCloudStrings.myCloud(lang)
+        currentFolderId = root
         clearCloudFileOpen()
         _state.update {
             it.copy(
-                breadcrumb = listOf(CloudVirtualNodes.HUB_ID to hubName),
+                breadcrumb = CloudBrowseRoot.myCloudCrumb(root, name),
                 cloudFolderTree = emptyList()
             )
         }
-        loadCloudFolder(CloudVirtualNodes.HUB_ID)
+        loadCloudFolder(root)
+    }
+
+    /** E9f Locations — Shared with me virtual listing (single crumb, no hub). */
+    fun openSharedWithMe() {
+        val lang = uiLang()
+        openVirtualLocation(
+            CloudVirtualNodes.SHARED_WITH_ME_ID,
+            ShareSheetCloudStrings.sharedWithMe(lang)
+        )
+    }
+
+    /** E9f Locations — Shared by me virtual listing. */
+    fun openSharedByMe() {
+        val lang = uiLang()
+        openVirtualLocation(
+            CloudVirtualNodes.SHARED_BY_ME_ID,
+            ShareSheetCloudStrings.sharedByMe(lang)
+        )
+    }
+
+    /** E9f Locations — Recent virtual listing. */
+    fun openRecent() {
+        val lang = uiLang()
+        openVirtualLocation(
+            CloudVirtualNodes.RECENT_ID,
+            ShareSheetCloudStrings.recent(lang)
+        )
+    }
+
+    private fun openVirtualLocation(
+        virtualId: String,
+        name: String,
+        statusAfterLoad: String? = null
+    ) {
+        clearCloudFileOpen()
+        _state.update {
+            it.copy(
+                breadcrumb = CloudBrowseRoot.virtualLocationCrumb(virtualId, name),
+                cloudFolderTree = emptyList()
+            )
+        }
+        loadCloudFolder(virtualId, statusAfterLoad = statusAfterLoad)
     }
 
     fun loadCloudFolder(folderId: String, statusAfterLoad: String? = null) = viewModelScope.launch {
@@ -1668,25 +1718,26 @@ class MainViewModel @Inject constructor(
     }
 
     private fun navigateToSharedWithMeListing(lang: String, statusAfterLoad: String? = null) {
-        val hub = CloudVirtualNodes.HUB_ID to ShareSheetCloudStrings.cloudHub(lang)
-        val shared = CloudVirtualNodes.SHARED_WITH_ME_ID to ShareSheetCloudStrings.sharedWithMe(lang)
-        _state.update { it.copy(breadcrumb = listOf(hub, shared)) }
-        loadCloudFolder(CloudVirtualNodes.SHARED_WITH_ME_ID, statusAfterLoad = statusAfterLoad)
+        openVirtualLocation(
+            CloudVirtualNodes.SHARED_WITH_ME_ID,
+            ShareSheetCloudStrings.sharedWithMe(lang),
+            statusAfterLoad = statusAfterLoad
+        )
     }
 
     /** Jump to a mapped folder (stories strip) with a sensible breadcrumb. */
     fun openMappedFolder(folderId: String, name: String) {
         val lang = uiLang()
         val root = cloudRootId
-        val hub = CloudVirtualNodes.HUB_ID to ShareSheetCloudStrings.cloudHub(lang)
+        // E9f: crumbs start at My Cloud (no hub crumb).
         val myCloud = root?.let { id -> id to ShareSheetCloudStrings.myCloud(lang) }
         val leaf = folderId to name.ifBlank { "Folder" }
         val crumbs = when {
             root != null && !root.equals(folderId, true) && myCloud != null ->
-                listOf(hub, myCloud, leaf)
+                listOf(myCloud, leaf)
             root != null && root.equals(folderId, true) && myCloud != null ->
-                listOf(hub, myCloud)
-            else -> listOf(hub, leaf)
+                listOf(myCloud)
+            else -> listOf(leaf)
         }
         _state.update { it.copy(breadcrumb = crumbs) }
         loadCloudFolder(folderId)
@@ -1704,17 +1755,15 @@ class MainViewModel @Inject constructor(
             openCloudFileInCurrentFolder(item)
             return
         }
-        // Hub Photos row → library folder entity (anti-SAP AT-PC6). Surface paused: row omitted.
+        // Photos library open (anti-SAP AT-PC6). Surface paused: hub row omitted; keep path if listed.
         val photosLib = photosLibraryId
         if (PhotosLibrary.isSurfaceEnabled() &&
-            currentFolderId.equals(CloudVirtualNodes.HUB_ID, ignoreCase = true) &&
             photosLib != null &&
             item.id.equals(photosLib, ignoreCase = true)
         ) {
             val lang = uiLang()
-            val hub = CloudVirtualNodes.HUB_ID to ShareSheetCloudStrings.cloudHub(lang)
             _state.update {
-                it.copy(breadcrumb = listOf(hub, item.id to ShareSheetCloudStrings.photos(lang)))
+                it.copy(breadcrumb = listOf(item.id to ShareSheetCloudStrings.photos(lang)))
             }
             loadCloudFolder(item.id)
             recordRecentOpen(item.id, ShareSheetCloudStrings.photos(lang), isFolder = true)
@@ -1739,7 +1788,11 @@ class MainViewModel @Inject constructor(
         val trail = CloudFolderTree.buildAncestorTrail(treeRows, folderId)
         if (trail.isNotEmpty()) {
             clearCloudFileOpen()
-            val composed = CloudFolderTree.composeBreadcrumb(_state.value.breadcrumb, trail)
+            val composed = CloudFolderTree.composeBreadcrumb(
+                _state.value.breadcrumb,
+                trail,
+                omitPrefixId = CloudVirtualNodes::isVirtual
+            )
             _state.update { it.copy(breadcrumb = composed) }
             val name = trail.last().second
             loadCloudFolder(folderId)
@@ -1990,14 +2043,13 @@ class MainViewModel @Inject constructor(
             if (chain[0].first.code == CloudCodes.CLOUD_ROOT) {
                 cloudRootId = chain[0].first.id
             }
-            val lang = uiLang()
-            val hub = CloudVirtualNodes.HUB_ID to ShareSheetCloudStrings.cloudHub(lang)
+            // E9f: crumbs start at My Cloud / CloudRoot — no hub prepend.
             val folderCrumbs = if (isFolder) {
                 chain.map { pair -> pair.first.id to pair.second }
             } else {
                 chain.dropLast(1).map { pair -> pair.first.id to pair.second }
             }
-            val crumbs = listOf(hub) + folderCrumbs
+            val crumbs = CloudBrowseRoot.withoutHubCrumb(folderCrumbs)
             if (isFolder) {
                 _state.update { s -> s.copy(breadcrumb = crumbs) }
                 loadCloudFolder(entity.id)
@@ -2006,7 +2058,8 @@ class MainViewModel @Inject constructor(
                 val parentFolder = folderCrumbs.lastOrNull()?.first
                 _state.update { s -> s.copy(breadcrumb = crumbs) }
                 if (parentFolder == null) {
-                    loadCloudFolder(CloudVirtualNodes.HUB_ID)
+                    val root = CloudBrowseRoot.coldOpenFolderId(cloudRootId)
+                    if (root != null) loadCloudFolder(root) else openMyCloud()
                 } else {
                     currentFolderId = parentFolder
                     val items = loadCloudFolderChildren(parentFolder)

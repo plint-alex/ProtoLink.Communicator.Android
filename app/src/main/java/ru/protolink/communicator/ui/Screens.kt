@@ -899,7 +899,7 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
     val openFile = state.cloudOpenFile
     val folderName = openFile?.name
         ?: state.breadcrumb.lastOrNull()?.second
-        ?: ru.protolink.communicator.util.ShareSheetCloudStrings.cloudHub(lang)
+        ?: ru.protolink.communicator.util.ShareSheetCloudStrings.myCloud(lang)
     val igSurface = Color(0xFFFAFAFA)
     val igBorder = Color(0xFFDBDBDB)
     val igAccent = Color(0xFF262626)
@@ -1011,19 +1011,20 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                     Icon(Icons.Default.Add, contentDescription = "New", tint = igAccent)
                 }
             }
-            if (canLeaveCurrentSharedRoot) {
-                Box {
-                    IconButton(onClick = { headerOverflowOpen = true }) {
-                        Icon(
-                            Icons.Default.MoreVert,
-                            contentDescription = ru.protolink.communicator.util.ShareSheetCloudStrings.leave(lang),
-                            tint = igAccent
-                        )
-                    }
-                    DropdownMenu(
-                        expanded = headerOverflowOpen,
-                        onDismissRequest = { headerOverflowOpen = false }
-                    ) {
+            // E9f: Cloud ⋮ Locations → SWM / SBM / Recent (not a permanent hub strip).
+            Box {
+                IconButton(onClick = { headerOverflowOpen = true }) {
+                    Icon(
+                        Icons.Default.MoreVert,
+                        contentDescription = "More",
+                        tint = igAccent
+                    )
+                }
+                DropdownMenu(
+                    expanded = headerOverflowOpen,
+                    onDismissRequest = { headerOverflowOpen = false }
+                ) {
+                    if (canLeaveCurrentSharedRoot) {
                         DropdownMenuItem(
                             text = {
                                 Text(ru.protolink.communicator.util.ShareSheetCloudStrings.leaveMenu(lang))
@@ -1031,6 +1032,39 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                             onClick = {
                                 headerOverflowOpen = false
                                 currentId?.let { leaveConfirmEntityId = it }
+                            }
+                        )
+                    }
+                    if (!isSharedListing) {
+                        DropdownMenuItem(
+                            text = {
+                                Text(ru.protolink.communicator.util.ShareSheetCloudStrings.sharedWithMe(lang))
+                            },
+                            onClick = {
+                                headerOverflowOpen = false
+                                vm.openSharedWithMe()
+                            }
+                        )
+                    }
+                    if (!isSharedByMeListing) {
+                        DropdownMenuItem(
+                            text = {
+                                Text(ru.protolink.communicator.util.ShareSheetCloudStrings.sharedByMe(lang))
+                            },
+                            onClick = {
+                                headerOverflowOpen = false
+                                vm.openSharedByMe()
+                            }
+                        )
+                    }
+                    if (!isRecentListing) {
+                        DropdownMenuItem(
+                            text = {
+                                Text(ru.protolink.communicator.util.ShareSheetCloudStrings.recent(lang))
+                            },
+                            onClick = {
+                                headerOverflowOpen = false
+                                vm.openRecent()
                             }
                         )
                     }
