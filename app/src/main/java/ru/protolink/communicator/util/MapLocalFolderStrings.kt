@@ -73,6 +73,21 @@ object MapLocalFolderStrings {
         else
             "No mapped folders. Cloud → Add local folder to Cloud…"
 
+    fun wizardParentMissing(lang: String?): String =
+        if (isRussian(lang))
+            "Не удалось определить «Моё облако». Обновите Cloud и попробуйте снова."
+        else
+            "Could not resolve My Cloud. Refresh Cloud and try again."
+
+    fun wizardOpening(lang: String?): String =
+        if (isRussian(lang)) "Открытие мастера сопоставления…" else "Opening map wizard…"
+
+    fun wizardOpenFailed(lang: String?): String =
+        if (isRussian(lang))
+            "Не удалось открыть мастер «Локальная папка → Cloud». См. подробности в Cloud."
+        else
+            "Could not open the Local folder → Cloud wizard. See Cloud details."
+
     fun suggestedFolderNameFromUri(uriString: String): String {
         val uri = runCatching { android.net.Uri.parse(uriString) }.getOrNull() ?: return "Folder"
         val last = uri.lastPathSegment?.substringAfterLast(':')?.substringAfterLast('/')

@@ -2948,25 +2948,59 @@ class MainViewModel @Inject constructor(
     /**
      * E6 local-first wizard entry (Cloud hub CTA, Notes nudge, Settings deep-link).
      * Prefill skips SAF when Notes already chose a tree URI.
+     * Candidate listing soft-fails (interactive pages only) so SameNamed cross-root
+     * discovery cannot block wizard chrome (AT-NMR-7 / AT-MAP-2).
      */
     fun requestAddLocalFolderWizard(prefilledLocalUri: String? = null) {
         if (!auth.isAuthenticated) {
             _state.update { it.copy(status = "Log in before mapping a folder", showSettings = true) }
             return
         }
+        val lang = uiLang()
+        val priorStatus = _state.value.status
+        _state.update {
+            it.copy(
+                status = MapLocalFolderStrings.wizardOpening(lang),
+                preferCloudTabNonce = it.preferCloudTabNonce + 1,
+                showSettings = false
+            )
+        }
         viewModelScope.launch {
-            ensureCloudRootQuiet()
-            val parent = resolveWizardParentFolderId()
-            val candidates = if (parent != null) loadUnmappedChildFolders(parent) else emptyList()
-            _state.update {
-                it.copy(
-                    preferCloudTabNonce = it.preferCloudTabNonce + 1,
-                    showSettings = false,
-                    mapWizardOpen = true,
-                    mapWizardPrefillUri = prefilledLocalUri?.takeIf { u -> u.isNotBlank() },
-                    mapWizardCandidates = candidates,
-                    mapWizardBusy = false
+            try {
+                ensureWizardCloudRoot()
+                val parent = resolveWizardParentFolderId()
+                if (parent.isNullOrBlank()) {
+                    _state.update {
+                        it.copy(
+                            status = MapLocalFolderStrings.wizardParentMissing(lang),
+                            mapWizardOpen = false,
+                            mapWizardBusy = false
+                        )
+                    }
+                    return@launch
+                }
+                val candidates = loadUnmappedChildFolders(parent)
+                _state.update {
+                    it.copy(
+                        mapWizardOpen = true,
+                        mapWizardPrefillUri = prefilledLocalUri?.takeIf { u -> u.isNotBlank() },
+                        mapWizardCandidates = candidates,
+                        mapWizardBusy = false,
+                        status = priorStatus
+                    )
+                }
+            } catch (e: Exception) {
+                Log.w(
+                    "ProtoLinkCloud",
+                    "requestAddLocalFolderWizard failed: ${e.javaClass.simpleName}: ${e.message}"
                 )
+                _state.update {
+                    it.copy(
+                        status = MapLocalFolderStrings.wizardOpenFailed(lang),
+                        mapWizardOpen = false,
+                        mapWizardBusy = false
+                    )
+                }
             }
         }
     }
@@ -2984,7 +3018,7 @@ class MainViewModel @Inject constructor(
 
     fun refreshMapWizardCandidates() {
         viewModelScope.launch {
-            ensureCloudRootQuiet()
+            ensureWizardCloudRoot()
             val parent = resolveWizardParentFolderId()
             val candidates = if (parent != null) loadUnmappedChildFolders(parent) else emptyList()
             _state.update { it.copy(mapWizardCandidates = candidates) }
@@ -2995,7 +3029,7 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch {
             _state.update { it.copy(mapWizardBusy = true) }
             try {
-                ensureCloudRootQuiet()
+                ensureWizardCloudRoot()
                 val parent = resolveWizardParentFolderId()
                     ?: run {
                         _state.update {
@@ -3014,20 +3048,15 @@ class MainViewModel @Inject constructor(
                         _state.update { it.copy(mapWizardBusy = false) }
                         return@launch
                     }
-                    // Never mint a second same-named CloudFolder (dual MyNotesFolder FAIL class).
-                    // Cross-CloudRoot: Win may already have the name under Drive while wizard is on Android root.
-                    val nameLower = name.trim().lowercase()
-                    val existing = SameNamedCloudFolderHeal.preferExistingSameName(
+                    // Prefer existing same-named child under create parent (interactive pages).
+                    // Cross-CloudRoot duals: Sync SameNamedCloudFolderHeal — do not hang confirm.
+                    val existing = MapLocalFolderWizardCandidates.preferSameNamedUnderParent(
                         name,
-                        loadChildFolderSiblingsForDiscovery(
-                            parentId = parent,
-                            onlyNames = setOf(nameLower),
-                            mappingDisplayByLower = mapOf(nameLower to name.trim())
-                        )
+                        loadWizardParentChildren(parent)
                     )
                     if (existing != null) {
-                        folderId = existing.id
-                        folderName = existing.name.ifBlank { name }
+                        folderId = existing.first
+                        folderName = existing.second.ifBlank { name }
                     } else {
                         val createdId = createCloudFolderUnder(parent, name)
                         if (createdId == null) {
@@ -3065,6 +3094,37 @@ class MainViewModel @Inject constructor(
         val id = resolveCanonicalCloudRootId(userId) ?: return
         cloudRootId = id
         folderTreeCodes[id.lowercase()] = CloudCodes.CLOUD_ROOT
+    }
+
+    /**
+     * Ensure My Cloud id without stalling Notes nudge on full richness walks (AT-NMR-7).
+     * Fast path when Cloud is already Ready with a known root.
+     */
+    private suspend fun ensureWizardCloudRoot() {
+        val root = cloudRootId
+        if (!root.isNullOrBlank() &&
+            knownCloudRootIds.any { it.equals(root, ignoreCase = true) }
+        ) {
+            val mapped = mappingStore.load().map { it.cloudFolderId.lowercase() }.toSet()
+            if (!mapped.contains(root.lowercase())) return
+
+            val knownRoots = knownCloudRootIds.map { CloudRootSelection.Candidate(it) }
+            val alt = CloudRootSelection.pickWizardCreateParentRoot(knownRoots, mapped)
+            if (!alt.isNullOrBlank()) {
+                cloudRootId = alt
+                folderTreeCodes[alt.lowercase()] = CloudCodes.CLOUD_ROOT
+            }
+            return
+        }
+
+        ensureCloudRootQuiet()
+        val mapped = mappingStore.load().map { it.cloudFolderId.lowercase() }.toSet()
+        val roots = knownCloudRootIds.map { CloudRootSelection.Candidate(it) }
+        val wizardRoot = CloudRootSelection.pickWizardCreateParentRoot(roots, mapped)
+        if (!wizardRoot.isNullOrBlank()) {
+            cloudRootId = wizardRoot
+            folderTreeCodes[wizardRoot.lowercase()] = CloudCodes.CLOUD_ROOT
+        }
     }
 
     /**
@@ -3178,22 +3238,48 @@ class MainViewModel @Inject constructor(
         return cloudRootId
     }
 
+    /**
+     * Soft-fail interactive parent listing only — never SameNamed cross-root discovery
+     * (unbounded includeValues paging blocked wizard open; AT-NMR-7).
+     */
     private suspend fun loadUnmappedChildFolders(parentId: String): List<MapLocalFolderCandidate> {
-        val siblings = loadChildFolderSiblingsForDiscovery(parentId)
-        val mapped = mappingStore.load().map { it.cloudFolderId.lowercase() }.toSet()
-        return siblings.mapNotNull { s ->
-            if (mapped.contains(s.id.lowercase())) return@mapNotNull null
-            MapLocalFolderCandidate(
-                id = s.id,
-                name = s.name,
-                creationTime = s.creationTime,
-                immediateChildCount = s.immediateChildCount
+        return try {
+            val list = loadWizardParentChildren(parentId)
+            val mapped = mappingStore.load().map { it.cloudFolderId }.toSet()
+            MapLocalFolderWizardCandidates.fromParentListing(list, mapped)
+        } catch (e: Exception) {
+            // Create-new still works with an empty pick list; do not abort the wizard.
+            Log.w(
+                "ProtoLinkCloud",
+                "LoadUnmappedChildFolders soft-fail: ${e.javaClass.simpleName}: ${e.message}"
             )
-        }.sortedWith(
-            compareByDescending<MapLocalFolderCandidate> { it.immediateChildCount }
-                .thenBy { it.creationTime.orEmpty() }
-                .thenBy { it.id }
-        )
+            emptyList()
+        }
+    }
+
+    /** Interactive-bounded GetEntities under wizard create parent (Win InteractiveListingMaxPages). */
+    private suspend fun loadWizardParentChildren(parentId: String): List<EntityDto> {
+        if (parentId.isBlank() || CloudVirtualNodes.isVirtual(parentId)) return emptyList()
+        val out = ArrayList<EntityDto>()
+        var skip = 0
+        val pageSize = CloudInteractiveListing.PAGE_SIZE
+        for (page in 0 until CloudInteractiveListing.MAX_PAGES) {
+            val children = runCatching {
+                api.getEntities(
+                    GetEntitiesRequest(
+                        parentIds = listOf(parentId),
+                        includeValues = true,
+                        skip = skip,
+                        take = pageSize
+                    )
+                )
+            }.getOrElse { emptyList() }
+            if (children.isEmpty()) break
+            out += children
+            if (children.size < pageSize) break
+            skip += pageSize
+        }
+        return out
     }
 
     /**
