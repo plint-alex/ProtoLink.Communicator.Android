@@ -3603,10 +3603,23 @@ class MainViewModel @Inject constructor(
             // with "No local changes" without DrainDeferred. Tip @6e9be86 drained only when
             // deferred was already set — heal-before-claim left the Sync tap as AutoPush chrome.
             SyncFlight.deferredFull.set(true)
+            // Tip 1.0.126: paint coalesce-visible chrome BEFORE heal. Heal does GetEntities and
+            // can outlast tester WaitBusyClear's first 9s idle window — 1.0.125 DOWNLOAD stayed
+            // "No local changes" (sawSyncing=False) while Sync had not yet painted Syncing….
+            // Win RequestFullSync is busy while scheduling; "Full sync queued…" is the coalesce
+            // banner (also used when lane held). Do not clobber Force/Syncing owners.
+            if (!ForceStatusGuard.ownsStatus(
+                    _state.value.forceRunning,
+                    SyncFlight.forcePreferred.get(),
+                    syncing = _state.value.syncing
+                )
+            ) {
+                _state.update { it.copy(status = "Full sync queued…") }
+            }
             // Win: heal before exclusive/coalesce so remap persists even when Sync defers to Force.
             runCatching { healDuplicateSameNamedMappings() }
             if (SyncFlight.forcePreferred.get() || _state.value.forceRunning) {
-                // deferred already claimed — do not overwrite "Force download…" / lock wait.
+                // deferred already claimed — Force banner stays; queued text already set if idle.
                 return@launch
             }
             val mappings = mappingStore.load()
@@ -3648,19 +3661,29 @@ class MainViewModel @Inject constructor(
                         _state.update { it.copy(status = "Full sync queued…") }
                     }
                     // Coalesce return — Win holder DrainDeferred settles. If the holder unlocks
-                    // without handoff (soft-cap TOCTOU / SyncWorker), reclaim shortly without
-                    // waitForLane spin so DOWNLOAD Sync taps are not stuck on idle chrome.
+                    // without handoff (soft-cap TOCTOU / SyncWorker), reclaim at staggered
+                    // deadlines without waitForLane spin (1.0.125 DOWNLOAD idle after upload).
                     viewModelScope.launch {
-                        delay(SYNC_ORPHAN_RECLAIM_MS)
-                        if (SyncDeferredDrain.shouldReclaimOrphanedDeferred(
-                                deferredFull = SyncFlight.deferredFull.get(),
-                                forcePreferred = SyncFlight.forcePreferred.get(),
-                                laneHeld = SyncFlight.mutex.isLocked ||
-                                    _state.value.syncing ||
-                                    _state.value.forceRunning
-                            )
-                        ) {
-                            requestFullSync()
+                        var elapsed = 0L
+                        for (target in SYNC_ORPHAN_RECLAIM_DEADLINES_MS) {
+                            delay(target - elapsed)
+                            elapsed = target
+                            if (SyncDeferredDrain.shouldReclaimOrphanedDeferred(
+                                    deferredFull = SyncFlight.deferredFull.get(),
+                                    forcePreferred = SyncFlight.forcePreferred.get(),
+                                    laneHeld = SyncFlight.mutex.isLocked ||
+                                        _state.value.syncing ||
+                                        _state.value.forceRunning
+                                )
+                            ) {
+                                requestFullSync()
+                                return@launch
+                            }
+                            if (!SyncFlight.deferredFull.get() ||
+                                SyncFlight.forcePreferred.get()
+                            ) {
+                                return@launch
+                            }
                         }
                     }
                     return@launch
@@ -4057,6 +4080,8 @@ class MainViewModel @Inject constructor(
                     }
                 } else {
                     // Own lane — do not call forceOwnsStatus(syncing=true) or completion is skipped.
+                    // Sync may claim deferredFull after this check; finally handoffDeferred +
+                    // staggered orphan reclaim cover that TOCTOU (1.0.125 DOWNLOAD idle).
                     _state.update {
                         it.copy(
                             status = if (applied > 0) {
@@ -4119,11 +4144,13 @@ class MainViewModel @Inject constructor(
         const val SYNC_CANCEL_RECLAIM_MS = 50L
 
         /**
-         * After coalesce-return ("Full sync queued…"), brief pause then orphan reclaim if
-         * deferredFull remains with lane free (1.0.123 DOWNLOAD idle). Shorter than AutoPush
-         * interval; not waitForLane mutex spin.
+         * After coalesce-return ("Full sync queued…"), staggered orphan reclaim if
+         * deferredFull remains with lane free (1.0.123–125 DOWNLOAD idle). Shorter than
+         * AutoPush interval; not waitForLane mutex spin. Multiple deadlines cover SyncWorker
+         * soft-cap unlock that misses the first 250ms window.
          */
         const val SYNC_ORPHAN_RECLAIM_MS = 250L
+        val SYNC_ORPHAN_RECLAIM_DEADLINES_MS = longArrayOf(250L, 1_000L, 3_000L)
     }
 
     private suspend fun notifyOtherDevices() {

@@ -160,10 +160,10 @@ class SyncEngineTest {
     }
 
     /**
-     * Tip 1.0.125: first map-root GetEntities can miss a just-added Api plant (AddEntity→list
-     * lag). Coalesce-only Sync (post-1.0.121) starts Walk immediately — waitForLane's delay
+     * Tip 1.0.125/126: first map-root GetEntities can miss a just-added Api plant
+     * (AddEntity→list lag). Coalesce-only Sync starts Walk immediately — waitForLane's delay
      * had masked this. Map-root IncludeValues re-list before deep BFS must land the plant
-     * (1.0.124 DOWNLOAD sticky Syncing / SAF miss on c01a45a2).
+     * (1.0.124 sticky Syncing / 1.0.125 idle+SAF miss on c01a45a2).
      */
     @Test
     fun reconcile_mapRootRelist_catchesApiOnlyMissedOnFirstListing() = runTest {
@@ -201,6 +201,53 @@ class SyncEngineTest {
             SyncEngine.mapRootRelistLagMs = prevLag
         }
         assertThat(rootLists).isAtLeast(3)
+        assertThat(fs.exists(root, "at-sync-threeway-download-test")).isTrue()
+        assertThat(
+            store.getAll("m1").any {
+                it.remoteId == "dl-f" &&
+                    PathUtil.normalize(it.relativePath) == "at-sync-threeway-download-test"
+            }
+        ).isTrue()
+    }
+
+    /**
+     * Tip 1.0.126: first map-root re-list can still miss AddEntity→list lag (1.0.125 residual).
+     * Second re-list after another lag must land the plant before deep BFS.
+     */
+    @Test
+    fun reconcile_mapRootRelist_secondAttempt_catchesSlowerApiOnlyLag() = runTest {
+        val (store, fs, innerRemote) = harness()
+        val keepBytes = "keep-body".toByteArray()
+        innerRemote.seedFile("keep-f", "cloud-root", "keep.txt", keepBytes)
+        fs.writeFile(root, "keep.txt", keepBytes)
+        SyncEngine(store, fs, innerRemote).reconcileAll(listOf(mapping))
+
+        innerRemote.seedFolder("dl-f", "cloud-root", "at-sync-threeway-download-test")
+        for (i in 0 until 10) {
+            innerRemote.seedFolder("wide-$i", "cloud-root", "wide-branch-$i")
+        }
+        var rootLists = 0
+        val lagRemote = object : ru.protolink.communicator.sync.ports.RemoteCloud by innerRemote {
+            override suspend fun listChildrenPaged(
+                parentId: String,
+                includeValues: Boolean
+            ): List<ru.protolink.communicator.sync.model.RemoteEntry> {
+                val all = innerRemote.listChildrenPaged(parentId, includeValues)
+                if (parentId != "cloud-root") return all
+                rootLists++
+                // Warm structure + IncludeValues + first map-root re-list miss; 2nd re-list hits.
+                if (rootLists <= 3) return all.filter { it.id != "dl-f" }
+                return all
+            }
+        }
+        val prevLag = SyncEngine.mapRootRelistLagMs
+        SyncEngine.mapRootRelistLagMs = 10L
+        try {
+            SyncEngine(store, fs, lagRemote).reconcileAll(listOf(mapping))
+        } finally {
+            SyncEngine.mapRootRelistLagMs = prevLag
+        }
+        assertThat(rootLists).isAtLeast(4)
         assertThat(fs.exists(root, "at-sync-threeway-download-test")).isTrue()
         assertThat(
             store.getAll("m1").any {

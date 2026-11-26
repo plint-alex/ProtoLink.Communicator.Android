@@ -37,13 +37,17 @@ class SyncEngine(
         var remoteDownloadBudgetMs: Long = 45_000L
 
         /**
-         * Map-root GetEntities lag after Api AddEntity (1.0.124 DOWNLOAD sticky Syncing /
-         * SAF miss on c01a45a2). Coalesce-only Sync starts Walk immediately; tip 1.0.121
+         * Map-root GetEntities lag after Api AddEntity (1.0.124–125 DOWNLOAD SAF miss /
+         * idle chrome on c01a45a2). Coalesce-only Sync starts Walk immediately; tip 1.0.121
          * waitForLane accidentally delayed listing enough for the plant to appear. Win
          * RequestFullSync scheduling has similar natural delay — not an Android-only Sync
-         * path. Tests may set 0. Relist runs once before deep BFS.
+         * path. Tip 1.0.125 used 750ms once (still miss). Tip 1.0.126: ~2s lag + optional
+         * second re-list when the first adds no new root ids. Tests may set 0.
          */
-        var mapRootRelistLagMs: Long = 750L
+        var mapRootRelistLagMs: Long = 2_000L
+
+        /** Max map-root IncludeValues re-lists before deep BFS (AddEntity→list lag). */
+        const val MAP_ROOT_RELIST_MAX_ATTEMPTS = 2
 
         /**
          * Parallel GetEntities for folder walk. Align with Windows
@@ -1217,38 +1221,46 @@ class SyncEngine(
                 mapping, loc, metaByRemoteId, gate, progressiveDirty
             )
         }
-        // Map-root only: Api AddEntity→GetEntities lag after coalesce-only Sync (1.0.124
-        // DOWNLOAD_API_ONLY_NOT_ON_SAF — chrome Syncing without SAF; tip 1.0.121 waitForLane
-        // delay masked the race). Re-list IncludeValues once before deep BFS so the plant
-        // lands early; deep Walk may still sticky-Sync (soft NFR) on ~1k folders.
+        // Map-root only: Api AddEntity→GetEntities lag after coalesce-only Sync (1.0.124–
+        // 1.0.125 DOWNLOAD_API_ONLY_NOT_ON_SAF). Re-list IncludeValues before deep BFS so
+        // the plant lands early (Win RequestFullSync scheduling delay class — not a second
+        // Sync path). Tip 1.0.125 single 750ms re-list still missed; retry once when the
+        // first re-list adds no new root ids. Soft NFR sticky Syncing on ~1k folders OK.
         if (relativeParent.isEmpty() && progressiveMaterialize) {
-            val lag = mapRootRelistLagMs
-            if (lag > 0L) delay(lag)
-            coroutineContext.ensureActive()
-            val relist = throttle.withPermit {
-                remote.listChildrenPaged(folderId, includeValues = true)
-            }
-            val lateProgressive = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
-            absorbWalkChildren(
-                children = relist,
-                useMetaNames = false,
-                folderId = folderId,
-                mappingId = mapping.id,
-                relativeParent = relativeParent,
-                out = out,
-                visitedIds = visitedIds,
-                seenPaths = seenPaths,
-                metaByRemoteId = metaByRemoteId,
-                progressiveMaterialize = true,
-                progressive = lateProgressive,
-                subfolders = subfolders,
-                gate = gate
-            )
-            for (loc in lateProgressive) {
+            var attempt = 0
+            while (attempt < MAP_ROOT_RELIST_MAX_ATTEMPTS) {
+                val lag = mapRootRelistLagMs
+                if (lag > 0L) delay(lag)
                 coroutineContext.ensureActive()
-                materializeWalkDiscoveredAdded(
-                    mapping, loc, metaByRemoteId, gate, progressiveDirty
+                val relist = throttle.withPermit {
+                    remote.listChildrenPaged(folderId, includeValues = true)
+                }
+                val lateProgressive = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
+                absorbWalkChildren(
+                    children = relist,
+                    useMetaNames = false,
+                    folderId = folderId,
+                    mappingId = mapping.id,
+                    relativeParent = relativeParent,
+                    out = out,
+                    visitedIds = visitedIds,
+                    seenPaths = seenPaths,
+                    metaByRemoteId = metaByRemoteId,
+                    progressiveMaterialize = true,
+                    progressive = lateProgressive,
+                    subfolders = subfolders,
+                    gate = gate
                 )
+                for (loc in lateProgressive) {
+                    coroutineContext.ensureActive()
+                    materializeWalkDiscoveredAdded(
+                        mapping, loc, metaByRemoteId, gate, progressiveDirty
+                    )
+                }
+                attempt++
+                // Plant appeared → stop. Empty late list → one more lag+re-list for slower
+                // AddEntity→GetEntities visibility (1.0.125 residual).
+                if (lateProgressive.isNotEmpty()) break
             }
         }
         if (subfolders.isEmpty()) return

@@ -19,6 +19,10 @@ package ru.protolink.communicator.syncadapt
  * interval AutoPush skips forever while chrome stays "No local changes". Win never parks
  * `_deferredFullSync` without a holder. [shouldReclaimOrphanedDeferred] re-enters full Sync
  * when the claim is pending and the lane is free (no waitForLane spin — keep upload PASS).
+ *
+ * Tip 1.0.126: paint "Full sync queued…" before heal on Sync tap + staggered orphan reclaim
+ * deadlines (250ms/1s/3s) so WaitBusyClear does not treat heal latency as idle; map-root
+ * re-list lag stays in SyncEngine (Win RequestFullSync scheduling class).
  */
 object SyncDeferredDrain {
     /**

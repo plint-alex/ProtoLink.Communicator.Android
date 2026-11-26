@@ -9,6 +9,7 @@ import org.junit.Test
  * Tip 1.0.122: Sync stays Win coalesce-only (no waitForLane).
  * Tip 1.0.123: soft-cap handoff so deferredFull is not orphaned after unlock.
  * Tip 1.0.124: reclaim when deferredFull sits with lane free (1.0.123 DOWNLOAD idle orphan).
+ * Tip 1.0.126: staggered reclaim deadlines + Full sync queued before heal (1.0.125 idle).
  */
 class SyncDeferredDrainTest {
     @Test
