@@ -199,6 +199,73 @@ class SyncEngineTest {
         assertThat(remote.get("dl-f")).isNotNull()
     }
 
+    /**
+     * Tip 1.0.120: phantom progressive mkdir must not upsert meta — ApplyRemote retries
+     * (1.0.119 DOWNLOAD lateSAF=NO when meta claimed land without SAF).
+     */
+    @Test
+    fun reconcile_progressiveWalk_phantomMkdir_fallsThroughToApplyRemote() = runTest {
+        val (store, innerFs, remote) = harness()
+        val keepBytes = "keep-body".toByteArray()
+        remote.seedFile("keep-f", "cloud-root", "keep.txt", keepBytes)
+        innerFs.writeFile(root, "keep.txt", keepBytes)
+        SyncEngine(store, innerFs, remote).reconcileAll(listOf(mapping))
+
+        remote.seedFolder("dl-f", "cloud-root", "at-sync-threeway-download-test")
+        var phantomAttempts = 0
+        val fs = object : ru.protolink.communicator.sync.ports.LocalFileSystem by innerFs {
+            override fun createDirectory(rootPath: String, relativePath: String) {
+                val n = PathUtil.normalize(relativePath)
+                if (n == "at-sync-threeway-download-test" && phantomAttempts == 0) {
+                    phantomAttempts++
+                    // Progressive Walk: pretend mkdir succeeded but path missing.
+                    return
+                }
+                innerFs.createDirectory(rootPath, relativePath)
+            }
+        }
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+        assertThat(phantomAttempts).isEqualTo(1)
+        assertThat(fs.exists(root, "at-sync-threeway-download-test")).isTrue()
+        assertThat(
+            store.getAll("m1").any {
+                it.remoteId == "dl-f" &&
+                    PathUtil.normalize(it.relativePath) == "at-sync-threeway-download-test"
+            }
+        ).isTrue()
+    }
+
+    /**
+     * Tip 1.0.120: Sync-first local delete must still DeleteEntity after progressive Walk
+     * (1.0.119 soft full budget aborted before ApplyLocal Removed).
+     */
+    @Test
+    fun reconcile_progressiveWalk_localRemoveStillDeletesRemote() = runTest {
+        val (store, fs, remote) = harness()
+        val keepBytes = "keep-body".toByteArray()
+        remote.seedFile("keep-f", "cloud-root", "keep.txt", keepBytes)
+        fs.writeFile(root, "keep.txt", keepBytes)
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        for (i in 0 until 20) {
+            remote.seedFolder("wide-$i", "cloud-root", "wide-branch-$i")
+        }
+        fs.createDirectory(root, "at-sync-threeway-delete-test")
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+        val deleteId = store.getAll("m1").first {
+            PathUtil.normalize(it.relativePath) == "at-sync-threeway-delete-test"
+        }.remoteId
+
+        fs.delete(root, "at-sync-threeway-delete-test", true)
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+        assertThat(remote.get(deleteId)).isNull()
+        assertThat(
+            store.getAll("m1").none {
+                PathUtil.normalize(it.relativePath) == "at-sync-threeway-delete-test"
+            }
+        ).isTrue()
+    }
+
     @Test
     fun localRemove_deletesRemote() = runTest {
         val (store, fs, remote) = harness()

@@ -1054,6 +1054,17 @@ class SyncEngine(
         try {
             val upserted = if (located.entry.isFolder) {
                 fs.createDirectory(mapping.localRootPath, path)
+                // Do not upsert meta on a phantom mkdir — ApplyRemote Added must retry
+                // (1.0.119 DOWNLOAD lateSAF=NO when meta claimed land without SAF/File).
+                if (!fs.exists(mapping.localRootPath, path)) {
+                    SyncRemoteDownload.logMaterializeFailed(
+                        "WalkRemote.ProgressiveAdded",
+                        path,
+                        located.entry.id,
+                        "createDirectory did not materialize path"
+                    )
+                    return
+                }
                 SyncItemMeta(
                     mappingId = mapping.id,
                     remoteId = located.entry.id,
@@ -1072,6 +1083,15 @@ class SyncEngine(
                     return
                 }
                 fs.writeFile(mapping.localRootPath, path, bytes)
+                if (!fs.exists(mapping.localRootPath, path)) {
+                    SyncRemoteDownload.logMaterializeFailed(
+                        "WalkRemote.ProgressiveAdded",
+                        path,
+                        located.entry.id,
+                        "writeFile did not materialize path"
+                    )
+                    return
+                }
                 SyncItemMeta(
                     mappingId = mapping.id,
                     remoteId = located.entry.id,
