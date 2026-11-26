@@ -121,11 +121,14 @@ class SyncEngine(
             }
         }
 
-        // Build remote trees once
+        // Build remote trees once. Progressive Walk materializes Api-only kids as soon as a
+        // folder listing discovers them (Force wave parity) so phone GE×~1k folders cannot
+        // starve ApplyRemote past the Sync wait (1.0.118 DOWNLOAD_API_ONLY_NOT_ON_SAF late SAF).
         val remoteLocated = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
+        val progressiveDirty = mutableSetOf<String>()
         for (mapping in mappings) {
             coroutineContext.ensureActive()
-            walkRemote(mapping.cloudFolderId, mapping.id, "", remoteLocated)
+            walkRemote(mapping, "", remoteLocated, progressiveDirty = progressiveDirty)
         }
 
         val byId = mappings.associateBy { it.id }
@@ -135,7 +138,15 @@ class SyncEngine(
         val enrichedRemote = remoteLocated
         for (mapping in mappings) {
             coroutineContext.ensureActive()
-            val dirty = mutableSetOf<String>()
+            // Seed dirty with Walk-progressive paths so SAF snapshot lag cannot Removed→DeleteEntity
+            // the same-pass download (ApplyRemote Added dirty guard parity).
+            val dirty = progressiveDirty
+                .filter { norm ->
+                    enrichedRemote.any {
+                        it.mappingId == mapping.id && PathUtil.normalize(it.relativePath) == norm
+                    }
+                }
+                .toMutableSet()
             val (writes, reads) = applyComparePhase(mapping, enrichedRemote, dirty)
             localCount += writes
             remoteCount += reads
@@ -380,7 +391,9 @@ class SyncEngine(
      */
     private suspend fun bootstrapFromRemote(mapping: SyncMapping) {
         val located = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
-        walkRemote(mapping.cloudFolderId, mapping.id, "", located)
+        // Cold bootstrap: progressive materialize during Walk would race mkdir+getFile with
+        // the bootstrap body below — inventory only here (includeValues via empty meta).
+        walkRemote(mapping, "", located, progressiveMaterialize = false)
         val enriched = enrichRemoteSizes(located)
         for (loc in enriched.sortedBy { it.relativePath.count { c -> c == '/' } }) {
             coroutineContext.ensureActive()
@@ -988,37 +1001,120 @@ class SyncEngine(
      * When meta is non-empty: structure-only GetEntities when every child id is already known;
      * otherwise one IncludeValues re-list (Win values-light). Cold bootstrap (empty meta) still
      * IncludeValues-lists. Force uses structure-first + Ids name waves (progressive materialize).
+     *
+     * Warm Sync ([progressiveMaterialize]=true): materialize Api-only kids as soon as listed,
+     * before sibling/deep BFS awaits — phone Walk latency otherwise leaves ApplyRemote after
+     * the Sync chrome wait (1.0.118 DOWNLOAD late SAF / sticky Syncing).
      * [visitedIds]/[seenPaths] stop cycles.
      */
     private suspend fun walkRemote(
-        folderId: String,
-        mappingId: String,
+        mapping: SyncMapping,
         relativeParent: String,
-        out: MutableList<RemoteChangeClassifier.RemoteLocated>
+        out: MutableList<RemoteChangeClassifier.RemoteLocated>,
+        progressiveMaterialize: Boolean = true,
+        progressiveDirty: MutableSet<String>? = null
     ) {
         val visitedIds = mutableSetOf<String>()
         val seenPaths = mutableSetOf<String>()
         val gate = Mutex()
         val throttle = Semaphore(WALK_REMOTE_CONCURRENCY)
-        val metaByRemoteId = store.getAll(mappingId)
+        val metaByRemoteId = store.getAll(mapping.id)
             .groupBy { it.remoteId }
             .mapValues { (_, items) -> items.first() }
+            .toMutableMap()
         walkRemoteParallel(
-            folderId, mappingId, relativeParent, out, visitedIds, seenPaths, gate, throttle,
-            metaByRemoteId
+            mapping,
+            mapping.cloudFolderId,
+            relativeParent,
+            out,
+            visitedIds,
+            seenPaths,
+            gate,
+            throttle,
+            metaByRemoteId,
+            progressiveMaterialize,
+            progressiveDirty
         )
     }
 
+    /**
+     * ApplyRemote Added for one Walk discovery (folder mkdir or file getFile). Soft-fails per
+     * item (NFR-SYNC-1). Updates [metaByRemoteId] so later Walk folders see the id as known.
+     */
+    private suspend fun materializeWalkDiscoveredAdded(
+        mapping: SyncMapping,
+        located: RemoteChangeClassifier.RemoteLocated,
+        metaByRemoteId: MutableMap<String, SyncItemMeta>,
+        gate: Mutex,
+        progressiveDirty: MutableSet<String>?
+    ) {
+        val path = PathUtil.normalize(located.relativePath)
+        if (AgentsRoleQueuePaths.isUnderAgentsTree(path)) return
+        if (metaByRemoteId.containsKey(located.entry.id)) return
+        try {
+            val upserted = if (located.entry.isFolder) {
+                fs.createDirectory(mapping.localRootPath, path)
+                SyncItemMeta(
+                    mappingId = mapping.id,
+                    remoteId = located.entry.id,
+                    parentRemoteId = located.entry.parentId,
+                    relativePath = path,
+                    isFolder = true,
+                    sizeBytes = 0,
+                    remoteUpdateTime = located.entry.updateTime
+                )
+            } else {
+                val bytes = remote.downloadFile(located.entry.id)
+                if (bytes == null) {
+                    SyncRemoteDownload.logFailed(
+                        "WalkRemote.ProgressiveAdded", path, located.entry.id
+                    )
+                    return
+                }
+                fs.writeFile(mapping.localRootPath, path, bytes)
+                SyncItemMeta(
+                    mappingId = mapping.id,
+                    remoteId = located.entry.id,
+                    parentRemoteId = located.entry.parentId,
+                    relativePath = path,
+                    isFolder = false,
+                    sizeBytes = bytes.size.toLong(),
+                    contentHash = if (bytes.isNotEmpty()) {
+                        ContentHashUtil.sha256Hex(bytes)
+                    } else {
+                        ""
+                    },
+                    remoteUpdateTime = located.entry.updateTime
+                )
+            }
+            store.upsert(upserted)
+            gate.withLock {
+                metaByRemoteId[located.entry.id] = upserted
+                progressiveDirty?.add(path)
+            }
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            SyncRemoteDownload.logMaterializeFailed(
+                "WalkRemote.ProgressiveAdded",
+                path,
+                located.entry.id,
+                e.message ?: e.javaClass.simpleName
+            )
+        }
+    }
+
     private suspend fun walkRemoteParallel(
+        mapping: SyncMapping,
         folderId: String,
-        mappingId: String,
         relativeParent: String,
         out: MutableList<RemoteChangeClassifier.RemoteLocated>,
         visitedIds: MutableSet<String>,
         seenPaths: MutableSet<String>,
         gate: Mutex,
         throttle: Semaphore,
-        metaByRemoteId: Map<String, SyncItemMeta>
+        metaByRemoteId: MutableMap<String, SyncItemMeta>,
+        progressiveMaterialize: Boolean,
+        progressiveDirty: MutableSet<String>?
     ) {
         coroutineContext.ensureActive()
         // Cold (empty meta): IncludeValues listing per folder.
@@ -1047,6 +1143,7 @@ class SyncEngine(
             }
         }
         val subfolders = mutableListOf<Pair<String, String>>()
+        val progressive = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
         gate.withLock {
             for (child in children) {
                 if (!visitedIds.add(child.id)) continue
@@ -1064,17 +1161,22 @@ class SyncEngine(
                 // Warm values-light (useMetaNames): structure-only UpdateTime must not drive
                 // ApplyCompare getFile. Trust meta baseline; IncludeValues re-list keeps time.
                 val listingUpdate = if (useMetaNames) null else child.updateTime
-                out.add(
-                    RemoteChangeClassifier.RemoteLocated(
-                        entry = child.copy(
-                            parentId = folderId,
-                            name = name,
-                            updateTime = listingUpdate
-                        ),
-                        mappingId = mappingId,
-                        relativePath = rel
-                    )
+                val located = RemoteChangeClassifier.RemoteLocated(
+                    entry = child.copy(
+                        parentId = folderId,
+                        name = name,
+                        updateTime = listingUpdate
+                    ),
+                    mappingId = mapping.id,
+                    relativePath = rel
                 )
+                out.add(located)
+                if (progressiveMaterialize &&
+                    !metaByRemoteId.containsKey(child.id) &&
+                    !AgentsRoleQueuePaths.isUnderAgentsTree(rel)
+                ) {
+                    progressive.add(located)
+                }
                 if (child.isFolder &&
                     !AgentsRoleQueuePaths.matchesOpenQueueOrAgentsRolesAncestor(rel)
                 ) {
@@ -1083,13 +1185,30 @@ class SyncEngine(
                 }
             }
         }
+        // Materialize unknowns before deep/sibling BFS so map-root Api plants land under SAF
+        // while Walk continues (1.0.118 sticky Syncing / late SAF residual).
+        for (loc in progressive) {
+            coroutineContext.ensureActive()
+            materializeWalkDiscoveredAdded(
+                mapping, loc, metaByRemoteId, gate, progressiveDirty
+            )
+        }
         if (subfolders.isEmpty()) return
         coroutineScope {
             subfolders.map { (id, rel) ->
                 async {
                     walkRemoteParallel(
-                        id, mappingId, rel, out, visitedIds, seenPaths, gate, throttle,
-                        metaByRemoteId
+                        mapping,
+                        id,
+                        rel,
+                        out,
+                        visitedIds,
+                        seenPaths,
+                        gate,
+                        throttle,
+                        metaByRemoteId,
+                        progressiveMaterialize,
+                        progressiveDirty
                     )
                 }
             }.awaitAll()

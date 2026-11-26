@@ -3675,6 +3675,11 @@ class MainViewModel @Inject constructor(
      * Caller must hold [SyncFlight.mutex]. Does not paint Cloud (reload after unlock).
      * Only runs reconcile while deferredFull was set (Win Exchange==1 loop) — never an
      * unconditional first pass (1.0.117 drain always-reconciled once when mis-invoked).
+     *
+     * Soft [SYNC_FULL_BUDGET_MS] per pass (phone/SAF Walk peculiarity toward Win daily-use
+     * LastSync window): progressive Walk already landed Api-only kids; cancel unfinished deep
+     * Walk/Compare so Syncing→Sync complete settles inside the controlled Sync wait
+     * (1.0.118 DOWNLOAD sticky Syncing ≥150s / late SAF). NFR-SYNC-1 soft-fail.
      */
     private suspend fun drainDeferredFullWhileHoldingExclusive(): SyncEngine.Result {
         var last = SyncEngine.Result(localChanges = 0, remoteChanges = 0)
@@ -3697,10 +3702,26 @@ class MainViewModel @Inject constructor(
                         cloudFolderName = it.cloudFolderName
                     )
                 }
-                SyncFlight.runDeferringToForce {
-                    SyncEngine(metadataStore, localFs, remoteCloud).reconcileAll(engineMappings)
+                try {
+                    withTimeout(SYNC_FULL_BUDGET_MS) {
+                        SyncFlight.runDeferringToForce {
+                            SyncEngine(metadataStore, localFs, remoteCloud)
+                                .reconcileAll(engineMappings)
+                        }
+                    }
+                } catch (e: TimeoutCancellationException) {
+                    Log.w(
+                        "ProtoLinkSync",
+                        "full Sync budget (${SYNC_FULL_BUDGET_MS}ms) expired — " +
+                            "Sync complete soft-fail (NFR-SYNC-1); progressive Walk may have landed"
+                    )
+                    null
                 }
-            } ?: break
+            }
+            if (result == null) {
+                // Force yield OR soft budget — stop coalesce; caller paints Sync complete unless Force.
+                break
+            }
             last = result
             passes++
         }
@@ -3952,6 +3973,13 @@ class MainViewModel @Inject constructor(
     private companion object {
         /** Win CloudMappedSyncCoordinator.AutoPushBudget. */
         const val AUTO_PUSH_BUDGET_MS = 60_000L
+
+        /**
+         * Soft budget for one full reconcile pass on phone/SAF (Win LastSync daily-use window
+         * class). Progressive Walk materializes Api-only kids first; cancel deep Walk so chrome
+         * reaches Sync complete inside tester Sync wait (~150s). NFR-SYNC-1 soft-fail.
+         */
+        const val SYNC_FULL_BUDGET_MS = 90_000L
 
         /**
          * Max reconcile passes per exclusive hold (1 + coalesce). Continuous SignalR must not

@@ -159,6 +159,46 @@ class SyncEngineTest {
         ).isTrue()
     }
 
+    /**
+     * Tip 1.0.119: progressive Walk materializes map-root Api-only kids before deep sibling
+     * BFS completes (1.0.118 DOWNLOAD sticky Syncing / late SAF). Wide remote tree must not
+     * starve the download fixture.
+     */
+    @Test
+    fun reconcile_progressiveWalk_materializesRootApiOnlyBesideWideTree() = runTest {
+        val (store, fs, remote) = harness()
+        val keepBytes = "keep-body".toByteArray()
+        remote.seedFile("keep-f", "cloud-root", "keep.txt", keepBytes)
+        fs.writeFile(root, "keep.txt", keepBytes)
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        // Wide sibling tree (phone Walk cost class) + Api-only download at map root.
+        for (i in 0 until 40) {
+            remote.seedFolder("wide-$i", "cloud-root", "wide-branch-$i")
+            remote.seedFolder("wide-$i-child", "wide-$i", "child")
+            remote.seedFile(
+                "wide-$i-idx",
+                "wide-$i-child",
+                "index.html",
+                "wide-$i".toByteArray()
+            )
+        }
+        remote.seedFolder("dl-f", "cloud-root", "at-sync-threeway-download-test")
+
+        SyncEngine(store, fs, remote).reconcileAll(listOf(mapping))
+
+        assertThat(fs.exists(root, "at-sync-threeway-download-test")).isTrue()
+        assertThat(
+            store.getAll("m1").any {
+                it.remoteId == "dl-f" &&
+                    PathUtil.normalize(it.relativePath) == "at-sync-threeway-download-test"
+            }
+        ).isTrue()
+        assertThat(store.getLastSyncUtc("m1")).isNotNull()
+        // Progressive dirty must not DeleteEntity the same-pass download.
+        assertThat(remote.get("dl-f")).isNotNull()
+    }
+
     @Test
     fun localRemove_deletesRemote() = runTest {
         val (store, fs, remote) = harness()
