@@ -4646,20 +4646,22 @@ class MainViewModel @Inject constructor(
         // Win SuspendMappedRootWatchers — AutoPush must not recreate soft-hidden tree from local.
         SyncFlight.suspendCloudMutation()
         try {
+            // Known local subtree (folder tree / sync-meta / listing) — purge after single-root
+            // DeleteEntity; do not N+1 GetEntities+DeleteEntity (Api cascade owns Cloud subtree).
             val deletedIds = linkedSetOf<String>()
             if (isFolder) {
-                CloudFolderDelete.deleteFolderRecursive(
-                    folderId = id,
-                    listChildren = { folderId -> listCloudChildrenForDelete(folderId) },
-                    deleteEntity = { entityId ->
-                        api.deleteEntity(DeleteEntityRequest(entityId))
-                    },
-                    deletedIds = deletedIds
-                )
+                collectKnownLocalSubtreeIds(id, deletedIds)
             } else {
-                api.deleteEntity(DeleteEntityRequest(id))
                 deletedIds.add(id)
             }
+
+            CloudFolderDelete.deleteSingleRoot(
+                rootId = id,
+                deleteEntity = { entityId ->
+                    api.deleteEntity(DeleteEntityRequest(entityId))
+                },
+                deletedIds = deletedIds
+            )
 
             // Soft Ready paints sync-meta when GetEntities empty — purge all cascade ids (Win).
             runCatching { metadataStore.removeByRemoteIds(deletedIds) }
@@ -4718,30 +4720,70 @@ class MainViewModel @Inject constructor(
     }
 
     /**
-     * Full GetEntities pages for E10 leaf-first cascade (defense-in-depth vs Api cascade).
-     * Fail-closed: HTTP/errors throw — caller must not soft-hide parent alone (promote).
-     * Single take=500 left large folders with undeleted children → Soft Ready/Sync resurrect.
+     * Gather folder/file ids under [rootId] from local folder-tree cache, sync-meta, and
+     * current listing — no GetEntities. Used to purge after single-root DeleteEntity.
      */
-    private suspend fun listCloudChildrenForDelete(folderId: String): List<CloudFolderDelete.ChildRef> {
-        val take = 200
-        val all = ArrayList<CloudFolderDelete.ChildRef>()
-        var skip = 0
-        while (true) {
-            val page = api.getEntities(
-                GetEntitiesRequest(
-                    parentIds = listOf(folderId),
-                    includeValues = false,
-                    skip = skip,
-                    take = take
+    private fun collectKnownLocalSubtreeIds(rootId: String, into: MutableCollection<String>) {
+        val metaByParent = linkedMapOf<String, MutableList<CloudFolderDelete.ChildRef>>()
+        val allMeta = runCatching {
+            // All mappings: Soft Ready may hold children under any map that covers this tree.
+            mappingStore.load().flatMap { m ->
+                val mid = m.cloudFolderId.replace("-", "")
+                runCatching { metadataStore.getAll(mid) }.getOrDefault(emptyList())
+            }
+        }.getOrDefault(emptyList())
+        for (row in allMeta) {
+            if (row.remoteId.isBlank() || row.parentRemoteId.isBlank()) continue
+            val parentKey = CloudFolderDelete.normalizeRemoteId(row.parentRemoteId)
+            metaByParent.getOrPut(parentKey) { mutableListOf() }.add(
+                CloudFolderDelete.ChildRef(
+                    id = row.remoteId,
+                    code = if (row.isFolder) CloudCodes.CLOUD_FOLDER else CloudCodes.CLOUD_FILE,
+                    typeEntityId = if (row.isFolder) {
+                        CloudEntityClassify.TYPE_CLOUD_FOLDER_ID
+                    } else {
+                        CloudEntityClassify.TYPE_CLOUD_FILE_ID
+                    }
                 )
             )
-            for (e in page) {
-                all.add(CloudFolderDelete.ChildRef(e.id, e.code, e.typeEntityId))
-            }
-            if (page.size < take) break
-            skip += take
         }
-        return all
+
+        CloudFolderDelete.collectKnownSubtreeIds(
+            rootId = rootId,
+            knownChildren = { parentId ->
+                val list = ArrayList<CloudFolderDelete.ChildRef>()
+                folderTreeChildren.entries
+                    .firstOrNull { it.key.equals(parentId, ignoreCase = true) }
+                    ?.value
+                    ?.forEach { n ->
+                        list.add(
+                            CloudFolderDelete.ChildRef(
+                                id = n.id,
+                                code = CloudCodes.CLOUD_FOLDER,
+                                typeEntityId = CloudEntityClassify.TYPE_CLOUD_FOLDER_ID
+                            )
+                        )
+                    }
+                metaByParent[CloudFolderDelete.normalizeRemoteId(parentId)]?.let { list.addAll(it) }
+                if (currentFolderId.equals(parentId, ignoreCase = true)) {
+                    for (row in _state.value.cloudItems) {
+                        list.add(
+                            CloudFolderDelete.ChildRef(
+                                id = row.id,
+                                code = if (row.isFolder) CloudCodes.CLOUD_FOLDER else CloudCodes.CLOUD_FILE,
+                                typeEntityId = if (row.isFolder) {
+                                    CloudEntityClassify.TYPE_CLOUD_FOLDER_ID
+                                } else {
+                                    CloudEntityClassify.TYPE_CLOUD_FILE_ID
+                                }
+                            )
+                        )
+                    }
+                }
+                list
+            },
+            into = into
+        )
     }
 
     /** Unmap without status toast (mapped-root delete honesty). */

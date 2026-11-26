@@ -6,9 +6,10 @@ import ru.protolink.communicator.data.CloudSyncMappingDto
 import ru.protolink.communicator.sync.ports.LocalFileSystem
 
 /**
- * E10 Cloud folder/file delete — confirm copy, CanWrite gate helpers, recursive DeleteEntity
- * order, and mapped local-mirror cleanup (NFR-SYNC-1 soft-fail). Mirrors Windows
- * CloudViewModel.DeleteAsync / DeleteFolderRecursiveAsync / CloudMappingMirrorPaths.
+ * E10 Cloud folder/file delete — confirm copy, CanWrite gate helpers, single-root
+ * DeleteEntity (Api cascade), local known-subtree collect for Soft Ready purge, and
+ * mapped local-mirror cleanup (NFR-SYNC-1 soft-fail). Recursive deleteFolderRecursive
+ * is offline unit-test only. Mirrors Windows CloudFolderDelete / CloudViewModel.DeleteAsync.
  */
 object CloudFolderDelete {
     data class ChildRef(val id: String, val code: String?, val typeEntityId: String? = null)
@@ -145,10 +146,58 @@ object CloudFolderDelete {
     }
 
     /**
-     * Depth-first: delete CloudFile children, recurse CloudFolder children, then delete [folderId].
-     * Leaf-first defense-in-depth (Api CloudFolder cascade may also soft-hide the subtree).
-     * [deletedIds] collects every successfully deleted remote id (for sync-meta purge / Soft Ready tombstones).
-     * Fail-closed: if [listChildren] throws, aborts without deleting [folderId] (no parent-only soft-hide → promote).
+     * Production delete: one DeleteEntity on [rootId]; Api cascade soft-hides the Cloud subtree.
+     * Adds [rootId] to [deletedIds]. Fail-closed: if delete throws, caller must not pretend gone.
+     */
+    suspend fun deleteSingleRoot(
+        rootId: String,
+        deleteEntity: suspend (String) -> Unit,
+        deletedIds: MutableCollection<String>? = null
+    ) {
+        deleteEntity(rootId)
+        deletedIds?.add(rootId)
+    }
+
+    /**
+     * BFS over *local* known children (folder-tree cache / sync-meta / listing) — no HTTP.
+     * Collects folder + file ids under [rootId] into [into] (includes root). Used after
+     * single-root DeleteEntity to purge Soft Ready / tombstones without re-walking the Api.
+     */
+    fun collectKnownSubtreeIds(
+        rootId: String,
+        knownChildren: (String) -> List<ChildRef>,
+        into: MutableCollection<String>
+    ) {
+        val seen = LinkedHashSet<String>()
+        val queue = ArrayDeque<String>()
+
+        fun remember(id: String) {
+            val key = normalizeRemoteId(id)
+            if (!seen.add(key)) return
+            into.add(id)
+        }
+
+        remember(rootId)
+        queue.add(rootId)
+
+        while (queue.isNotEmpty()) {
+            val parent = queue.removeFirst()
+            val kids = runCatching { knownChildren(parent) }.getOrDefault(emptyList())
+            for (c in kids) {
+                if (c.id.isBlank() || c.id.equals(parent, ignoreCase = true)) continue
+                val key = normalizeRemoteId(c.id)
+                if (!seen.add(key)) continue
+                into.add(c.id)
+                if (CloudEntityClassify.isFolder(c.typeEntityId, c.code)) {
+                    queue.add(c.id)
+                }
+            }
+        }
+    }
+
+    /**
+     * Offline unit-test helper only — leaf-first recursive DeleteEntity.
+     * Do **not** call from UI delete (Api cascade + [deleteSingleRoot] is production; N+1 is too slow).
      */
     suspend fun deleteFolderRecursive(
         folderId: String,

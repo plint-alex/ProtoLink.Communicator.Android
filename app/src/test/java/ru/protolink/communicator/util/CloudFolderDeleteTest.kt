@@ -147,6 +147,37 @@ class CloudFolderDeleteTest {
     }
 
     @Test
+    fun deleteSingleRoot_callsDeleteEntityOnce() = runBlocking {
+        val order = mutableListOf<String>()
+        val deleted = linkedSetOf<String>()
+        CloudFolderDelete.deleteSingleRoot(
+            rootId = "root",
+            deleteEntity = { id -> order.add(id) },
+            deletedIds = deleted
+        )
+        assertThat(order).containsExactly("root")
+        assertThat(deleted).containsExactly("root")
+    }
+
+    @Test
+    fun collectKnownSubtreeIds_walksLocalCacheOnly() {
+        val tree = mapOf(
+            "root" to listOf(
+                CloudFolderDelete.ChildRef("file1", CloudCodes.CLOUD_FILE),
+                CloudFolderDelete.ChildRef("sub", CloudCodes.CLOUD_FOLDER)
+            ),
+            "sub" to listOf(CloudFolderDelete.ChildRef("file2", CloudCodes.CLOUD_FILE))
+        )
+        val into = linkedSetOf<String>()
+        CloudFolderDelete.collectKnownSubtreeIds(
+            rootId = "root",
+            knownChildren = { id -> tree[id].orEmpty() },
+            into = into
+        )
+        assertThat(into).containsExactly("root", "file1", "sub", "file2").inOrder()
+    }
+
+    @Test
     fun deleteFolderRecursive_depthFirst_filesThenFoldersThenSelf() = runBlocking {
         val order = mutableListOf<String>()
         val deleted = linkedSetOf<String>()
