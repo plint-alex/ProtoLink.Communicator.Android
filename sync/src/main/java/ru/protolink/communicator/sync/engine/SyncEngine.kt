@@ -37,6 +37,15 @@ class SyncEngine(
         var remoteDownloadBudgetMs: Long = 45_000L
 
         /**
+         * Map-root GetEntities lag after Api AddEntity (1.0.124 DOWNLOAD sticky Syncing /
+         * SAF miss on c01a45a2). Coalesce-only Sync starts Walk immediately; tip 1.0.121
+         * waitForLane accidentally delayed listing enough for the plant to appear. Win
+         * RequestFullSync scheduling has similar natural delay — not an Android-only Sync
+         * path. Tests may set 0. Relist runs once before deep BFS.
+         */
+        var mapRootRelistLagMs: Long = 750L
+
+        /**
          * Parallel GetEntities for folder walk. Align with Windows
          * GetEntitiesThrottlingHandler.SyncLaneConcurrency (24). Must pair with OkHttp
          * maxRequestsPerHost ≥ this (default 5 capped live Force to ~140–180 GE/min).
@@ -1185,6 +1194,104 @@ class SyncEngine(
         }
         val subfolders = mutableListOf<Pair<String, String>>()
         val progressive = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
+        absorbWalkChildren(
+            children = children,
+            useMetaNames = useMetaNames,
+            folderId = folderId,
+            mappingId = mapping.id,
+            relativeParent = relativeParent,
+            out = out,
+            visitedIds = visitedIds,
+            seenPaths = seenPaths,
+            metaByRemoteId = metaByRemoteId,
+            progressiveMaterialize = progressiveMaterialize,
+            progressive = progressive,
+            subfolders = subfolders,
+            gate = gate
+        )
+        // Materialize unknowns before deep/sibling BFS so map-root Api plants land under SAF
+        // while Walk continues (1.0.118 sticky Syncing / late SAF residual).
+        for (loc in progressive) {
+            coroutineContext.ensureActive()
+            materializeWalkDiscoveredAdded(
+                mapping, loc, metaByRemoteId, gate, progressiveDirty
+            )
+        }
+        // Map-root only: Api AddEntity→GetEntities lag after coalesce-only Sync (1.0.124
+        // DOWNLOAD_API_ONLY_NOT_ON_SAF — chrome Syncing without SAF; tip 1.0.121 waitForLane
+        // delay masked the race). Re-list IncludeValues once before deep BFS so the plant
+        // lands early; deep Walk may still sticky-Sync (soft NFR) on ~1k folders.
+        if (relativeParent.isEmpty() && progressiveMaterialize) {
+            val lag = mapRootRelistLagMs
+            if (lag > 0L) delay(lag)
+            coroutineContext.ensureActive()
+            val relist = throttle.withPermit {
+                remote.listChildrenPaged(folderId, includeValues = true)
+            }
+            val lateProgressive = mutableListOf<RemoteChangeClassifier.RemoteLocated>()
+            absorbWalkChildren(
+                children = relist,
+                useMetaNames = false,
+                folderId = folderId,
+                mappingId = mapping.id,
+                relativeParent = relativeParent,
+                out = out,
+                visitedIds = visitedIds,
+                seenPaths = seenPaths,
+                metaByRemoteId = metaByRemoteId,
+                progressiveMaterialize = true,
+                progressive = lateProgressive,
+                subfolders = subfolders,
+                gate = gate
+            )
+            for (loc in lateProgressive) {
+                coroutineContext.ensureActive()
+                materializeWalkDiscoveredAdded(
+                    mapping, loc, metaByRemoteId, gate, progressiveDirty
+                )
+            }
+        }
+        if (subfolders.isEmpty()) return
+        coroutineScope {
+            subfolders.map { (id, rel) ->
+                async {
+                    walkRemoteParallel(
+                        mapping,
+                        id,
+                        rel,
+                        out,
+                        visitedIds,
+                        seenPaths,
+                        gate,
+                        throttle,
+                        metaByRemoteId,
+                        progressiveMaterialize,
+                        progressiveDirty
+                    )
+                }
+            }.awaitAll()
+        }
+    }
+
+    /**
+     * Fold one GetEntities page into Walk [out] / progressive / BFS [subfolders].
+     * Skips already-visited ids (map-root re-list safe).
+     */
+    private suspend fun absorbWalkChildren(
+        children: List<RemoteEntry>,
+        useMetaNames: Boolean,
+        folderId: String,
+        mappingId: String,
+        relativeParent: String,
+        out: MutableList<RemoteChangeClassifier.RemoteLocated>,
+        visitedIds: MutableSet<String>,
+        seenPaths: MutableSet<String>,
+        metaByRemoteId: MutableMap<String, SyncItemMeta>,
+        progressiveMaterialize: Boolean,
+        progressive: MutableList<RemoteChangeClassifier.RemoteLocated>,
+        subfolders: MutableList<Pair<String, String>>,
+        gate: Mutex
+    ) {
         gate.withLock {
             for (child in children) {
                 if (!visitedIds.add(child.id)) continue
@@ -1208,7 +1315,7 @@ class SyncEngine(
                         name = name,
                         updateTime = listingUpdate
                     ),
-                    mappingId = mapping.id,
+                    mappingId = mappingId,
                     relativePath = rel
                 )
                 out.add(located)
@@ -1225,34 +1332,6 @@ class SyncEngine(
                     subfolders.add(child.id to rel)
                 }
             }
-        }
-        // Materialize unknowns before deep/sibling BFS so map-root Api plants land under SAF
-        // while Walk continues (1.0.118 sticky Syncing / late SAF residual).
-        for (loc in progressive) {
-            coroutineContext.ensureActive()
-            materializeWalkDiscoveredAdded(
-                mapping, loc, metaByRemoteId, gate, progressiveDirty
-            )
-        }
-        if (subfolders.isEmpty()) return
-        coroutineScope {
-            subfolders.map { (id, rel) ->
-                async {
-                    walkRemoteParallel(
-                        mapping,
-                        id,
-                        rel,
-                        out,
-                        visitedIds,
-                        seenPaths,
-                        gate,
-                        throttle,
-                        metaByRemoteId,
-                        progressiveMaterialize,
-                        progressiveDirty
-                    )
-                }
-            }.awaitAll()
         }
     }
 
