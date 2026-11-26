@@ -69,6 +69,7 @@ import ru.protolink.communicator.util.MessengerAttachmentRender
 import ru.protolink.communicator.util.MessengerConversationMerge
 import ru.protolink.communicator.util.MessengerConversationScope
 import ru.protolink.communicator.util.MessengerAtomicSend
+import ru.protolink.communicator.util.MessengerChatLoad
 import ru.protolink.communicator.util.MessengerContactsLoad
 import ru.protolink.communicator.util.MessengerImageDownscale
 import ru.protolink.communicator.util.MessengerMediaLimits
@@ -290,6 +291,10 @@ data class UiState(
     /** True while the contacts list is fetching (#messenger-startup-priority). */
     val isContactsLoading: Boolean = false,
     val selectedContact: ContactItem? = null,
+    /** True while open-chat ConversationUserIds is in flight and thread is empty (#MSG_LIST_BLANK). */
+    val isChatLoading: Boolean = false,
+    /** Soft fail chrome when cold open settles empty (never silent blank). */
+    val chatLoadError: String? = null,
     val messages: List<MessageItem> = emptyList(),
     val notesTreeRows: List<NoteTreeRow> = emptyList(),
     val notesExpandedIds: Set<String> = emptySet(),
@@ -420,6 +425,9 @@ class MainViewModel @Inject constructor(
 
     /** Messenger contacts load generation — supersede slower older fetches (#messenger-startup-priority). */
     private val contactsLoadGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** Open-chat select generation — leave Loading budget from select, not from deferred GE start. */
+    private val chatSelectGeneration = java.util.concurrent.atomic.AtomicInteger(0)
 
     /**
      * Session tombstones after Cloud delete — Soft Ready / empty-API paint must not resurrect them.
@@ -791,7 +799,17 @@ class MainViewModel @Inject constructor(
         auth.logout()
         ru.protolink.communicator.util.MessengerThumbMemoryCache.clear()
         ru.protolink.communicator.util.MessengerUnfurlCache.clear()
-        _state.update { it.copy(authenticated = false, login = "", contacts = emptyList(), messages = emptyList(), selectedContact = null) }
+        _state.update {
+            it.copy(
+                authenticated = false,
+                login = "",
+                contacts = emptyList(),
+                messages = emptyList(),
+                selectedContact = null,
+                isChatLoading = false,
+                chatLoadError = null
+            )
+        }
     }
 
     /** Settings → Account Change password (Bearer POST changePassword). */
@@ -5080,8 +5098,9 @@ class MainViewModel @Inject constructor(
                     val lookup = runCatching { api.getUserById(c.userId) }
                     val u = lookup.getOrNull()
                     val lookupSucceeded = lookup.isSuccess && u != null
-                    val display = u?.name?.takeIf { it.isNotBlank() }
-                        ?: u?.login?.takeIf { it.isNotBlank() }
+                    // Prefer lasting name/login email — never replace bag email with GUID-shaped name.
+                    val display = ShareAddPeople.pickResolvedDisplayName(u?.name, u?.login)
+                        ?: c.displayName.takeIf { !ShareAddPeople.isGuidText(it) }
                     val connectivity = lookup.exceptionOrNull()?.let {
                         ApiConnectivity.isExpectedConnectivityFailure(it)
                     } == true
@@ -5163,8 +5182,37 @@ class MainViewModel @Inject constructor(
 
     fun selectContact(c: ContactItem) {
         val me = auth.current()?.userId
-        _state.update { it.copy(selectedContact = c, messages = emptyList()) }
+        val gen = chatSelectGeneration.incrementAndGet()
+        _state.update {
+            it.copy(
+                selectedContact = c,
+                messages = emptyList(),
+                isChatLoading = false,
+                chatLoadError = null
+            )
+        }
         if (me != null) tryPaintMessagesFromDisk(me, c.userId)
+        val hasCached = _state.value.messages.isNotEmpty()
+        val showLoading = MessengerChatLoad.shouldShowLoadingOnSelect(
+            hasSelectedContact = true,
+            hasCachedThread = hasCached
+        )
+        if (showLoading) {
+            _state.update { it.copy(isChatLoading = true, chatLoadError = null) }
+            viewModelScope.launch {
+                delay(MessengerChatLoad.InteractiveHttpTimeoutMs)
+                if (gen != chatSelectGeneration.get()) return@launch
+                val cur = _state.value
+                if (cur.selectedContact?.userId.equals(c.userId, true) != true) return@launch
+                if (!cur.isChatLoading) return@launch
+                _state.update { s ->
+                    s.copy(
+                        isChatLoading = false,
+                        chatLoadError = if (s.messages.isEmpty()) MessengerChatLoad.LoadFailedSoft else null
+                    )
+                }
+            }
+        }
         loadMessages(c)
         startChatPoll()
     }
@@ -5218,7 +5266,15 @@ class MainViewModel @Inject constructor(
         chatPollJob = null
         loadMessagesQueuedContactId = null
         loadMessagesJob?.cancel()
-        _state.update { it.copy(selectedContact = null, messages = emptyList()) }
+        chatSelectGeneration.incrementAndGet()
+        _state.update {
+            it.copy(
+                selectedContact = null,
+                messages = emptyList(),
+                isChatLoading = false,
+                chatLoadError = null
+            )
+        }
     }
 
     private fun startChatPoll() {
@@ -5255,6 +5311,9 @@ class MainViewModel @Inject constructor(
                     // Sick/cold: paint last-good disk page before online prefer (always refresh after).
                     if (_state.value.messages.isEmpty()) {
                         tryPaintMessagesFromDisk(me, targetContactId)
+                        if (_state.value.messages.isNotEmpty()) {
+                            _state.update { it.copy(isChatLoading = false, chatLoadError = null) }
+                        }
                     }
 
                     val all = api.getEntities(
@@ -5339,6 +5398,7 @@ class MainViewModel @Inject constructor(
                                 a.pendingLocalAttachments == b.pendingLocalAttachments
                         }
                     ) {
+                        _state.update { it.copy(isChatLoading = false, chatLoadError = null) }
                         markOpenChatRead(targetContactId, merged)
                     } else {
                         _state.update { cur ->
@@ -5349,13 +5409,20 @@ class MainViewModel @Inject constructor(
                                 proposed = proposed,
                                 syncing = cur.syncing
                             ) ?: cur.status
-                            cur.copy(messages = merged, status = status)
+                            cur.copy(
+                                messages = merged,
+                                status = status,
+                                isChatLoading = false,
+                                chatLoadError = null
+                            )
                         }
                         markOpenChatRead(targetContactId, merged)
                     }
                     persistMessagesDiskAsap(me, targetContactId, msgs)
                 } catch (ex: Exception) {
                     if (ex is kotlinx.coroutines.CancellationException) throw ex
+                    // Always drop Loading on fault so cold open cannot stick blank forever
+                    // (MessengerChatLoad.shouldClearLoadingOnFault).
                     if (ApiConnectivity.isExpectedConnectivityFailure(ex) &&
                         PreferOnlineUiCache.shouldKeepCacheOnSoftFail(true, _state.value.messages.isNotEmpty())
                     ) {
@@ -5368,10 +5435,18 @@ class MainViewModel @Inject constructor(
                                 proposed = proposed,
                                 syncing = cur.syncing
                             ) ?: cur.status
-                            cur.copy(status = status)
+                            cur.copy(status = status, isChatLoading = false)
                         }
                     } else if (_state.value.messages.isEmpty()) {
-                        showError("Load messages failed", httpDetail(ex), ex)
+                        _state.update {
+                            it.copy(
+                                isChatLoading = false,
+                                chatLoadError = MessengerChatLoad.LoadFailedSoft
+                            )
+                        }
+                        if (!ApiConnectivity.isExpectedConnectivityFailure(ex)) {
+                            showError("Load messages failed", httpDetail(ex), ex)
+                        }
                     } else if (ApiConnectivity.isExpectedConnectivityFailure(ex)) {
                         _state.update { cur ->
                             val proposed = ShareSheetStrings.offlineBanner(uiLang())
@@ -5381,9 +5456,10 @@ class MainViewModel @Inject constructor(
                                 proposed = proposed,
                                 syncing = cur.syncing
                             ) ?: cur.status
-                            cur.copy(status = status)
+                            cur.copy(status = status, isChatLoading = false)
                         }
                     } else {
+                        _state.update { it.copy(isChatLoading = false) }
                         showError("Load messages failed", httpDetail(ex), ex)
                     }
                 }

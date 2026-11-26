@@ -2098,41 +2098,109 @@ private fun MessengerChatPane(
                 Text("Select a contact to start messaging", color = Color(0xFF667781))
             }
         } else {
+            val showChatLoading = ru.protolink.communicator.util.MessengerChatLoad.shouldShowLoading(
+                state.isChatLoading
+            )
+            val showChatEmpty = ru.protolink.communicator.util.MessengerChatLoad.shouldShowEmpty(
+                state.isChatLoading,
+                state.messages.size
+            )
             Box(Modifier.weight(1f).fillMaxWidth()) {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(vertical = 8.dp, horizontal = 6.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    items(
-                        count = chatRows.size,
-                        key = { index ->
-                            when (val row = chatRows[index]) {
-                                is ChatRow.DateHeader -> "day:${row.label}"
-                                is ChatRow.Bubble -> "msg:${row.message.id}"
+                when {
+                    showChatLoading && state.messages.isEmpty() -> {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                CircularProgressIndicator(color = TgAccent)
+                                Spacer(Modifier.height(12.dp))
+                                Text(
+                                    ru.protolink.communicator.util.MessengerChatLoad.LoadingStatus,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = Color(0xFF667781)
+                                )
                             }
                         }
-                    ) { index ->
-                        when (val row = chatRows[index]) {
-                            is ChatRow.DateHeader -> DateChip(row.label)
-                            is ChatRow.Bubble -> MessageBubble(
-                                m = row.message,
-                                api = api,
-                                publicSiteBaseUrl = publicSiteBaseUrl,
-                                onRetry = { vm.retryFailedSend(row.message.id) },
-                                onCancelFailed = { vm.cancelFailedSend(row.message.id) }
+                    }
+                    showChatEmpty && !state.chatLoadError.isNullOrBlank() -> {
+                        val err = state.chatLoadError.orEmpty()
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text(
+                                err,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Color(0xFF667781),
+                                modifier = Modifier.padding(24.dp)
                             )
                         }
                     }
-                }
-                if (stickyDate.isNotBlank() && listState.isScrollInProgress) {
-                    DateChip(
-                        stickyDate,
-                        modifier = Modifier
-                            .align(Alignment.TopCenter)
-                            .padding(top = 4.dp)
-                    )
+                    showChatEmpty -> {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text(
+                                ru.protolink.communicator.util.MessengerChatLoad.EmptyHint,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Color(0xFF667781),
+                                modifier = Modifier.padding(24.dp)
+                            )
+                        }
+                    }
+                    else -> {
+                        LazyColumn(
+                            state = listState,
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(vertical = 8.dp, horizontal = 6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            if (showChatLoading) {
+                                item(key = "__chat_loading") {
+                                    Row(
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.Center
+                                    ) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(18.dp),
+                                            strokeWidth = 2.dp,
+                                            color = TgAccent
+                                        )
+                                        Spacer(Modifier.width(10.dp))
+                                        Text(
+                                            ru.protolink.communicator.util.MessengerChatLoad.LoadingStatus,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = Color(0xFF667781)
+                                        )
+                                    }
+                                }
+                            }
+                            items(
+                                count = chatRows.size,
+                                key = { index ->
+                                    when (val row = chatRows[index]) {
+                                        is ChatRow.DateHeader -> "day:${row.label}"
+                                        is ChatRow.Bubble -> "msg:${row.message.id}"
+                                    }
+                                }
+                            ) { index ->
+                                when (val row = chatRows[index]) {
+                                    is ChatRow.DateHeader -> DateChip(row.label)
+                                    is ChatRow.Bubble -> MessageBubble(
+                                        m = row.message,
+                                        api = api,
+                                        publicSiteBaseUrl = publicSiteBaseUrl,
+                                        onRetry = { vm.retryFailedSend(row.message.id) },
+                                        onCancelFailed = { vm.cancelFailedSend(row.message.id) }
+                                    )
+                                }
+                            }
+                        }
+                        if (stickyDate.isNotBlank() && listState.isScrollInProgress) {
+                            DateChip(
+                                stickyDate,
+                                modifier = Modifier
+                                    .align(Alignment.TopCenter)
+                                    .padding(top = 4.dp)
+                            )
+                        }
+                    }
                 }
             }
 
