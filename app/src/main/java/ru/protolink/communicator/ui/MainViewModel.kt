@@ -267,7 +267,11 @@ data class PendingDeleteCloud(
     /** E12: show me-only / for-all when multi-principal share root. */
     val shared: Boolean = false,
     val canWriteForAll: Boolean = true,
-    val isSwmShareRoot: Boolean = false
+    val isSwmShareRoot: Boolean = false,
+    /** Stamped at resolve — PreferDetach must not race SBM load (AT-SFD-4). */
+    val knownOutbound: Boolean = false,
+    /** Crumb/virtual SWM only — not SWM-list membership. */
+    val inSwmScope: Boolean = false
 )
 
 data class UiState(
@@ -4649,19 +4653,21 @@ class MainViewModel @Inject constructor(
         }
         viewModelScope.launch {
             val swmRoot = isSwmShareRootItem(item)
-            val knownOutbound = outboundShareRootIds.contains(item.id.lowercase())
-            var hasGrants = false
-            if (!CloudFolderDelete.isSharedDeleteTarget(swmRoot, knownOutbound, false)) {
-                hasGrants = try {
-                    // AT-SFD-2: owner self-grant alone is not "shared".
-                    CloudFolderDelete.hasExternalGrants(
-                        api.listShareGrants(item.id).map { it.permissionForId },
-                        currentUserId()
-                    )
-                } catch (_: Exception) {
-                    false
-                }
-                if (hasGrants) outboundShareRootIds.add(item.id.lowercase())
+            var knownOutbound = outboundShareRootIds.contains(item.id.lowercase())
+            // AT-SFD-4: always probe grants — skipping when swmRoot already true left outbound
+            // false and PreferDetach fell through to creator Leave (MainParent no-op).
+            val hasGrants = try {
+                // AT-SFD-2: owner self-grant alone is not "shared".
+                CloudFolderDelete.hasExternalGrants(
+                    api.listShareGrants(item.id).map { it.permissionForId },
+                    currentUserId()
+                )
+            } catch (_: Exception) {
+                false
+            }
+            if (hasGrants) {
+                outboundShareRootIds.add(item.id.lowercase())
+                knownOutbound = true
             }
             val shared = CloudFolderDelete.isSharedDeleteTarget(swmRoot, knownOutbound, hasGrants)
             _state.update {
@@ -4672,7 +4678,11 @@ class MainViewModel @Inject constructor(
                         isFolder = item.isFolder,
                         shared = shared,
                         canWriteForAll = true,
-                        isSwmShareRoot = swmRoot
+                        isSwmShareRoot = swmRoot,
+                        knownOutbound = knownOutbound,
+                        inSwmScope = CloudSharedScope.isInSharedWithMeScope(
+                            _state.value.breadcrumb.map { it.first }
+                        )
                     )
                 )
             }
@@ -4710,9 +4720,9 @@ class MainViewModel @Inject constructor(
 
     private fun deleteSharedForMeOnly(pending: PendingDeleteCloud) {
         val crumbIds = _state.value.breadcrumb.map { it.first }
-        val inSwmScope = CloudSharedScope.isInSharedWithMeScope(crumbIds) ||
-            currentFolderId.equals(CloudVirtualNodes.SHARED_WITH_ME_ID, ignoreCase = true)
-        val outbound = outboundShareRootIds.contains(pending.id.lowercase())
+        // Prefer resolve-time stamps; crumb SWM as fallback (not SWM-list membership).
+        val inSwmScope = pending.inSwmScope || CloudSharedScope.isInSharedWithMeScope(crumbIds)
+        val outbound = pending.knownOutbound || outboundShareRootIds.contains(pending.id.lowercase())
         // AT-SFD-4: creator Leave is MainParent no-op — Detach when outbound / outside SWM.
         if (!CloudFolderDelete.preferDetachForMeOnly(
                 pending.isSwmShareRoot,
@@ -4764,8 +4774,8 @@ class MainViewModel @Inject constructor(
             val result = api.detachFromMyCloud(DetachFromMyCloudRequest(entityId = entityId))
             if (!result.detached) return@repeat
             val mp = runCatching { api.getEntity(entityId).mainParentId }.getOrNull()
+            // Fail-closed: require readable self-root (do not trust mainParentCleared alone).
             if (mp != null && mp.equals(entityId, ignoreCase = true)) return true
-            if (result.mainParentCleared && mp.isNullOrBlank()) return true
         }
         return false
     }

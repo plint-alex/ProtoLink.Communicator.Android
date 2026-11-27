@@ -76,13 +76,18 @@ object CloudFolderDelete {
         isKnownOutboundShareRoot: Boolean = false
     ): Boolean = isSwmShareRoot && !isKnownOutboundShareRoot
 
+    /**
+     * Detach unless clear inbound SWM leave.
+     * [isInSharedWithMeScope] must be crumb/virtual SWM only — not SWM-list membership.
+     * Outbound / external grants always Detach.
+     */
     fun preferDetachForMeOnly(
         isSwmShareRoot: Boolean,
         isInSharedWithMeScope: Boolean,
         isKnownOutboundShareRoot: Boolean
-    ): Boolean = !preferLeaveForMeOnly(
+    ): Boolean = isKnownOutboundShareRoot || !preferLeaveForMeOnly(
         isSwmShareRoot = isSwmShareRoot && isInSharedWithMeScope,
-        isKnownOutboundShareRoot = isKnownOutboundShareRoot
+        isKnownOutboundShareRoot = false
     )
 
     fun deleteMenu(lang: String?): String =

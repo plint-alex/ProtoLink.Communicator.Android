@@ -90,6 +90,14 @@ class CloudFolderDeleteTest {
                 isKnownOutboundShareRoot = false
             )
         ).isFalse()
+        // Outbound wins even when SWM root+scope both true (AT-SFD-4 grant probe).
+        assertThat(
+            CloudFolderDelete.preferDetachForMeOnly(
+                isSwmShareRoot = true,
+                isInSharedWithMeScope = true,
+                isKnownOutboundShareRoot = true
+            )
+        ).isTrue()
         val body = CloudFolderDelete.sharedConfirmBody("en", "Docs", true)
         assertThat(body.lowercase()).contains("shared")
         assertThat(CloudFolderDelete.forMeOnly("en")).isEqualTo("For me only")
