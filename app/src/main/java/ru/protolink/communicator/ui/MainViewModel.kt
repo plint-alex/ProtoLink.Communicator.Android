@@ -4725,8 +4725,8 @@ class MainViewModel @Inject constructor(
         }
         viewModelScope.launch {
             try {
-                val result = api.detachFromMyCloud(DetachFromMyCloudRequest(entityId = pending.id))
-                if (!result.detached) {
+                // AT-SFD-4 reopen: verify MainParent self-root; retry once if Api claim lies.
+                if (!tryDetachFromMyCloudVerified(pending.id)) {
                     _state.update {
                         it.copy(status = CloudFolderDelete.detachFailedStatus(uiLang(), pending.name))
                     }
@@ -4757,6 +4757,17 @@ class MainViewModel @Inject constructor(
                 showError("Detach failed", httpDetail(e), e)
             }
         }
+    }
+
+    private suspend fun tryDetachFromMyCloudVerified(entityId: String): Boolean {
+        repeat(2) {
+            val result = api.detachFromMyCloud(DetachFromMyCloudRequest(entityId = entityId))
+            if (!result.detached) return@repeat
+            val mp = runCatching { api.getEntity(entityId).mainParentId }.getOrNull()
+            if (mp != null && mp.equals(entityId, ignoreCase = true)) return true
+            if (result.mainParentCleared && mp.isNullOrBlank()) return true
+        }
+        return false
     }
 
     private fun deleteCloudItem(

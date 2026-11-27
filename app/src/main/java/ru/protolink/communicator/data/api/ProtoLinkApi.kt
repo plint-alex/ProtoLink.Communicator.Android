@@ -439,7 +439,8 @@ data class DetachFromMyCloudRequest(val entityId: String)
 
 data class DetachFromMyCloudResult(
     val entityId: String? = null,
-    val detached: Boolean = true,
+    /** Fail-closed default — missing/false must not paint Detach success (AT-SFD-4). */
+    val detached: Boolean = false,
     val removedRelationCount: Int = 0,
     val mainParentCleared: Boolean = false
 )
