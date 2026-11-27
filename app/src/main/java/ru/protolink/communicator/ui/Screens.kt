@@ -932,6 +932,17 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
         crumbIds,
         state.shareRootCanWrite
     )
+    val canDeleteCurrent =
+        currentId != null &&
+            openFile == null &&
+            !isVirtualCurrent &&
+            state.breadcrumb.size > 1 &&
+            ru.protolink.communicator.util.CloudFolderDelete.canDeleteItem(
+                isVirtualEntry = false,
+                itemId = currentId,
+                breadcrumbIds = crumbIds,
+                shareRootCanWrite = state.shareRootCanWrite
+            )
     val canLeaveCurrentSharedRoot = ru.protolink.communicator.util.CloudSharedScope.canLeaveOpenShareRoot(
         currentId,
         crumbIds,
@@ -1024,6 +1035,25 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                     expanded = headerOverflowOpen,
                     onDismissRequest = { headerOverflowOpen = false }
                 ) {
+                    // AT-SFD-9: open CloudFolder page Delete → same E12 fork as list rows.
+                    if (canDeleteCurrent && currentId != null) {
+                        DropdownMenuItem(
+                            text = {
+                                Text(ru.protolink.communicator.util.CloudFolderDelete.deleteMenu(lang))
+                            },
+                            onClick = {
+                                headerOverflowOpen = false
+                                vm.requestDeleteCloudItem(
+                                    CloudItem(
+                                        id = currentId,
+                                        name = folderName,
+                                        isFolder = true,
+                                        isShareRoot = canLeaveCurrentSharedRoot
+                                    )
+                                )
+                            }
+                        )
+                    }
                     if (canLeaveCurrentSharedRoot) {
                         DropdownMenuItem(
                             text = {
