@@ -67,7 +67,23 @@ object CloudFolderDelete {
         return false
     }
 
-    fun preferLeaveForMeOnly(isSwmShareRoot: Boolean): Boolean = isSwmShareRoot
+    /**
+     * Leave only for inbound SWM. Known outbound must Detach — creator Leave is Left=false
+     * / MainParent no-op (AT-SFD-4).
+     */
+    fun preferLeaveForMeOnly(
+        isSwmShareRoot: Boolean,
+        isKnownOutboundShareRoot: Boolean = false
+    ): Boolean = isSwmShareRoot && !isKnownOutboundShareRoot
+
+    fun preferDetachForMeOnly(
+        isSwmShareRoot: Boolean,
+        isInSharedWithMeScope: Boolean,
+        isKnownOutboundShareRoot: Boolean
+    ): Boolean = !preferLeaveForMeOnly(
+        isSwmShareRoot = isSwmShareRoot && isInSharedWithMeScope,
+        isKnownOutboundShareRoot = isKnownOutboundShareRoot
+    )
 
     fun deleteMenu(lang: String?): String =
         if (isRu(lang)) "Удалить" else "Delete"
@@ -117,6 +133,15 @@ object CloudFolderDelete {
             "Убрано из Моего облака: «$safe»"
         else
             "Removed from My Cloud: \"$safe\""
+    }
+
+    /** AT-SFD-4: Api detached=false — do not paint success. */
+    fun detachFailedStatus(lang: String?, name: String): String {
+        val safe = name.ifBlank { "—" }
+        return if (isRu(lang))
+            "Не удалось убрать из Моего облака: «$safe»"
+        else
+            "Could not remove from My Cloud: \"$safe\""
     }
 
     fun permissionDenied(lang: String?): String =

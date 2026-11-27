@@ -4709,17 +4709,45 @@ class MainViewModel @Inject constructor(
     }
 
     private fun deleteSharedForMeOnly(pending: PendingDeleteCloud) {
-        if (CloudFolderDelete.preferLeaveForMeOnly(pending.isSwmShareRoot)) {
+        val crumbIds = _state.value.breadcrumb.map { it.first }
+        val inSwmScope = CloudSharedScope.isInSharedWithMeScope(crumbIds) ||
+            currentFolderId.equals(CloudVirtualNodes.SHARED_WITH_ME_ID, ignoreCase = true)
+        val outbound = outboundShareRootIds.contains(pending.id.lowercase())
+        // AT-SFD-4: creator Leave is MainParent no-op — Detach when outbound / outside SWM.
+        if (!CloudFolderDelete.preferDetachForMeOnly(
+                pending.isSwmShareRoot,
+                inSwmScope,
+                outbound
+            )
+        ) {
             leaveShared(pending.id)
             return
         }
         viewModelScope.launch {
             try {
-                api.detachFromMyCloud(DetachFromMyCloudRequest(entityId = pending.id))
+                val result = api.detachFromMyCloud(DetachFromMyCloudRequest(entityId = pending.id))
+                if (!result.detached) {
+                    _state.update {
+                        it.copy(status = CloudFolderDelete.detachFailedStatus(uiLang(), pending.name))
+                    }
+                    return@launch
+                }
                 outboundShareRootIds.remove(pending.id.lowercase())
                 val listed = currentFolderId
                 val statusOk = CloudFolderDelete.detachedStatus(uiLang(), pending.name)
-                if (listed != null) {
+                val viewingDetached = listed.equals(pending.id, ignoreCase = true) ||
+                    crumbIds.any { it.equals(pending.id, ignoreCase = true) }
+                if (viewingDetached) {
+                    val parent = crumbIds.asReversed().firstOrNull { id ->
+                        !id.equals(pending.id, ignoreCase = true) &&
+                            !CloudVirtualNodes.isVirtual(id)
+                    } ?: cloudRootId
+                    if (!parent.isNullOrBlank()) {
+                        loadCloudFolder(parent, statusAfterLoad = statusOk)
+                    } else {
+                        _state.update { it.copy(status = statusOk) }
+                    }
+                } else if (listed != null) {
                     loadCloudFolder(listed, statusAfterLoad = statusOk)
                 } else {
                     _state.update { it.copy(status = statusOk) }

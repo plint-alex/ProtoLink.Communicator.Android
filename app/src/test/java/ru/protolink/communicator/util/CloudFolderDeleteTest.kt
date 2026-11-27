@@ -75,6 +75,21 @@ class CloudFolderDeleteTest {
         assertThat(CloudFolderDelete.isSharedDeleteTarget(false, false, false)).isFalse()
         assertThat(CloudFolderDelete.preferLeaveForMeOnly(true)).isTrue()
         assertThat(CloudFolderDelete.preferLeaveForMeOnly(false)).isFalse()
+        assertThat(CloudFolderDelete.preferLeaveForMeOnly(true, isKnownOutboundShareRoot = true)).isFalse()
+        assertThat(
+            CloudFolderDelete.preferDetachForMeOnly(
+                isSwmShareRoot = false,
+                isInSharedWithMeScope = false,
+                isKnownOutboundShareRoot = true
+            )
+        ).isTrue()
+        assertThat(
+            CloudFolderDelete.preferDetachForMeOnly(
+                isSwmShareRoot = true,
+                isInSharedWithMeScope = true,
+                isKnownOutboundShareRoot = false
+            )
+        ).isFalse()
         val body = CloudFolderDelete.sharedConfirmBody("en", "Docs", true)
         assertThat(body.lowercase()).contains("shared")
         assertThat(CloudFolderDelete.forMeOnly("en")).isEqualTo("For me only")
