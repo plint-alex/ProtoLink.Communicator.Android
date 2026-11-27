@@ -4653,7 +4653,11 @@ class MainViewModel @Inject constructor(
             var hasGrants = false
             if (!CloudFolderDelete.isSharedDeleteTarget(swmRoot, knownOutbound, false)) {
                 hasGrants = try {
-                    api.listShareGrants(item.id).isNotEmpty()
+                    // AT-SFD-2: owner self-grant alone is not "shared".
+                    CloudFolderDelete.hasExternalGrants(
+                        api.listShareGrants(item.id).map { it.permissionForId },
+                        currentUserId()
+                    )
                 } catch (_: Exception) {
                     false
                 }

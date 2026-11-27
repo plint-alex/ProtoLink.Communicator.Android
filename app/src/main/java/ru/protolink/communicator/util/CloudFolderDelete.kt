@@ -50,6 +50,23 @@ object CloudFolderDelete {
         hasExternalGrants: Boolean
     ): Boolean = isSwmShareRoot || isKnownOutboundShareRoot || hasExternalGrants
 
+    /**
+     * AT-SFD-2: ListGrants on an unshared owner folder still returns the caller's own people grant.
+     * Count only principals whose permissionForId differs from the caller.
+     */
+    fun hasExternalGrants(
+        permissionForIds: Iterable<String?>?,
+        callerId: String?
+    ): Boolean {
+        val me = callerId?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return false
+        if (permissionForIds == null) return false
+        for (raw in permissionForIds) {
+            val id = raw?.trim()?.lowercase().orEmpty()
+            if (id.isNotEmpty() && id != me) return true
+        }
+        return false
+    }
+
     fun preferLeaveForMeOnly(isSwmShareRoot: Boolean): Boolean = isSwmShareRoot
 
     fun deleteMenu(lang: String?): String =

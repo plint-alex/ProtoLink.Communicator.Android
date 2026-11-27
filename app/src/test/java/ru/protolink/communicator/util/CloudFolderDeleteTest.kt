@@ -82,6 +82,17 @@ class CloudFolderDeleteTest {
     }
 
     @Test
+    fun e12_hasExternalGrants_ignoresOwnerSelf() {
+        val me = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val tina = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        assertThat(CloudFolderDelete.hasExternalGrants(listOf(me), me)).isFalse()
+        assertThat(CloudFolderDelete.hasExternalGrants(listOf(me, tina), me)).isTrue()
+        assertThat(CloudFolderDelete.hasExternalGrants(listOf(tina), me)).isTrue()
+        assertThat(CloudFolderDelete.hasExternalGrants(emptyList(), me)).isFalse()
+        assertThat(CloudFolderDelete.hasExternalGrants(listOf(me), null)).isFalse()
+    }
+
+    @Test
     fun resolveMirror_childUnderMappedBreadcrumb() {
         val mapId = "11111111-1111-4111-8111-111111111111"
         val childId = "22222222-2222-4222-8222-222222222222"
