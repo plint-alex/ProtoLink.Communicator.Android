@@ -140,6 +140,49 @@ object CloudFolderTree {
         return out
     }
 
+    /**
+     * E9g: omit browse-parent wrapper row; project its immediate folder children as sequential
+     * depth-0 stacked trees (Notes E11a feel). Empty / unloaded children → no rows (no lone stub).
+     */
+    fun projectVisibleStackedChildren(
+        browseParentId: String?,
+        childrenByParent: Map<String, List<Node>>,
+        expandedIds: Set<String>,
+        loadedParentIds: Set<String>,
+        selectedId: String?,
+        loadingIds: Set<String> = emptySet(),
+        maxDepth: Int = DEFAULT_MAX_DEPTH
+    ): List<VisibleRow> {
+        if (browseParentId.isNullOrBlank()) return emptyList()
+        val stackedRoots = childrenByParent.entries
+            .firstOrNull { it.key.equals(browseParentId, ignoreCase = true) }
+            ?.value
+        if (stackedRoots.isNullOrEmpty()) return emptyList()
+
+        val out = ArrayList<VisibleRow>()
+        for (stacked in stackedRoots) {
+            if (stacked.id.isBlank()) continue
+            out.addAll(
+                projectVisible(
+                    root = stacked,
+                    childrenByParent = childrenByParent,
+                    expandedIds = expandedIds,
+                    loadedParentIds = loadedParentIds,
+                    selectedId = selectedId,
+                    loadingIds = loadingIds,
+                    maxDepth = maxDepth
+                )
+            )
+        }
+        return out
+    }
+
+    /** E9g: Folders left panel omits the My Cloud CloudRoot wrapper when it is the tree root. */
+    fun omitBrowseParentWrapper(treeRootId: String?, myCloudRootId: String?): Boolean {
+        if (treeRootId.isNullOrBlank() || myCloudRootId.isNullOrBlank()) return false
+        return treeRootId.equals(myCloudRootId, ignoreCase = true)
+    }
+
     /** Remove [folderId] and all known descendants from the expanded set. */
     fun collapseBranch(
         folderId: String,

@@ -218,4 +218,98 @@ class CloudFolderTreeTest {
             CloudFolderTree.pickTreeRootId(crumbs, photosLibraryId = null, CloudVirtualNodes::isVirtual)
         ).isEqualTo(root)
     }
+
+    @Test
+    fun omitBrowseParentWrapper_onlyWhenTreeRootIsMyCloud() {
+        val myCloud = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val other = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        assertThat(CloudFolderTree.omitBrowseParentWrapper(myCloud, myCloud)).isTrue()
+        assertThat(CloudFolderTree.omitBrowseParentWrapper(other, myCloud)).isFalse()
+        assertThat(CloudFolderTree.omitBrowseParentWrapper(myCloud, null)).isFalse()
+        assertThat(CloudFolderTree.omitBrowseParentWrapper(null, myCloud)).isFalse()
+        assertThat(CloudFolderTree.omitBrowseParentWrapper("", myCloud)).isFalse()
+    }
+
+    @Test
+    fun projectVisibleStackedChildren_omitsWrapper_showsDepth0Roots() {
+        // AT-CE21 / AT-CE22: no My Cloud row; ≥2 children as sequential depth-0 trees.
+        val myCloud = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val a = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val b = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        val a1 = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        val map = mapOf(
+            myCloud to listOf(CloudFolderTree.Node(a, "Notes"), CloudFolderTree.Node(b, "Photos")),
+            a to listOf(CloudFolderTree.Node(a1, "Nested")),
+            b to emptyList()
+        )
+        val rows = CloudFolderTree.projectVisibleStackedChildren(
+            browseParentId = myCloud,
+            childrenByParent = map,
+            expandedIds = setOf(myCloud),
+            loadedParentIds = setOf(myCloud, b),
+            selectedId = null
+        )
+        assertThat(rows).hasSize(2)
+        assertThat(rows.none { it.id.equals(myCloud, ignoreCase = true) }).isTrue()
+        assertThat(rows[0].id).isEqualTo(a)
+        assertThat(rows[0].depth).isEqualTo(0)
+        assertThat(rows[1].id).isEqualTo(b)
+        assertThat(rows[1].depth).isEqualTo(0)
+        assertThat(rows[0].canExpand).isTrue()
+        assertThat(rows[1].canExpand).isFalse()
+    }
+
+    @Test
+    fun projectVisibleStackedChildren_emptyOrUnloaded_noWrapperStub() {
+        // AT-CE21 soft: Soft Ready / soft-fail must not paint lone My Cloud chrome.
+        val myCloud = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        assertThat(
+            CloudFolderTree.projectVisibleStackedChildren(
+                browseParentId = myCloud,
+                childrenByParent = emptyMap(),
+                expandedIds = setOf(myCloud),
+                loadedParentIds = emptySet(),
+                selectedId = myCloud
+            )
+        ).isEmpty()
+
+        val emptyKids = mapOf(myCloud to emptyList<CloudFolderTree.Node>())
+        assertThat(
+            CloudFolderTree.projectVisibleStackedChildren(
+                browseParentId = myCloud,
+                childrenByParent = emptyKids,
+                expandedIds = setOf(myCloud),
+                loadedParentIds = setOf(myCloud),
+                selectedId = myCloud
+            )
+        ).isEmpty()
+    }
+
+    @Test
+    fun projectVisibleStackedChildren_expandStackedRoot_revealsGrandchildren() {
+        // Soft AT-CE9/CE10 per stacked root.
+        val myCloud = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val a = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val a1 = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        val map = mapOf(
+            myCloud to listOf(CloudFolderTree.Node(a, "A")),
+            a to listOf(CloudFolderTree.Node(a1, "A1")),
+            a1 to emptyList()
+        )
+        val rows = CloudFolderTree.projectVisibleStackedChildren(
+            browseParentId = myCloud,
+            childrenByParent = map,
+            expandedIds = setOf(a),
+            loadedParentIds = setOf(myCloud, a, a1),
+            selectedId = a1
+        )
+        assertThat(rows).hasSize(2)
+        assertThat(rows.none { it.id.equals(myCloud, ignoreCase = true) }).isTrue()
+        assertThat(rows[0].id).isEqualTo(a)
+        assertThat(rows[0].depth).isEqualTo(0)
+        assertThat(rows[0].isExpanded).isTrue()
+        assertThat(rows[1].id).isEqualTo(a1)
+        assertThat(rows[1].depth).isEqualTo(1)
+        assertThat(rows[1].selected).isTrue()
+    }
 }

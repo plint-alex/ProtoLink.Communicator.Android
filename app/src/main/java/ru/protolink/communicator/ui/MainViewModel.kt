@@ -1789,7 +1789,22 @@ class MainViewModel @Inject constructor(
         }
         // Prefer local tree trail (Windows parity) — avoids silent-fail parent walks on nested folders.
         val treeRows = _state.value.cloudFolderTree.map { Triple(it.id, it.name, it.depth) }
-        val trail = CloudFolderTree.buildAncestorTrail(treeRows, folderId)
+        var trail = CloudFolderTree.buildAncestorTrail(treeRows, folderId)
+        // E9g: stacked rows omit My Cloud — prepend browse parent so crumbs/Up stay correct.
+        val myCloud = cloudRootId
+        if (trail.isNotEmpty()
+            && CloudFolderTree.omitBrowseParentWrapper(folderTreeRootId, myCloud)
+            && myCloud != null
+            && !trail[0].first.equals(myCloud, ignoreCase = true)
+        ) {
+            val myName = folderTreeNames.entries
+                .firstOrNull { it.key.equals(myCloud, ignoreCase = true) }
+                ?.value
+                ?: _state.value.breadcrumb.firstOrNull { it.first.equals(myCloud, ignoreCase = true) }
+                    ?.second
+                ?: "Cloud"
+            trail = listOf(myCloud to myName) + trail
+        }
         if (trail.isNotEmpty()) {
             clearCloudFileOpen()
             val composed = CloudFolderTree.composeBreadcrumb(
@@ -2191,18 +2206,30 @@ class MainViewModel @Inject constructor(
             openEntityId = if (openFile != null) openFile.id else currentFolderId,
             parentFolderId = openFile?.parentFolderId ?: currentFolderId
         )
-        val rootName = folderTreeNames.entries
-            .firstOrNull { it.key.equals(treeRoot, ignoreCase = true) }
-            ?.value
-            ?: "Cloud"
-        val visible = CloudFolderTree.projectVisible(
-            root = CloudFolderTree.Node(treeRoot, rootName),
-            childrenByParent = folderTreeChildren,
-            expandedIds = folderTreeExpanded,
-            loadedParentIds = folderTreeLoaded,
-            selectedId = selected,
-            loadingIds = folderTreeLoading
-        )
+        val visible = if (CloudFolderTree.omitBrowseParentWrapper(treeRoot, cloudRootId)) {
+            // E9g: My Cloud children as sequential depth-0 stacked trees (no wrapper row).
+            CloudFolderTree.projectVisibleStackedChildren(
+                browseParentId = treeRoot,
+                childrenByParent = folderTreeChildren,
+                expandedIds = folderTreeExpanded,
+                loadedParentIds = folderTreeLoaded,
+                selectedId = selected,
+                loadingIds = folderTreeLoading
+            )
+        } else {
+            val rootName = folderTreeNames.entries
+                .firstOrNull { it.key.equals(treeRoot, ignoreCase = true) }
+                ?.value
+                ?: "Cloud"
+            CloudFolderTree.projectVisible(
+                root = CloudFolderTree.Node(treeRoot, rootName),
+                childrenByParent = folderTreeChildren,
+                expandedIds = folderTreeExpanded,
+                loadedParentIds = folderTreeLoaded,
+                selectedId = selected,
+                loadingIds = folderTreeLoading
+            )
+        }
         _state.update { s ->
             s.copy(
                 cloudFolderTree = visible.map { row ->
