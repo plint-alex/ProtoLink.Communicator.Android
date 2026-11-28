@@ -189,10 +189,11 @@ class CloudSharedWithMeScopeTest {
         assertThat(ShareSheetCloudStrings.emptySharedTitle("en"))
             .isEqualTo("Nothing shared with you yet")
         assertThat(ShareSheetCloudStrings.emptySharedBody("en"))
-            .isEqualTo("When someone gives you access, it shows up here.")
+            .isEqualTo("Legacy grants list here. New Cloud shares also appear under My Cloud.")
         assertThat(ShareSheetCloudStrings.emptySharedTitle("ru"))
             .isEqualTo("Вам пока ничего не открыли")
-        assertThat(ShareSheetCloudStrings.emptySharedBody("ru")).contains("здесь")
+        assertThat(ShareSheetCloudStrings.emptySharedBody("ru")).contains("Моё облако")
+        assertThat(ShareSheetCloudStrings.emptySharedBody("en").lowercase()).doesNotContain("only")
 
         val en = ShareSheetCloudStrings.sharedRowSubtitle("en", "Ivan", canWrite = false)
         assertThat(en).contains("Shared by Ivan")

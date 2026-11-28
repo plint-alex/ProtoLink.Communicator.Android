@@ -102,6 +102,20 @@ class ShareAddPeopleTest {
             .contains("Maria K.")
         assertThat(ShareSheetStrings.addedToast("en", "Maria K.", canWrite = false).lowercase())
             .contains("view")
+        assertThat(ShareSheetStrings.addedToast("en", "Maria K.", canWrite = false).lowercase())
+            .contains("link")
+        assertThat(
+            ShareSheetStrings.addedToast("en", "Maria K.", canWrite = false, plantsUnderMyCloud = true)
+        ).contains("My Cloud")
+        assertThat(
+            ShareSheetStrings.addedToast("en", "Maria K.", canWrite = false, plantsUnderMyCloud = true)
+        ).doesNotContain("Send them the link")
+        assertThat(
+            ShareSheetStrings.addedToast("ru", "Мария", canWrite = true, plantsUnderMyCloud = true)
+        ).contains("Моё облако")
+        assertThat(
+            ShareSheetStrings.addedToastMany("en", 3, plantsUnderMyCloud = true)
+        ).contains("My Cloud")
         assertThat(ShareSheetStrings.pasteIdHint("en").lowercase()).doesNotContain("token")
         assertThat(ShareSheetStrings.pasteIdHint("en").lowercase()).contains("email")
         assertThat(ShareSheetStrings.pasteIdPlaceholder("en").lowercase()).contains("email")

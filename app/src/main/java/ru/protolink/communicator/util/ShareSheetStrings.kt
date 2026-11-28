@@ -201,23 +201,41 @@ object ShareSheetStrings {
 
     fun add(lang: String?) = if (ru(lang)) "Добавить" else "Add"
 
-    fun addedToast(lang: String?, name: String, canWrite: Boolean): String {
+    /** Cloud people-share (E13): appear = My Cloud. Notes keep link find hint (AT-S49). */
+    fun addedToast(
+        lang: String?,
+        name: String,
+        canWrite: Boolean,
+        plantsUnderMyCloud: Boolean = false
+    ): String {
         val level = if (canWrite) {
             if (ru(lang)) "редактировать" else "edit"
         } else {
             if (ru(lang)) "смотреть" else "view"
         }
-        return if (ru(lang))
+        return if (plantsUnderMyCloud) {
+            if (ru(lang))
+                "$name теперь может $level. Появится у них в «Моё облако»."
+            else
+                "$name can now $level. It will appear in their My Cloud."
+        } else if (ru(lang)) {
             "$name теперь может $level. Отправьте ссылку, чтобы найти."
-        else
+        } else {
             "$name can now $level. Send them the link so they can find it."
+        }
     }
 
-    fun addedToastMany(lang: String?, count: Int): String =
-        if (ru(lang))
+    fun addedToastMany(lang: String?, count: Int, plantsUnderMyCloud: Boolean = false): String =
+        if (plantsUnderMyCloud) {
+            if (ru(lang))
+                "$count человек добавлено. Появится у них в «Моё облако»."
+            else
+                "$count people can now access this. It will appear in their My Cloud."
+        } else if (ru(lang)) {
             "$count человек добавлено. Отправьте ссылку, чтобы найти."
-        else
+        } else {
             "$count people can now access this. Send them the link so they can find it."
+        }
 
     fun noContactsYet(lang: String?) =
         if (ru(lang)) "Пока нет контактов в Мессенджере." else "No Messenger contacts yet."

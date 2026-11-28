@@ -2874,10 +2874,17 @@ class MainViewModel @Inject constructor(
                     )
                 )
             }
+            // Cloud people-share E13: appear = My Cloud (Notes keep link toast via isNote).
+            val plantsUnderMyCloud = !sheet.isNote
             val toast = if (targets.size > 1) {
-                ShareSheetStrings.addedToastMany(uiLang(), targets.size)
+                ShareSheetStrings.addedToastMany(uiLang(), targets.size, plantsUnderMyCloud)
             } else {
-                ShareSheetStrings.addedToast(uiLang(), targets.values.first(), canWrite)
+                ShareSheetStrings.addedToast(
+                    uiLang(),
+                    targets.values.first(),
+                    canWrite,
+                    plantsUnderMyCloud
+                )
             }
             updateShareSheet {
                 it.copy(
@@ -2896,6 +2903,13 @@ class MainViewModel @Inject constructor(
             }
             _state.update { it.copy(status = toast) }
             loadShareSheet()
+            // E13 AT-CFS-2: refresh open Cloud browse (ParentIds) without requiring SWM.
+            if (plantsUnderMyCloud) {
+                val browseId = currentFolderId
+                if (!browseId.isNullOrBlank() && !CloudVirtualNodes.isVirtual(browseId)) {
+                    loadCloudFolder(browseId)
+                }
+            }
         } catch (_: Exception) {
             updateShareSheet {
                 it.copy(busy = false, errorText = ShareSheetStrings.loadFailed(uiLang()))

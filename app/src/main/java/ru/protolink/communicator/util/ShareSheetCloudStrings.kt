@@ -41,9 +41,9 @@ object ShareSheetCloudStrings {
 
     fun emptySharedBody(lang: String?): String =
         if (isRussian(lang))
-            "Когда кто-то даст вам доступ, это появится здесь."
+            "Старые доступы — здесь. Новые папки Cloud также появляются в «Моё облако»."
         else
-            "When someone gives you access, it shows up here."
+            "Legacy grants list here. New Cloud shares also appear under My Cloud."
 
     /** Shared by me empty (AC-SO Communicator copy). */
     fun emptySharedByMeTitle(lang: String?): String =
