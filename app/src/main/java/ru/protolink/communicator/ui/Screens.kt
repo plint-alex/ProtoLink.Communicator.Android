@@ -6,6 +6,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -119,6 +120,7 @@ import androidx.compose.material.icons.filled.People
 import androidx.compose.material3.AlertDialog
 import ru.protolink.communicator.ui.share.ShareSheetScreen
 import ru.protolink.communicator.util.AuthShellGate
+import ru.protolink.communicator.util.CloudNarrowShell
 import ru.protolink.communicator.util.MapLocalFolderStrings
 import ru.protolink.communicator.util.MapLocalFolderUi
 import ru.protolink.communicator.util.NotesRootSettings
@@ -957,19 +959,43 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
     )
     val canMutate = currentId != null && !isVirtualCurrent
     val canShareCurrent = currentId != null && !isVirtualCurrent
+    // E9h: narrow stack — cold = Folders tree; open folder → contents; Back → tree.
+    var narrowPanel by remember { mutableStateOf(CloudNarrowShell.coldOpenPanel()) }
 
-    Column(
+    BoxWithConstraints(
         Modifier
             .fillMaxSize()
             .background(Color.White)
     ) {
+    val isNarrowShell = CloudNarrowShell.isNarrow(maxWidth.value)
+    val hasTreeRows = state.cloudFolderTree.isNotEmpty()
+    val showTreePanel = CloudNarrowShell.showTreePanel(isNarrowShell, narrowPanel, hasTreeRows)
+    val showContentsPanel =
+        CloudNarrowShell.showContentsPanel(isNarrowShell, narrowPanel, hasTreeRows)
+    val showBackToTree =
+        CloudNarrowShell.shouldShowBackToTree(isNarrowShell, narrowPanel, hasTreeRows)
+    BackHandler(
+        enabled = CloudNarrowShell.shouldHandleSystemBackToTree(
+            isNarrowShell,
+            narrowPanel,
+            hasTreeRows
+        )
+    ) {
+        narrowPanel = CloudNarrowShell.afterBackToTree()
+    }
+
+    Column(Modifier.fillMaxSize()) {
         Row(
             Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            if (canGoUp) {
+            if (showBackToTree) {
+                IconButton(onClick = { narrowPanel = CloudNarrowShell.afterBackToTree() }) {
+                    Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = igAccent)
+                }
+            } else if (canGoUp) {
                 IconButton(onClick = { vm.cloudNavigateUp() }) {
                     Icon(Icons.Default.ArrowBack, contentDescription = "Up", tint = igAccent)
                 }
@@ -1072,6 +1098,7 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                             },
                             onClick = {
                                 headerOverflowOpen = false
+                                narrowPanel = CloudNarrowShell.afterOpenBrowseTarget()
                                 vm.openSharedWithMe()
                             }
                         )
@@ -1083,6 +1110,7 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                             },
                             onClick = {
                                 headerOverflowOpen = false
+                                narrowPanel = CloudNarrowShell.afterOpenBrowseTarget()
                                 vm.openSharedByMe()
                             }
                         )
@@ -1094,6 +1122,7 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                             },
                             onClick = {
                                 headerOverflowOpen = false
+                                narrowPanel = CloudNarrowShell.afterOpenBrowseTarget()
                                 vm.openRecent()
                             }
                         )
@@ -1129,6 +1158,7 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                         modifier = Modifier
                             .width(72.dp)
                             .clickable {
+                                narrowPanel = CloudNarrowShell.afterOpenBrowseTarget()
                                 vm.openMappedFolder(
                                     m.cloudFolderId,
                                     m.cloudFolderName.ifBlank { m.cloudFolderId.take(8) }
@@ -1197,7 +1227,10 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                         fontSize = 13.sp,
                         fontWeight = if (isLastFolder) FontWeight.SemiBold else FontWeight.Normal,
                         color = if (isLastFolder) igAccent else Color(0xFF8E8E8E),
-                        modifier = Modifier.clickable { vm.cloudNavigateTo(i) }
+                        modifier = Modifier.clickable {
+                            narrowPanel = CloudNarrowShell.afterOpenBrowseTarget()
+                            vm.cloudNavigateTo(i)
+                        }
                     )
                     if (i < state.breadcrumb.lastIndex) {
                         Text("  ›  ", fontSize = 13.sp, color = Color(0xFF8E8E8E))
@@ -1217,12 +1250,15 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
             }
         }
 
-        // E9: platform-appropriate Explorer shell — Folders tree | details (+ preview).
+        // E9 / E9h: wide = Folders tree | details; narrow (&lt;700dp) = tree XOR contents.
         Row(Modifier.fillMaxSize()) {
-            if (state.cloudFolderTree.isNotEmpty()) {
+            if (showTreePanel) {
                 Column(
                     Modifier
-                        .width(168.dp)
+                        .then(
+                            if (isNarrowShell) Modifier.fillMaxWidth()
+                            else Modifier.width(168.dp)
+                        )
                         .fillMaxHeight()
                         .background(igSurface)
                         .verticalScroll(rememberScrollState())
@@ -1237,6 +1273,7 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                     state.cloudFolderTree.forEach { row ->
                         // Expand + open are sibling click targets (not nested) so name taps
                         // reliably open the folder (AT-CE3) and chevron still toggles (AT-CE9…11).
+                        // E9h: name/row open switches narrow panel; chevron expand does not.
                         Row(
                             Modifier
                                 .fillMaxWidth()
@@ -1279,7 +1316,10 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                             Row(
                                 Modifier
                                     .weight(1f)
-                                    .clickable { vm.openCloudFolderTreeRow(row.id) },
+                                    .clickable {
+                                        narrowPanel = CloudNarrowShell.afterOpenFolderFromTree()
+                                        vm.openCloudFolderTreeRow(row.id)
+                                    },
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Icon(
@@ -1302,15 +1342,18 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                         }
                     }
                 }
-                Divider(
-                    color = igBorder,
-                    thickness = 0.5.dp,
-                    modifier = Modifier
-                        .fillMaxHeight()
-                        .width(0.5.dp)
-                )
+                if (showContentsPanel) {
+                    Divider(
+                        color = igBorder,
+                        thickness = 0.5.dp,
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .width(0.5.dp)
+                    )
+                }
             }
 
+            if (showContentsPanel) {
             Column(Modifier.weight(1f).fillMaxHeight()) {
                 // AT-PC2 / E9 preview pane when a CloudFile is open.
                 if (openFile != null) {
@@ -1625,6 +1668,7 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
                     }
                 }
             }
+            } // showContentsPanel
         }
     }
 
@@ -1795,6 +1839,7 @@ fun CloudScreen(vm: MainViewModel, state: UiState) {
             onConfirm = { vm.completeAddLocalFolderWizard(it) }
         )
     }
+    } // BoxWithConstraints (E9h shell width)
 }
 
 @OptIn(ExperimentalFoundationApi::class)
